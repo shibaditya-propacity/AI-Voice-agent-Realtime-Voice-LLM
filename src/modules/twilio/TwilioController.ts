@@ -22,7 +22,7 @@ const log = Logger.root('TwilioController');
 
 // ─── TwiML Helpers ────────────────────────────────────────────────────────────
 
-const GREETING_TEXT = 'Hello! This is Arjun from PropCity. Please go ahead and speak.';
+const GREETING_TEXT = 'Hello, this is Arjun calling from PropCity. Please go ahead.';
 
 function twimlStreamResponse(streamUrl: string, callerNumber: string): string {
   return [
