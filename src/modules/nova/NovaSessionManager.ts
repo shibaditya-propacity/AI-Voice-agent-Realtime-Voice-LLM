@@ -24,6 +24,7 @@ interface NovaContext {
   streamer: NovaAudioStreamer;
   info: NovaSessionInfo;
   currentAssistantTranscript: string;
+  currentUserTranscript: string;
   outputAudioBytes: number;
   onAudioOutput: (chunk: Buffer) => void;
   /** Cleanup fn that removes all client event listeners — called in destroySession(). */
@@ -60,9 +61,17 @@ export class NovaSessionManager {
       topP: Env.nova.topP,
       voiceId: Env.nova.voiceId,
       sampleRate: Env.audio.internalSampleRate,
+      endpointingSensitivity: Env.nova.endpointingSensitivity,
     };
 
     const log = Logger.forSession(sessionId, callId, 'NovaSessionManager');
+    log.info('Creating Nova session', {
+      modelId: config.modelId,
+      region: config.region,
+      voiceId: config.voiceId,
+      sampleRate: config.sampleRate,
+      endpointingSensitivity: config.endpointingSensitivity,
+    });
 
     await withRetry(
       async () => {
@@ -89,6 +98,7 @@ export class NovaSessionManager {
           streamer,
           info,
           currentAssistantTranscript: '',
+          currentUserTranscript: '',
           outputAudioBytes: 0,
           onAudioOutput,
           unsubscribeClientEvents: () => { /* populated below */ },
@@ -96,16 +106,30 @@ export class NovaSessionManager {
 
         ctx.unsubscribeClientEvents = this.wireClientEvents(ctx);
 
-        // Correct event order for Nova Sonic bidirectional stream:
-        //   1. initialize() — queues sessionStart (MUST be first)
-        //   2. beginUserTurn() — queues promptStart + system block + USER audio block
-        //      (The Twilio TwiML <Say> plays the greeting before the stream starts,
-        //      so Nova just needs to be ready to listen when the caller responds.)
-        //   3. connect() — calls bedrockClient.send(); the generator immediately yields
-        //      all queued events so Nova has enough input to send its first response,
-        //      which allows send() to return without deadlocking.
+        // Correct event order for Nova Sonic v2 bidirectional stream:
+        //
+        //   1. initialize() — queues sessionStart (MUST be first, includes
+        //      turnDetectionConfiguration for Nova 2)
+        //
+        //   2. startConversation() — queues the single long-lived prompt:
+        //        promptStart + SYSTEM text + USER text greeting cue
+        //        + contentStart(AUDIO, interactive:true)   [block left open]
+        //      The text cue makes Nova speak the greeting (silence produces no
+        //      output in Nova 2). The interactive audio block then stays open for
+        //      the whole call so Nova's VAD detects each caller turn and responds.
+        //
+        //   3. connect() — calls bedrockClient.send(); the input generator yields
+        //      the queued events so Nova can start the greeting immediately, then
+        //      streams caller audioInput as it arrives. The prompt is closed only
+        //      at call teardown (finishConversation → contentEnd + promptEnd).
+        log.info('Queueing sessionStart + conversation prompt before connect()', {
+          sessionId,
+          callId,
+          modelId: config.modelId,
+        });
+
         client.initialize();
-        streamer.beginUserTurn();
+        streamer.startConversation();
         await client.connect();
 
         info.state = 'session-active';
@@ -131,12 +155,17 @@ export class NovaSessionManager {
       },
     );
 
-    // First user turn was already opened inside the retry block (before connect())
-    // so the streamer is ready to receive audio immediately.
+    // The conversation prompt (system + greeting cue + open audio block) was queued
+    // before connect(). Nova is now generating the spoken greeting and is already
+    // listening on the open audio block — caller audio pushed via pushAudio() flows
+    // straight in, and Nova's VAD drives every subsequent turn.
     const ctx = this.sessions.get(sessionId);
     if (ctx) {
       ctx.info.state = 'prompt-active';
       ctx.info.currentPromptName = ctx.streamer.promptName;
+      log.info('Nova session ready — greeting in flight, listening on open audio block', {
+        promptName: ctx.streamer.promptName,
+      });
     }
   }
 
@@ -147,18 +176,11 @@ export class NovaSessionManager {
     ctx.streamer.pushAudio(pcm16);
   }
 
-  beginUserTurn(sessionId: string): void {
-    const ctx = this.sessions.get(sessionId);
-    if (!ctx) return;
-    ctx.streamer.beginUserTurn();
-    ctx.info.state = 'prompt-active';
-    ctx.info.currentPromptName = ctx.streamer.promptName;
-  }
-
+  /** Close the conversation prompt (called at call teardown). */
   endUserTurn(sessionId: string): void {
     const ctx = this.sessions.get(sessionId);
     if (!ctx) return;
-    ctx.streamer.endUserTurn();
+    ctx.streamer.finishConversation();
   }
 
   handleInterruption(sessionId: string): void {
@@ -209,6 +231,7 @@ export class NovaSessionManager {
         ctx.info.state = 'receiving-response';
         ctx.currentAssistantTranscript = '';
         ctx.outputAudioBytes = 0;
+        log.info('✅ Nova audio response started — audio is flowing to caller', { contentId: _contentId });
         eventBus.emit(AppEvent.NOVA_RESPONSE_STARTED, {
           sessionId, callId, timestamp: Date.now(),
         });
@@ -218,6 +241,15 @@ export class NovaSessionManager {
     const onAudioOutput = (chunk: Buffer, _contentId: string): void => {
       ctx.info.lastEventAt = Date.now();
       ctx.outputAudioBytes += chunk.length;
+
+      if (ctx.outputAudioBytes === chunk.length) {
+        // First audio chunk for this response
+        log.info('✅ First audio chunk routed to caller', {
+          chunkBytes: chunk.length,
+          contentId: _contentId,
+        });
+      }
+
       ctx.onAudioOutput(chunk);
 
       eventBus.emit(AppEvent.AUDIO_SENT, {
@@ -229,15 +261,27 @@ export class NovaSessionManager {
       });
     };
 
-    // 'text-output' carries the assistant's transcript (replaces 'contentBlockDelta')
-    const onTextOutput = (text: string, _contentId: string): void => {
-      ctx.currentAssistantTranscript += text;
+    // 'text-output' carries either the caller's ASR transcript (role USER) or the
+    // agent's spoken reply (role ASSISTANT). Route each to the correct speaker so the
+    // transcript isn't all mislabeled as 'assistant'.
+    const onTextOutput = (text: string, _contentId: string, role: string): void => {
       ctx.info.lastEventAt = Date.now();
-      this.sessionManager.addTranscriptEntry(sessionId, 'assistant', ctx.currentAssistantTranscript, false);
+      if (role === 'USER') {
+        ctx.currentUserTranscript += text;
+        this.sessionManager.addTranscriptEntry(sessionId, 'user', ctx.currentUserTranscript, false);
+      } else {
+        ctx.currentAssistantTranscript += text;
+        this.sessionManager.addTranscriptEntry(sessionId, 'assistant', ctx.currentAssistantTranscript, false);
+      }
     };
 
-    // 'content-end' signals the end of a content block (replaces 'contentBlockStop')
+    // 'content-end' signals the end of a content block — finalize whichever transcript
+    // was being accumulated.
     const onContentEnd = (_contentId: string, _stopReason: string): void => {
+      if (ctx.currentUserTranscript) {
+        this.sessionManager.addTranscriptEntry(sessionId, 'user', ctx.currentUserTranscript, true);
+        ctx.currentUserTranscript = '';
+      }
       if (ctx.currentAssistantTranscript) {
         this.sessionManager.addTranscriptEntry(sessionId, 'assistant', ctx.currentAssistantTranscript, true);
         ctx.currentAssistantTranscript = '';
@@ -245,9 +289,14 @@ export class NovaSessionManager {
     };
 
     const onTurnComplete = (stopReason: string): void => {
-      ctx.info.state = 'session-active';
       ctx.info.turnCount += 1;
-      log.info('Nova Sonic turn complete', { stopReason, turnCount: ctx.info.turnCount });
+      const isGreetingTurn = ctx.info.turnCount === 1;
+      log.info(
+        isGreetingTurn
+          ? '✅ Nova greeting response complete — still listening on open audio block'
+          : '✅ Nova response complete — still listening on open audio block',
+        { stopReason, turnCount: ctx.info.turnCount },
+      );
 
       this.sessionManager.incrementTurn(sessionId);
 
@@ -255,7 +304,10 @@ export class NovaSessionManager {
         sessionId, callId, timestamp: Date.now(),
       });
 
-      ctx.streamer.beginUserTurn();
+      // Do NOT open a new prompt/turn here. The single interactive audio block stays
+      // open for the whole call; Nova's VAD detects the next caller utterance and
+      // emits a fresh completion on the same block. The prompt is closed only at
+      // teardown via finishConversation().
       ctx.info.state = 'prompt-active';
       ctx.info.currentPromptName = ctx.streamer.promptName;
     };
