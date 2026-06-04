@@ -26,10 +26,16 @@ export type NovaContentRole = 'SYSTEM' | 'USER' | 'ASSISTANT';
 // ─── Input Events (Client → Nova Sonic) ─────────────────────────────────────
 
 // ── sessionStart ──────────────────────────────────────────────────────────────
+// Nova 2 added turnDetectionConfiguration — controls how quickly Nova detects
+// end-of-speech (endpointing). Missing this was a silent break in Nova 2.
 export interface NovaSessionStartEvent {
   event: {
     sessionStart: {
       inferenceConfiguration: NovaInferenceConfig;
+      // Nova 2 only — v1 rejects this field entirely
+      turnDetectionConfiguration?: {
+        endpointingSensitivity: 'HIGH' | 'MEDIUM' | 'LOW';
+      };
     };
   };
 }
@@ -61,7 +67,7 @@ export interface NovaContentStartText {
       promptName: string;
       contentName: string;     // unique string per block (we generate)
       type: 'TEXT';
-      interactive: false;
+      interactive: boolean;
       role: NovaContentRole;
       textInputConfiguration: { mediaType: 'text/plain' };
     };
@@ -70,13 +76,15 @@ export interface NovaContentStartText {
 
 // ── contentStart (audio) ──────────────────────────────────────────────────────
 // Used for each USER audio turn.
+// interactive:false → we control turn end with explicit contentEnd+promptEnd (greeting)
+// interactive:true  → Nova's VAD controls turn end (normal listening turns)
 export interface NovaContentStartAudio {
   event: {
     contentStart: {
       promptName: string;
       contentName: string;     // unique string per block (we generate)
       type: 'AUDIO';
-      interactive: true;
+      interactive: boolean;
       role: 'USER';
       audioInputConfiguration: {
         mediaType: 'audio/lpcm';
@@ -264,4 +272,6 @@ export interface NovaClientConfig {
   topP: number;
   voiceId: string;
   sampleRate: number;
+  // Nova 2 only — omit entirely for Nova 1 (v1 rejects this field)
+  endpointingSensitivity?: 'HIGH' | 'MEDIUM' | 'LOW';
 }

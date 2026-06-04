@@ -1,11 +1,16 @@
 /**
- * NovaAudioStreamer: manages per-turn audio streaming to Nova Sonic.
+ * NovaAudioStreamer: streams caller audio to Nova Sonic v2 using its native
+ * continuous conversational model — ONE long-lived prompt per call.
  *
- * Each user speech segment = one Nova prompt turn:
+ *   startConversation() → promptStart + SYSTEM text + USER text greeting cue
+ *                         + contentStart(AUDIO, interactive:true)   [block stays open]
+ *   pushAudio(chunk)    → audioInput × N  (buffered and flushed into the open block)
+ *   finishConversation()→ contentEnd + promptEnd                    [call teardown only]
  *
- *   beginUserTurn()   → promptStart + contentStart(SYS, first turn only) + contentStart(AUDIO)
- *   pushAudio(chunk)  → audioInput × N  (buffered and flushed)
- *   endUserTurn()     → contentEnd + promptEnd
+ * Nova's own VAD (turnDetectionConfiguration) detects the end of each caller
+ * utterance and emits a full completionStart…completionEnd response cycle on the
+ * SAME audio block — so we do NOT open/close a prompt per turn. The app has no
+ * end-of-speech detector of its own, so relying on Nova's VAD here is mandatory.
  *
  * Content blocks are identified by contentName (unique string per block).
  */
@@ -24,17 +29,14 @@ export class NovaAudioStreamer {
   private readonly buffer: AudioBuffer;
   private readonly minChunkBytes: number;
 
-  /** True only for the very first turn — system prompt is sent then. */
-  private isFirstTurn: boolean = true;
+  /** Whether the (single, long-lived) conversation prompt is open. */
+  private conversationOpen: boolean = false;
 
-  /** Whether a user turn is currently open. */
-  private turnOpen: boolean = false;
-
-  /** Current prompt name (one per turn). */
+  /** The one prompt name used for the whole call. */
   private currentPromptName: string = '';
 
-  /** contentName for the open USER audio block in the current turn. */
-  private currentContentName: string = '';
+  /** contentName for the single continuous USER audio block. */
+  private audioContentName: string = '';
 
   constructor(sessionId: string, callId: string, client: NovaClient) {
     this.client = client;
@@ -55,108 +57,87 @@ export class NovaAudioStreamer {
   }
 
   /**
-   * Send a greeting turn (first turn only): system prompt + silent audio block +
-   * promptEnd. Nova Sonic requires at least one audio block per prompt, so we send
-   * 300ms of silence to satisfy the constraint. The hard promptEnd causes Nova to
-   * respond immediately with a spoken greeting regardless of VAD.
+   * Open the single, long-lived conversation prompt for the whole call:
    *
-   * After completionEnd fires → onTurnComplete → beginUserTurn() opens the real
-   * audio listening turn.
+   *   promptStart + SYSTEM text block            (the agent persona/instructions)
+   *   USER text greeting cue ("Hello?")          (makes Nova speak the greeting)
+   *   contentStart(AUDIO, interactive:true)      (left OPEN for the whole call)
+   *
+   * Why a text cue and not silence: Nova 2 produces NO output from silence
+   * (confirmed by scripts/test-nova-v2.ts) — it needs real speech or text. A short
+   * USER text turn deterministically elicits the spoken greeting defined by the
+   * system prompt, then the open interactive audio block lets Nova listen and
+   * respond to every subsequent caller utterance via its own VAD — no per-turn
+   * promptEnd required.
    */
-  sendGreeting(): void {
-    if (!this.client.isOpen) return;
+  startConversation(): void {
+    if (this.conversationOpen || !this.client.isOpen) return;
 
-    this.currentPromptName = this.client.startPrompt(true); // includes system
-    this.currentContentName = `greet_${uuidv4().replace(/-/g, '')}`;
+    // promptStart + SYSTEM content block (system prompt is sent once for the call).
+    this.currentPromptName = this.client.startPrompt(true);
 
-    // Open audio block (required by Nova Sonic — text-only turns are rejected)
-    this.client.openAudioBlock(this.currentPromptName, this.currentContentName);
+    // Greeting cue: a USER text turn that reliably triggers a spoken greeting.
+    const cueContentName = `cue_${uuidv4().replace(/-/g, '')}`;
+    this.client.sendUserTextBlock(this.currentPromptName, cueContentName, Env.nova.greetingTrigger);
 
-    // Send 300ms of PCM16 silence at 16kHz (16-bit mono = 2 bytes/sample)
-    // promptEnd forces a response regardless of what audio was in the buffer.
-    const silenceSamples = Math.floor(Env.audio.internalSampleRate * 0.3); // 300ms
-    const silence = Buffer.alloc(silenceSamples * 2, 0);
-    for (let offset = 0; offset < silence.length; offset += this.minChunkBytes) {
-      const chunk = silence.subarray(offset, Math.min(offset + this.minChunkBytes, silence.length));
-      this.client.sendAudio(this.currentPromptName, this.currentContentName, toBase64(chunk));
-    }
+    // ONE interactive audio block for the entire call. Nova's VAD drives turn-taking.
+    this.audioContentName = `audio_${uuidv4().replace(/-/g, '')}`;
+    this.client.openAudioBlock(this.currentPromptName, this.audioContentName, true);
 
-    this.client.closeAudioBlock(this.currentPromptName, this.currentContentName);
-    this.client.sendPromptEnd(this.currentPromptName);
-    this.isFirstTurn = false;
+    this.conversationOpen = true;
 
-    this.log.debug('Greeting turn sent (silence + promptEnd)', { promptName: this.currentPromptName });
-  }
-
-  /**
-   * Open a new user turn.
-   * Sends promptStart + contentStart(USER AUDIO).
-   * System prompt is only included on first turn (if sendGreeting() was not called).
-   */
-  beginUserTurn(): void {
-    if (this.turnOpen || !this.client.isOpen) return;
-
-    const includeSystem = this.isFirstTurn;
-
-    this.currentPromptName = this.client.startPrompt(includeSystem);
-    this.currentContentName = `audio_${uuidv4().replace(/-/g, '')}`;
-
-    this.client.openAudioBlock(this.currentPromptName, this.currentContentName);
-
-    this.isFirstTurn = false;
-    this.turnOpen = true;
-
-    this.log.debug('User turn opened', {
+    this.log.info('Conversation opened (system + greeting cue + continuous audio block)', {
       promptName: this.currentPromptName,
-      contentName: this.currentContentName,
-      systemIncluded: includeSystem,
+      cueContentName,
+      audioContentName: this.audioContentName,
+      greetingTrigger: Env.nova.greetingTrigger,
+      interactive: true,
     });
   }
 
   /**
-   * Push a noise-suppressed PCM16 chunk. Flushes to Nova when a full frame
-   * has accumulated.
+   * Push a noise-suppressed PCM16 chunk into the open audio block. Flushes to Nova
+   * when a full frame has accumulated. Nova's VAD detects when the caller stops and
+   * responds automatically.
    */
   pushAudio(pcm16: Buffer): void {
-    if (!this.turnOpen || !this.client.isOpen || pcm16.length === 0) return;
+    if (!this.conversationOpen || !this.client.isOpen || pcm16.length === 0) return;
     this.buffer.push(pcm16);
     this.flush();
   }
 
   /**
-   * Close the user turn: flush remaining audio, send contentEnd + promptEnd.
-   * Nova Sonic will begin generating its response after promptEnd.
+   * End the whole conversation (call teardown): flush remaining audio, then close
+   * the audio block and the prompt. Nova finishes any in-flight response and the
+   * stream is closed by the client (sessionEnd).
    */
-  endUserTurn(): void {
-    if (!this.turnOpen) return;
+  finishConversation(): void {
+    if (!this.conversationOpen) return;
 
     const remaining = this.buffer.drain();
     if (remaining.length > 0) {
       this.sendChunk(remaining);
     }
 
-    this.client.closeAudioBlock(this.currentPromptName, this.currentContentName);
+    this.client.closeAudioBlock(this.currentPromptName, this.audioContentName);
     this.client.sendPromptEnd(this.currentPromptName);
-    this.turnOpen = false;
+    this.conversationOpen = false;
 
-    this.log.debug('User turn ended — promptEnd sent', {
+    this.log.debug('Conversation finished — contentEnd + promptEnd sent', {
       promptName: this.currentPromptName,
     });
   }
 
   /**
-   * Barge-in: discard buffered audio, close the block early, signal Nova.
+   * Barge-in: Nova handles turn-taking natively on the interactive audio block, so
+   * we keep the block open and simply drop any buffered inbound audio. The outbound
+   * (caller-facing) audio is cleared separately by the AudioRouter via Twilio.
    */
   handleInterruption(): void {
     this.buffer.clear();
-    if (this.turnOpen) {
-      this.client.closeAudioBlock(this.currentPromptName, this.currentContentName);
-      this.client.sendPromptEnd(this.currentPromptName);
-      this.turnOpen = false;
-      this.log.info('User turn interrupted — buffer cleared', {
-        promptName: this.currentPromptName,
-      });
-    }
+    this.log.info('Barge-in — inbound buffer cleared (Nova manages the turn natively)', {
+      promptName: this.currentPromptName,
+    });
   }
 
   private flush(): void {
@@ -166,11 +147,11 @@ export class NovaAudioStreamer {
   }
 
   private sendChunk(chunk: Buffer): void {
-    this.client.sendAudio(this.currentPromptName, this.currentContentName, toBase64(chunk));
+    this.client.sendAudio(this.currentPromptName, this.audioContentName, toBase64(chunk));
   }
 
-  get isTurnOpen(): boolean {
-    return this.turnOpen;
+  get isConversationOpen(): boolean {
+    return this.conversationOpen;
   }
 
   get promptName(): string {

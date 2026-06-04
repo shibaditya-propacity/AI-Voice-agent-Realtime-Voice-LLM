@@ -86,7 +86,7 @@ export const Env = {
   },
 
   nova: {
-    modelId: optionalEnv('NOVA_MODEL_ID', 'amazon.nova-sonic-v1:0'),
+    modelId: optionalEnv('NOVA_MODEL_ID', 'amazon.nova-2-sonic-v1:0'),
     // System prompt is hardcoded here — edit this source line to change agent behaviour.
     // Do NOT put the prompt in the .env file.
     systemPrompt: [
@@ -96,8 +96,13 @@ export const Env = {
       'PRIMARY OBJECTIVE: Book a site visit.',
       'SECONDARY: Qualify the lead, schedule a callback, gather requirements, create a positive impression.',
       '',
+      'LANGUAGE:',
+      'Understand and speak Hindi, English, and Hinglish (mixed Hindi-English).',
+      'Detect the language the caller uses and mirror it — if they speak Hindi, reply in Hindi; if English, reply in English; if they mix, reply in natural Hinglish.',
+      'Use everyday Indian conversational phrasing. Numbers, budgets, and dates may be spoken in whichever language sounds natural.',
+      '',
       'VOICE AND PERSONALITY:',
-      'Speak with a professional Indian English accent. Formal, respectful, confident but never aggressive.',
+      'Speak with a professional, warm Indian conversational voice. Formal, respectful, confident but never aggressive.',
       'Keep responses short — under 2 sentences for most replies.',
       'Ask only one question at a time. Never overload the customer with information.',
       'Sound natural, never robotic or scripted. Do not show excessive enthusiasm.',
@@ -147,10 +152,21 @@ export const Env = {
       'Respond immediately. Avoid unnecessary words. Prioritize conversational speed.',
       'Every qualified call must move toward securing a site visit.',
     ].join(' '),
+    // Greeting trigger: Nova 2 will NOT produce any output from silence — it needs
+    // real speech or a text turn. We open the call with a short USER text cue (as if
+    // the caller picked up and said "Hello?") so Nova generates the spoken greeting
+    // defined by the system prompt. Change via NOVA_GREETING_TRIGGER if needed.
+    greetingTrigger: optionalEnv('NOVA_GREETING_TRIGGER', 'Hello?'),
     maxTokens: optionalInt('NOVA_MAX_TOKENS', 512),
     temperature: optionalFloat('NOVA_TEMPERATURE', 0.7),
     topP: optionalFloat('NOVA_TOP_P', 0.9),
-    voiceId: optionalEnv('NOVA_VOICE_ID', 'matthew'),
+    // Nova 2 voices: arjun (Indian English + Hindi), tiffany (US female), matthew (US male), amy (British)
+    // 'arjun' is required for Hindi/Indian English code-switching — DO use with telephony/PCMU.
+    // The audio pipeline converts Nova's PCM16 output → PCMU, so all voices work with telephony.
+    voiceId: optionalEnv('NOVA_VOICE_ID', 'arjun'),
+    // endpointingSensitivity is ONLY for Nova 2 — Nova 1 rejects it with a hard error.
+    // Leave undefined for Nova 1. Set via NOVA_ENDPOINTING_SENSITIVITY env var for Nova 2.
+    endpointingSensitivity: process.env.NOVA_ENDPOINTING_SENSITIVITY as 'HIGH' | 'MEDIUM' | 'LOW' | undefined,
   },
 
   audio: {
