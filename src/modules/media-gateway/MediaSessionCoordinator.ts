@@ -79,17 +79,9 @@ export class MediaSessionCoordinator {
     const { sessionId } = session;
     this.callToSession.set(callId, sessionId);
 
-    // 2. Initialize Krisp processor for this session
-    try {
-      await this.krispService.createProcessor(sessionId);
-    } catch (err) {
-      log.warn('Krisp initialization failed — continuing without noise suppression', {
-        sessionId,
-        error: (err as Error).message,
-      });
-    }
-
-    // 3. Open Nova Sonic session — wire audio output back to caller
+    // 2. Open Nova Sonic session FIRST so the greeting starts as fast as possible.
+    //    (Krisp is only needed once the caller speaks — i.e. after the greeting —
+    //    so initializing it before Nova just adds dead time to greeting latency.)
     try {
       await this.novaSessionManager.createSession(
         sessionId,
@@ -108,6 +100,17 @@ export class MediaSessionCoordinator {
       await this.teardown(callId, sessionId, 'nova-init-failure');
       throw err;
     }
+
+    // 3. Initialize Krisp in the BACKGROUND — do not block the greeting on it.
+    //    routeInbound() passes audio through unprocessed until the processor is
+    //    ready, so the only cost of a not-yet-ready processor is a few early
+    //    caller frames skipping noise suppression.
+    this.krispService.createProcessor(sessionId).catch((err) => {
+      log.warn('Krisp initialization failed — continuing without noise suppression', {
+        sessionId,
+        error: (err as Error).message,
+      });
+    });
 
     // 4. Transition session to active
     this.sessionManager.transitionState(sessionId, 'active');

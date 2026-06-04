@@ -11,6 +11,7 @@ import { Env } from '../../config';
 import { AppEvent } from '../../events/EventTypes';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
+import { latencyRegistry, clearVad } from '../../shared/LatencyRegistry';
 import { withRetry } from '../../utils/helpers';
 import { SessionManager } from '../session/SessionManager';
 import { NovaClient } from './NovaClient';
@@ -36,9 +37,71 @@ export class NovaSessionManager {
   private readonly sessionManager: SessionManager;
   private readonly log: Logger;
 
+  /** Timer for periodic Bedrock connection re-warming (keep-alive). */
+  private prewarmTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(sessionManager: SessionManager) {
     this.sessionManager = sessionManager;
     this.log = Logger.root('NovaSessionManager');
+  }
+
+  /** Build the per-call Nova client config from environment settings. */
+  private buildConfig(): NovaClientConfig {
+    return {
+      modelId: Env.nova.modelId,
+      region: Env.aws.region,
+      accessKeyId: Env.aws.accessKeyId,
+      secretAccessKey: Env.aws.secretAccessKey,
+      systemPrompt: Env.nova.systemPrompt,
+      maxTokens: Env.nova.maxTokens,
+      temperature: Env.nova.temperature,
+      topP: Env.nova.topP,
+      voiceId: Env.nova.voiceId,
+      sampleRate: Env.audio.internalSampleRate,
+      outputSampleRate: Env.nova.audioOutputSampleRate,
+      endpointingSensitivity: Env.nova.endpointingSensitivity,
+    };
+  }
+
+  /**
+   * Warm the Bedrock connection at server boot so the first real call avoids the
+   * cold-connection penalty. Best-effort and non-blocking; safe to fire-and-forget.
+   */
+  async prewarm(): Promise<void> {
+    await NovaClient.prewarm(this.buildConfig());
+  }
+
+  /**
+   * Warm the Bedrock connection now and keep it warm on an interval, so the first
+   * call after a quiet period stays fast (AWS idle-closes HTTP/2 connections after
+   * ~5 min). Re-warming is skipped while calls are active — live traffic already
+   * keeps the connection alive. Pass intervalMs <= 0 to do a one-shot warm only.
+   */
+  startPeriodicPrewarm(intervalMs: number = Env.nova.prewarmIntervalMs): void {
+    // Immediate warm at boot.
+    void this.prewarm();
+
+    if (intervalMs <= 0) return;
+
+    this.prewarmTimer = setInterval(() => {
+      // Active calls keep the connection warm on their own — no need to re-warm.
+      if (this.sessions.size > 0) return;
+      void this.prewarm();
+    }, intervalMs);
+
+    // Don't let the keep-alive timer hold the process open by itself.
+    if (typeof this.prewarmTimer.unref === 'function') this.prewarmTimer.unref();
+
+    this.log.info('Periodic Bedrock pre-warm started', { intervalMs });
+  }
+
+  /** Stop the periodic re-warm timer (called on shutdown). */
+  stopPeriodicPrewarm(): void {
+    if (this.prewarmTimer) {
+      clearInterval(this.prewarmTimer);
+      this.prewarmTimer = null;
+      this.log.info('Periodic Bedrock pre-warm stopped');
+    }
   }
 
   async createSession(
@@ -50,19 +113,7 @@ export class NovaSessionManager {
       throw new Error(`Nova session already exists for session ${sessionId}`);
     }
 
-    const config: NovaClientConfig = {
-      modelId: Env.nova.modelId,
-      region: Env.aws.region,
-      accessKeyId: Env.aws.accessKeyId,
-      secretAccessKey: Env.aws.secretAccessKey,
-      systemPrompt: Env.nova.systemPrompt,
-      maxTokens: Env.nova.maxTokens,
-      temperature: Env.nova.temperature,
-      topP: Env.nova.topP,
-      voiceId: Env.nova.voiceId,
-      sampleRate: Env.audio.internalSampleRate,
-      endpointingSensitivity: Env.nova.endpointingSensitivity,
-    };
+    const config = this.buildConfig();
 
     const log = Logger.forSession(sessionId, callId, 'NovaSessionManager');
     log.info('Creating Nova session', {
@@ -113,9 +164,9 @@ export class NovaSessionManager {
         //
         //   2. startConversation() — queues the single long-lived prompt:
         //        promptStart + SYSTEM text + USER text greeting cue
-        //        + contentStart(AUDIO, interactive:true)   [block left open]
-        //      The text cue makes Nova speak the greeting (silence produces no
-        //      output in Nova 2). The interactive audio block then stays open for
+        //        + contentStart(AUDIO, interactive:true)   [audio block left open]
+        //      The greeting cue's contentEnd makes the agent speak first (Nova does
+        //      not greet on its own). The interactive audio block then stays open for
         //      the whole call so Nova's VAD detects each caller turn and responds.
         //
         //   3. connect() — calls bedrockClient.send(); the input generator yields
@@ -156,7 +207,7 @@ export class NovaSessionManager {
     );
 
     // The conversation prompt (system + greeting cue + open audio block) was queued
-    // before connect(). Nova is now generating the spoken greeting and is already
+    // before connect(). Nova is generating the opening greeting and is already
     // listening on the open audio block — caller audio pushed via pushAudio() flows
     // straight in, and Nova's VAD drives every subsequent turn.
     const ctx = this.sessions.get(sessionId);
@@ -198,6 +249,8 @@ export class NovaSessionManager {
     ctx.unsubscribeClientEvents();
     ctx.client.close();
     this.sessions.delete(sessionId);
+    latencyRegistry.clear(sessionId);
+    clearVad(sessionId);
 
     eventBus.emit(AppEvent.NOVA_DISCONNECTED, {
       sessionId,
@@ -225,6 +278,12 @@ export class NovaSessionManager {
       });
     };
 
+    // 'completion-start' fires when Nova begins generating a response turn.
+    // This is the start of the response-latency clock (caller-stop happened earlier).
+    const onCompletionStart = (): void => {
+      latencyRegistry.startTurn(sessionId);
+    };
+
     // 'content-start' fires when Nova begins an AUDIO or TEXT output block
     const onContentStart = (_contentId: string, type: 'AUDIO' | 'TEXT'): void => {
       if (type === 'AUDIO') {
@@ -243,7 +302,8 @@ export class NovaSessionManager {
       ctx.outputAudioBytes += chunk.length;
 
       if (ctx.outputAudioBytes === chunk.length) {
-        // First audio chunk for this response
+        // First audio chunk for this response (Nova model time-to-first-audio)
+        latencyRegistry.mark(sessionId, 'firstNovaAudio');
         log.info('✅ First audio chunk routed to caller', {
           chunkBytes: chunk.length,
           contentId: _contentId,
@@ -267,9 +327,11 @@ export class NovaSessionManager {
     const onTextOutput = (text: string, _contentId: string, role: string): void => {
       ctx.info.lastEventAt = Date.now();
       if (role === 'USER') {
+        latencyRegistry.mark(sessionId, 'firstUserText');
         ctx.currentUserTranscript += text;
         this.sessionManager.addTranscriptEntry(sessionId, 'user', ctx.currentUserTranscript, false);
       } else {
+        latencyRegistry.mark(sessionId, 'firstAssistantText');
         ctx.currentAssistantTranscript += text;
         this.sessionManager.addTranscriptEntry(sessionId, 'assistant', ctx.currentAssistantTranscript, false);
       }
@@ -293,10 +355,17 @@ export class NovaSessionManager {
       const isGreetingTurn = ctx.info.turnCount === 1;
       log.info(
         isGreetingTurn
-          ? '✅ Nova greeting response complete — still listening on open audio block'
+          ? '✅ Nova greeting complete — opening ears to the caller now'
           : '✅ Nova response complete — still listening on open audio block',
         { stopReason, turnCount: ctx.info.turnCount },
       );
+
+      // The greeting is done playing → start feeding caller audio to Nova. Before
+      // this, inbound audio was dropped so an overlapping "hello" couldn't trigger a
+      // repeat greeting.
+      if (isGreetingTurn) {
+        ctx.streamer.startListening('greeting-complete');
+      }
 
       this.sessionManager.incrementTurn(sessionId);
 
@@ -336,6 +405,7 @@ export class NovaSessionManager {
     };
 
     client.on('session-started', onSessionStarted);
+    client.on('completion-start', onCompletionStart);
     client.on('content-start', onContentStart);
     client.on('audio-output', onAudioOutput);
     client.on('text-output', onTextOutput);
@@ -347,6 +417,7 @@ export class NovaSessionManager {
 
     return () => {
       client.off('session-started', onSessionStarted);
+      client.off('completion-start', onCompletionStart);
       client.off('content-start', onContentStart);
       client.off('audio-output', onAudioOutput);
       client.off('text-output', onTextOutput);

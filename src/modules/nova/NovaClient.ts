@@ -14,7 +14,7 @@
  *   contentEnd                       (contentName_sys)
  *   contentStart                     (contentName_cue, type:TEXT, role:USER, interactive:true)
  *   textInput                        (contentName_cue, greeting trigger e.g. "Hello?")
- *   contentEnd                       (contentName_cue)  ← Nova speaks the greeting
+ *   contentEnd                       (contentName_cue)  ← agent speaks the greeting
  *   contentStart                     (contentName_aud, type:AUDIO, role:USER, interactive:TRUE)
  *   audioInput × N …                 (caller speech streamed continuously for the
  *                                     whole call — Nova's VAD detects each end-of-turn
@@ -29,8 +29,9 @@
  * emitting a fresh completionStart…completionEnd cycle for every caller utterance on
  * the SAME open audio block. Closing/reopening a prompt per turn (and the fact that
  * nothing in this app detects end-of-speech to send promptEnd) is exactly what made
- * the migrated build go silent. Silence input also never triggers output, so the
- * greeting is primed with a short text cue instead of PCM silence.
+ * the migrated build go silent. Silence input never triggers output and Nova does
+ * not greet first on its own, so the opening greeting is primed with a short USER
+ * text cue (its contentEnd triggers the greeting).
  *
  * Nova 2 OUTPUT events (in order):
  *   usageEvent
@@ -72,6 +73,15 @@ import {
 } from './NovaTypes';
 
 export class NovaClient extends EventEmitter {
+  /**
+   * Shared across all calls so the HTTP/2 connection + TLS handshake to Bedrock is
+   * reused (keep-alive) instead of re-established per call. The first call pays the
+   * full setup cost; every subsequent call connects on the warm connection, cutting
+   * seconds off time-to-greeting. Region/credentials are identical for all calls
+   * (sourced from Env), so a single shared client is correct.
+   */
+  private static sharedClient: BedrockRuntimeClient | null = null;
+
   private readonly bedrockClient: BedrockRuntimeClient;
   private readonly config: NovaClientConfig;
   private readonly log: Logger;
@@ -92,13 +102,7 @@ export class NovaClient extends EventEmitter {
     this.config = config;
     this.log = Logger.forSession(sessionId, callId, 'NovaClient');
 
-    this.bedrockClient = new BedrockRuntimeClient({
-      region: config.region,
-      credentials: {
-        accessKeyId: config.accessKeyId,
-        secretAccessKey: config.secretAccessKey,
-      },
-    });
+    this.bedrockClient = NovaClient.ensureSharedClient(config);
 
     this.log.info('NovaClient created', {
       modelId: config.modelId,
@@ -107,6 +111,162 @@ export class NovaClient extends EventEmitter {
       sampleRate: config.sampleRate,
       endpointingSensitivity: config.endpointingSensitivity,
     });
+  }
+
+  /** Lazily create (or return) the process-wide shared Bedrock client. */
+  private static ensureSharedClient(config: NovaClientConfig): BedrockRuntimeClient {
+    if (!NovaClient.sharedClient) {
+      NovaClient.sharedClient = new BedrockRuntimeClient({
+        region: config.region,
+        credentials: {
+          accessKeyId: config.accessKeyId,
+          secretAccessKey: config.secretAccessKey,
+        },
+      });
+    }
+    return NovaClient.sharedClient;
+  }
+
+  /**
+   * Pre-warm the Bedrock connection at server boot so the FIRST real call gets the
+   * warm-connection latency (~2s) instead of the cold-connection latency (~5s).
+   *
+   * Runs a COMPLETE, VALID, self-contained warm-up session — its own session,
+   * promptName and content names, a tiny system+user text turn, capped at a few
+   * tokens — that Nova accepts and closes cleanly (no "No prompts were received"
+   * error, no dangling stream). It shares the pooled HTTP/2 connection that live
+   * calls reuse (that is the point of warming), but it is fully ISOLATED from any
+   * live caller session: separate stream, output entirely discarded, never reads or
+   * writes session/transcript/latency state, and (via the caller's guard) never runs
+   * while a call is active. Best-effort: failures are logged and swallowed.
+   *
+   * Logs `connectMs` (time to open the stream — the number that drops once the
+   * connection is warm) and `elapsedMs` (whole warm-up) so the improvement is
+   * measurable: compare this cold `connectMs` against the `connectElapsedMs` printed
+   * on the first real call's stream-open.
+   */
+  static async prewarm(config: NovaClientConfig, timeoutMs = 8_000): Promise<void> {
+    const log = Logger.root('NovaClient');
+    const client = NovaClient.ensureSharedClient(config);
+
+    // Unique, isolated identifiers — cannot collide with any live call's session.
+    const promptName = `warmup_${uuidv4().replace(/-/g, '')}`;
+    const sysName = `wsys_${uuidv4().replace(/-/g, '')}`;
+    const usrName = `wusr_${uuidv4().replace(/-/g, '')}`;
+
+    const sessionStart: NovaSessionStartEvent = {
+      event: {
+        sessionStart: {
+          // Cap tokens hard — the warm-up reply is discarded, we only need a valid turn.
+          inferenceConfiguration: { maxTokens: 8, temperature: 0.5, topP: 0.9 },
+          ...(config.endpointingSensitivity
+            ? { turnDetectionConfiguration: { endpointingSensitivity: config.endpointingSensitivity } }
+            : {}),
+        },
+      },
+    };
+    const promptStart: NovaPromptStartEvent = {
+      event: {
+        promptStart: {
+          promptName,
+          textOutputConfiguration: { mediaType: 'text/plain' },
+          audioOutputConfiguration: {
+            mediaType: 'audio/lpcm',
+            sampleRateHertz: config.outputSampleRate,
+            sampleSizeBits: 16,
+            channelCount: 1,
+            voiceId: config.voiceId,
+            encoding: 'base64',
+            audioType: 'SPEECH',
+          },
+        },
+      },
+    };
+    const sysStart: NovaContentStartText = {
+      event: { contentStart: { promptName, contentName: sysName, type: 'TEXT', interactive: true, role: 'SYSTEM', textInputConfiguration: { mediaType: 'text/plain' } } },
+    };
+    const sysText: NovaTextInputEvent = {
+      event: { textInput: { promptName, contentName: sysName, content: 'Warm-up. Reply with: ok' } },
+    };
+    const sysEnd: NovaContentEndEvent = { event: { contentEnd: { promptName, contentName: sysName } } };
+
+    // Nova requires every prompt to contain at least one AUDIO content block, so the
+    // warm-up sends one with a short silent PCM16 chunk (non-interactive, we close it
+    // ourselves). Silence yields no response — fine, we only need a valid prompt.
+    const silence = Buffer.alloc(Math.floor(config.sampleRate * 0.1) * 2, 0); // ~100ms @ input rate
+    const audStart: NovaContentStartAudio = {
+      event: {
+        contentStart: {
+          promptName,
+          contentName: usrName,
+          type: 'AUDIO',
+          interactive: false,
+          role: 'USER',
+          audioInputConfiguration: {
+            mediaType: 'audio/lpcm',
+            sampleRateHertz: config.sampleRate,
+            sampleSizeBits: 16,
+            channelCount: 1,
+            audioType: 'SPEECH',
+            encoding: 'base64',
+          },
+        },
+      },
+    };
+    const audInput: NovaAudioInputEvent = {
+      event: { audioInput: { promptName, contentName: usrName, content: silence.toString('base64') } },
+    };
+    const audEnd: NovaContentEndEvent = { event: { contentEnd: { promptName, contentName: usrName } } };
+    const promptEnd: NovaPromptEndEvent = { event: { promptEnd: { promptName } } };
+    const sessionEnd: NovaSessionEndEvent = { event: { sessionEnd: {} } };
+
+    const warmupEvents: NovaInputEvent[] = [
+      sessionStart, promptStart, sysStart, sysText, sysEnd, audStart, audInput, audEnd, promptEnd, sessionEnd,
+    ];
+
+    async function* warmupStream(): AsyncGenerator<InvokeModelWithBidirectionalStreamInput> {
+      for (const ev of warmupEvents) {
+        yield { chunk: { bytes: Buffer.from(JSON.stringify(ev), 'utf-8') } };
+      }
+    }
+
+    log.info('Pre-warming Bedrock connection (valid warm-up session)', { modelId: config.modelId, region: config.region });
+    const startedAt = Date.now();
+
+    try {
+      const command = new InvokeModelWithBidirectionalStreamCommand({
+        modelId: config.modelId,
+        body: warmupStream(),
+      } as InvokeModelWithBidirectionalStreamCommandInput);
+
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`prewarm timed out after ${timeoutMs}ms`)), timeoutMs),
+      );
+      const response = await Promise.race([client.send(command), timeout]);
+      const connectMs = Date.now() - startedAt;
+
+      // Drain the valid session to completion so it closes cleanly (Nova ends it
+      // after sessionEnd). Output is fully discarded — never touches live state.
+      if (response.body) {
+        const drain = (async () => {
+          for await (const _item of response.body!) {
+            /* discard warm-up output */
+          }
+        })();
+        const drainTimeout = new Promise<void>((resolve) => setTimeout(resolve, 3_000));
+        await Promise.race([drain, drainTimeout]);
+      }
+      log.info('Bedrock connection pre-warmed — first call reuses the warm connection', {
+        connectMs,
+        elapsedMs: Date.now() - startedAt,
+        note: 'compare connectMs (cold) vs the first call\'s connectElapsedMs (warm) to see the gain',
+      });
+    } catch (err) {
+      // Only reached if send() itself fails (real connection/credential problem).
+      log.warn('Bedrock pre-warm failed (non-fatal) — first call may be cold', {
+        error: (err as Error).message,
+      });
+    }
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────────────
@@ -138,6 +298,7 @@ export class NovaClient extends EventEmitter {
     });
 
     try {
+      const connectStartedAt = Date.now();
       const sendPromise = this.bedrockClient.send(command);
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(
@@ -147,9 +308,11 @@ export class NovaClient extends EventEmitter {
       );
       const response = await Promise.race([sendPromise, timeoutPromise]);
 
+      // Bedrock stream-open time — cold (~seconds) vs warm (pre-warmed connection).
       this.log.info('Nova Sonic stream opened successfully', {
         modelId: this.config.modelId,
         hasBody: !!response.body,
+        connectElapsedMs: Date.now() - connectStartedAt,
       });
 
       if (response.body) {
@@ -515,7 +678,8 @@ export class NovaClient extends EventEmitter {
           textOutputConfiguration: { mediaType: 'text/plain' },
           audioOutputConfiguration: {
             mediaType: 'audio/lpcm',
-            sampleRateHertz: this.config.sampleRate,
+            // Nova emits speech at this rate; outbound pipeline downsamples it to 8kHz.
+            sampleRateHertz: this.config.outputSampleRate,
             sampleSizeBits: 16,
             channelCount: 1,
             voiceId: this.config.voiceId,

@@ -271,7 +271,10 @@ export interface NovaClientConfig {
   temperature: number;
   topP: number;
   voiceId: string;
+  /** Sample rate of caller audio we SEND to Nova (audioInputConfiguration). */
   sampleRate: number;
+  /** Sample rate Nova produces its speech OUTPUT at (audioOutputConfiguration). */
+  outputSampleRate: number;
   // Nova 2 only — omit entirely for Nova 1 (v1 rejects this field)
   endpointingSensitivity?: 'HIGH' | 'MEDIUM' | 'LOW';
 }
