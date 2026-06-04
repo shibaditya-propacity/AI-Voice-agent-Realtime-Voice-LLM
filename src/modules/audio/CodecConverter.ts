@@ -174,4 +174,24 @@ export class CodecConverter implements ICodecConverter {
 
     return out;
   }
+
+  // ─── Resampling: 24kHz → 8kHz (3:1 decimation, windowed average) ─────────
+  // Nova Sonic emits 24kHz PCM16 audio. Telephony (Twilio) needs 8kHz. Treating
+  // 24kHz as 16kHz (the old assumption) plays it ~1.5x slow and garbled ("harsh").
+
+  resample24kTo8k(pcm16_24k: Buffer): Buffer {
+    const inputSamples = pcm16_24k.length >> 1;
+    const outputSamples = Math.floor(inputSamples / 3);
+    const out = Buffer.allocUnsafe(outputSamples * 2);
+
+    for (let i = 0; i < outputSamples; i++) {
+      // Average three consecutive samples (anti-aliasing low-pass)
+      const s0 = pcm16_24k.readInt16LE(i * 6);
+      const s1 = pcm16_24k.readInt16LE(i * 6 + 2);
+      const s2 = pcm16_24k.readInt16LE(i * 6 + 4);
+      out.writeInt16LE(Math.round((s0 + s1 + s2) / 3), i * 2);
+    }
+
+    return out;
+  }
 }

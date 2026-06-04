@@ -37,6 +37,7 @@ export interface AppServices {
   twilioService: TwilioService;
   mediaGateway: MediaGatewayService;
   sessionManager: SessionManager;
+  novaSessionManager: NovaSessionManager;
 }
 
 export function createApp(): { app: Application; services: AppServices } {
@@ -106,6 +107,6 @@ export function createApp(): { app: Application; services: AppServices } {
 
   return {
     app,
-    services: { twilioService, mediaGateway, sessionManager },
+    services: { twilioService, mediaGateway, sessionManager, novaSessionManager },
   };
 }

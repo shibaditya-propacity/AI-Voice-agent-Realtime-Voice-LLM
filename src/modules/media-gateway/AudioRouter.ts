@@ -8,8 +8,8 @@
  *   4. NovaSessionManager → Nova Sonic
  *
  * Outbound pipeline (agent → caller):
- *   1. PCM16 @ 16kHz from Nova Sonic
- *   2. AudioProcessor → telephony codec (PCMU @ 8kHz)
+ *   1. PCM16 @ Nova output rate (24kHz native) from Nova Sonic
+ *   2. AudioProcessor → downsample to 8kHz → telephony codec (PCMU @ 8kHz)
  *   3. Base64-encode → TwilioService
  */
 
@@ -18,6 +18,7 @@ import { AppEvent } from '../../events/EventTypes';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
 import { fromBase64, toBase64, nowMs } from '../../utils/helpers';
+import { latencyRegistry, detectSpeechEnd } from '../../shared/LatencyRegistry';
 import { AudioProcessor } from '../audio/AudioProcessor';
 import { KrispService } from '../krisp/KrispService';
 import { NovaSessionManager } from '../nova/NovaSessionManager';
@@ -63,6 +64,7 @@ export class AudioRouter {
     if (raw.length === 0) return;
 
     const codec = Env.audio.telephonyCodec;
+    const tStart = process.hrtime.bigint();
 
     // Step 1: Decode + resample to PCM16 @ 16kHz
     let pcm16: Buffer;
@@ -72,6 +74,12 @@ export class AudioRouter {
       this.log.error('Inbound audio conversion failed', err as Error, { sessionId, callId });
       return;
     }
+    const tDecoded = process.hrtime.bigint();
+
+    // Energy VAD (measurement only): timestamp when the caller stops speaking so we
+    // can measure Nova's endpointing latency. Does not alter the audio path.
+    const speechEndAt = detectSpeechEnd(sessionId, pcm16);
+    if (speechEndAt !== null) latencyRegistry.setSpeechEnd(sessionId, speechEndAt);
 
     eventBus.emit(AppEvent.AUDIO_RECEIVED, {
       sessionId,
@@ -94,6 +102,7 @@ export class AudioRouter {
       });
       cleanPcm16 = pcm16;
     }
+    const tKrisp = process.hrtime.bigint();
 
     eventBus.emit(AppEvent.AUDIO_PROCESSED, {
       sessionId,
@@ -106,6 +115,12 @@ export class AudioRouter {
 
     // Step 3: Stream to Nova Sonic
     this.novaSessionManager.pushAudio(sessionId, cleanPcm16);
+
+    // Per-frame inbound cost (microseconds): decode, krisp, total.
+    const decodeUs = Number(tDecoded - tStart) / 1000;
+    const krispUs = Number(tKrisp - tDecoded) / 1000;
+    const totalUs = Number(process.hrtime.bigint() - tStart) / 1000;
+    latencyRegistry.recordInbound(sessionId, decodeUs, krispUs, totalUs);
 
     this.sessionManager.recordAudioStats(sessionId, {
       framesReceived: 1,
@@ -136,6 +151,11 @@ export class AudioRouter {
     const sent = this.twilioService.sendAudio(callId, base64);
 
     if (sent) {
+      // Mark first audio chunk reaching Twilio for this turn → completes the
+      // latency breakdown table.
+      latencyRegistry.mark(sessionId, 'firstTwilioAudio');
+      latencyRegistry.report(sessionId, callId);
+
       eventBus.emit(AppEvent.AUDIO_SENT, {
         sessionId,
         callId,

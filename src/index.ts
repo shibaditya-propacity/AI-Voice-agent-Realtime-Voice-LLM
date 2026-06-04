@@ -44,6 +44,11 @@ async function main(): Promise<void> {
     httpServer.on('error', reject);
   });
 
+  // 4b. Pre-warm the Bedrock connection so the first call isn't cold (~5s → ~2s),
+  //     and keep it warm on an interval so calls after a quiet period stay fast.
+  //     Non-blocking: never delays startup or crashes on failure.
+  services.novaSessionManager.startPeriodicPrewarm();
+
   // 5. Graceful shutdown
   const shutdown = async (signal: string): Promise<void> => {
     log.info(`Received ${signal} — shutting down gracefully`);
@@ -53,6 +58,9 @@ async function main(): Promise<void> {
 
     // Close all WebSocket connections
     await wsServer.close();
+
+    // Stop the periodic Bedrock re-warm timer
+    services.novaSessionManager.stopPeriodicPrewarm();
 
     // Unsubscribe MediaGatewayService internal event handlers
     services.mediaGateway.dispose();

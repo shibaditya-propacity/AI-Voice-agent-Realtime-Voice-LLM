@@ -1,8 +1,8 @@
 /**
  * AudioProcessor: stateless conversion layer between telephony and internal formats.
  *
- * Inbound:  PCMU/PCMA @ 8kHz  →  PCM16 @ 16kHz   (for Krisp + Nova Sonic)
- * Outbound: PCM16 @ 16kHz     →  PCMU/PCMA @ 8kHz (for Knowlarity playback)
+ * Inbound:  PCMU/PCMA @ 8kHz       →  PCM16 @ 16kHz   (for Krisp + Nova Sonic input)
+ * Outbound: PCM16 @ Nova rate (24k) →  PCMU/PCMA @ 8kHz (for Twilio playback)
  */
 
 import { Env } from '../../config';
@@ -58,18 +58,34 @@ export class AudioProcessor implements IAudioProcessor {
   }
 
   /**
-   * Convert internal PCM16 @ 16kHz → telephony audio.
+   * Convert Nova Sonic PCM16 output → telephony audio.
+   *
+   * Nova emits PCM16 at Env.nova.audioOutputSampleRate (24kHz by default — its
+   * native rate). Telephony needs 8kHz. We downsample from Nova's ACTUAL output
+   * rate, not from a fixed assumption — using the wrong rate is what made playback
+   * sound slow/garbled ("harsh").
    *
    * Pipeline:
-   *   PCM16 (16kHz, 16-bit) → PCM16 (8kHz, 16-bit) → PCMU/PCMA (8kHz, 8-bit)
+   *   PCM16 (Nova rate) → PCM16 (8kHz) → PCMU/PCMA (8kHz, 8-bit)
    */
   async processOutbound(pcm16: Buffer, targetCodec: AudioCodec): Promise<Buffer> {
     if (pcm16.length === 0) return pcm16;
 
-    // Downsample from internal rate (16kHz) to telephony rate (8kHz)
+    const srcRate = Env.nova.audioOutputSampleRate;
+    const dstRate = Env.audio.telephonySampleRate; // 8000
+
+    // Downsample from Nova's output rate to telephony rate (8kHz)
     let pcm16_8k: Buffer = pcm16;
-    if (Env.audio.telephonySampleRate !== Env.audio.internalSampleRate) {
-      pcm16_8k = this.converter.resample16kTo8k(pcm16);
+    if (srcRate !== dstRate) {
+      if (srcRate === 24000) {
+        pcm16_8k = this.converter.resample24kTo8k(pcm16);
+      } else if (srcRate === 16000) {
+        pcm16_8k = this.converter.resample16kTo8k(pcm16);
+      } else {
+        log.warn(
+          `Unsupported Nova output rate ${srcRate}Hz → ${dstRate}Hz; sending without resample (audio may sound wrong)`,
+        );
+      }
     }
 
     switch (targetCodec) {

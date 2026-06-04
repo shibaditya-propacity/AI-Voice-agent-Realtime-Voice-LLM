@@ -106,4 +106,7 @@ export interface ICodecConverter {
 
   /** Downsample a 16-bit mono PCM buffer from 16kHz to 8kHz. */
   resample16kTo8k(pcm16_16k: Buffer): Buffer;
+
+  /** Downsample a 16-bit mono PCM buffer from 24kHz to 8kHz (Nova Sonic output). */
+  resample24kTo8k(pcm16_24k: Buffer): Buffer;
 }

@@ -83,8 +83,21 @@ export function createTwilioRouter(
   router.post('/webhooks/twilio/status', (req: Request, res: Response): void => {
     const callSid: string = req.body?.CallSid ?? '';
     const callStatus: string = req.body?.CallStatus ?? '';
+    // Twilio includes ErrorCode/ErrorMessage on failed/canceled calls — surface them.
+    const errorCode = req.body?.ErrorCode;
+    const errorMessage = req.body?.ErrorMessage;
 
-    log.info('Twilio status callback', { callSid, callStatus });
+    if (errorCode || callStatus === 'failed') {
+      log.warn('Twilio call FAILED — see Twilio error code', {
+        callSid,
+        callStatus,
+        errorCode,
+        errorMessage,
+        hint: 'Common: 21215/13227 geo-permission (enable India/+91 in Voice Geo Permissions); 21219/13225 unverified number (trial can only call Verified Caller IDs); 21210 invalid From number.',
+      });
+    } else {
+      log.info('Twilio status callback', { callSid, callStatus });
+    }
 
     res.status(204).send();
 
