@@ -87,11 +87,19 @@ export class MediaSessionCoordinator {
         sessionId,
         callId,
         (pcm16Chunk: Buffer) => {
-          // This callback fires in the Nova output handler context
-          // Route asynchronously to avoid blocking the Nova output loop
+          // This callback fires in the Nova output handler context.
+          // Route asynchronously to avoid blocking the Nova output loop.
           this.audioRouter.routeOutbound(callId, sessionId, pcm16Chunk).catch((err) =>
             log.error('Outbound audio routing error', err as Error, { sessionId, callId }),
           );
+        },
+        () => {
+          // onInterruption: called by NovaSessionManager when a Nova-side barge-in is
+          // detected (new completionStart while AI_SPEAKING). Delegates to AudioRouter
+          // which clears the Twilio outbound buffer and marks content as cancelled.
+          // The proactive (client-side VAD) path in AudioRouter calls handleInterruption
+          // directly, so both paths converge here.
+          this.audioRouter.handleInterruption(callId, sessionId);
         },
       );
     } catch (err) {
@@ -167,7 +175,10 @@ export class MediaSessionCoordinator {
       log.warn('Error destroying Krisp processor', { sessionId, error: (err as Error).message });
     }
 
-    // 3. Terminate and destroy in-memory session
+    // 3. Clean up AudioRouter per-session maps (seqnum dedup, barge-in cooldown)
+    this.audioRouter.cleanupSession(sessionId);
+
+    // 4. Terminate and destroy in-memory session
     this.sessionManager.terminateSession(sessionId, reason);
     this.sessionManager.destroySession(sessionId, reason);
 
