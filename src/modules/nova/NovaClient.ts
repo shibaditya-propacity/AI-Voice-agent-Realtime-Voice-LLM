@@ -588,12 +588,13 @@ export class NovaClient extends EventEmitter {
       }
 
     } else if ('audioOutput' in inner) {
-      const e = inner.audioOutput as { contentId: string; content: string };
+      const e = inner.audioOutput as { contentId: string; content: string; completionId?: string };
       this.audioChunksReceived++;
 
       if (this.audioChunksReceived === 1) {
         this.log.info('✅ First audio output chunk received from Nova', {
           contentId: e.contentId,
+          completionId: e.completionId,
           audioChunksReceived: this.audioChunksReceived,
           base64Length: e.content.length,
         });
@@ -601,7 +602,9 @@ export class NovaClient extends EventEmitter {
         this.log.debug('Audio output progress', { audioChunksReceived: this.audioChunksReceived });
       }
 
-      this.emit('audio-output', Buffer.from(e.content, 'base64'), e.contentId);
+      // completionId passed as 3rd arg so NovaSessionManager can discard stale chunks
+      // from a cancelled (barge-in interrupted) completion.
+      this.emit('audio-output', Buffer.from(e.content, 'base64'), e.contentId, e.completionId ?? '');
 
     } else if ('textOutput' in inner) {
       const e = inner.textOutput as { contentId: string; content: string; role?: string };

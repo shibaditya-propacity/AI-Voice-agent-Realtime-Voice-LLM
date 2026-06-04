@@ -248,6 +248,22 @@ export type NovaSessionState =
   | 'closed'
   | 'error';
 
+/**
+ * Explicit conversation state machine for barge-in / interruption control.
+ *
+ *   LISTENING      waiting for the caller to speak (after greeting or after each turn)
+ *   USER_SPEAKING  caller audio is being streamed to Nova (detected via energy VAD)
+ *   AI_THINKING    Nova received end-of-turn and is generating a response (completionStart fired)
+ *   AI_SPEAKING    Nova is sending audio chunks back to the caller (content-start AUDIO fired)
+ *   INTERRUPTED    barge-in detected — outbound audio is discarded, Twilio buffer cleared
+ */
+export type ConversationState =
+  | 'LISTENING'
+  | 'USER_SPEAKING'
+  | 'AI_THINKING'
+  | 'AI_SPEAKING'
+  | 'INTERRUPTED';
+
 export interface NovaSessionInfo {
   novaSessionId: string;
   currentPromptName: string;
