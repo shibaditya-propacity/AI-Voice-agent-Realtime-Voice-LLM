@@ -11,6 +11,7 @@ export const Env = {
     bufferMaxBytes: 64_000,
     vadRmsThreshold: 500,
     vadSilenceHangoverMs: 300,
+    proactiveBargeIn: false,
   },
   nova: {
     modelId: 'amazon.nova-2-sonic-v1:0',

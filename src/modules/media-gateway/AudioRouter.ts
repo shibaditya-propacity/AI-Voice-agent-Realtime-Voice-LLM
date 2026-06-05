@@ -17,7 +17,7 @@ import { Env } from '../../config';
 import { AppEvent } from '../../events/EventTypes';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
-import { fromBase64, toBase64, nowMs } from '../../utils/helpers';
+import { fromBase64, toBase64, nowMs, pcmFrameBytes, chunkBuffer } from '../../utils/helpers';
 import { latencyRegistry, detectSpeechEnd } from '../../shared/LatencyRegistry';
 import { AudioProcessor } from '../audio/AudioProcessor';
 import { KrispService } from '../krisp/KrispService';
@@ -45,15 +45,33 @@ export class AudioRouter {
   /**
    * Per-session: epoch-ms of the last proactive barge-in we triggered.
    * Guards against firing handleInterruption() on every high-energy frame
-   * while the agent is speaking — one trigger per 2-second window is enough.
+   * while the agent is speaking — one trigger per cooldown window is enough.
    */
   private readonly lastBargeInAt = new Map<string, number>();
+
+  /**
+   * Per-session: monotonically increasing counter bumped on every interruption.
+   * routeOutbound() captures the generation at entry; if it changes during the
+   * async processOutbound(), the chunk is discarded instead of being sent to
+   * Twilio. This closes the race condition where audio chunks that were already
+   * dispatched to routeOutbound (past NovaSessionManager's guard) complete their
+   * async encoding and arrive at Twilio AFTER the clearAudio call.
+   */
+  private readonly outboundGeneration = new Map<string, number>();
 
   /** Minimum RMS energy (PCM16) that counts as "caller is speaking". */
   private static readonly BARGE_IN_RMS_THRESHOLD = Env.audio.vadRmsThreshold;
 
   /** Minimum ms between consecutive proactive barge-in triggers for the same session. */
-  private static readonly BARGE_IN_COOLDOWN_MS = 2_000;
+  private static readonly BARGE_IN_COOLDOWN_MS = 300;
+
+  /**
+   * Whether the proactive client-side RMS barge-in is enabled. DEFAULT OFF — Nova 2
+   * Sonic handles barge-in natively (via the completionStart-while-AI_SPEAKING path
+   * in NovaSessionManager), and this RMS heuristic false-triggers on echo / caller
+   * backchannel, cancelling the agent's turn → silence. See Env.audio.proactiveBargeIn.
+   */
+  private static readonly PROACTIVE_BARGE_IN_ENABLED = Env.audio.proactiveBargeIn;
 
   constructor(
     audioProcessor: AudioProcessor,
@@ -131,30 +149,37 @@ export class AudioRouter {
     }
     const tDecoded = process.hrtime.bigint();
 
-    // ── Proactive barge-in detection ─────────────────────────────────────────
-    // If the agent is currently speaking (AI_SPEAKING) and the caller's energy
-    // is above the VAD threshold, interrupt immediately — don't wait for Nova's
-    // own endpointing. This gives true instant barge-in:
-    //   1. Twilio's outbound buffer is cleared (caller hears silence instantly).
-    //   2. Nova's in-flight audio content block is marked cancelled.
-    //   3. State transitions to INTERRUPTED.
-    // Nova's native VAD will then emit a new completionStart for the caller's
-    // speech, at which point the state transitions to AI_THINKING → AI_SPEAKING.
-    if (this.novaSessionManager.isAgentSpeaking(sessionId)) {
-      const rms = AudioRouter.computeRms(pcm16);
-      if (rms >= AudioRouter.BARGE_IN_RMS_THRESHOLD) {
-        const now = Date.now();
-        const lastBarge = this.lastBargeInAt.get(sessionId) ?? 0;
-        if (now - lastBarge >= AudioRouter.BARGE_IN_COOLDOWN_MS) {
-          this.lastBargeInAt.set(sessionId, now);
-          this.log.warn('⚡ BARGE-IN DETECTED — caller speech during AI playback — stopping output immediately', {
-            sessionId,
-            callId,
-            rms: Math.round(rms),
-            threshold: AudioRouter.BARGE_IN_RMS_THRESHOLD,
-            seqNum,
-          });
-          this.handleInterruption(callId, sessionId);
+    // ── Proactive barge-in detection (DEFAULT OFF) ───────────────────────────
+    // Optional, opt-in fast interruption: if the agent is speaking and the caller's
+    // RMS energy exceeds the threshold, interrupt immediately rather than waiting for
+    // Nova's endpointing. DISABLED by default because Nova 2 Sonic already handles
+    // barge-in natively and this RMS heuristic false-triggers on telephony echo of
+    // the agent's own voice and on caller backchannel, killing the agent's turn with
+    // no replacement (the "agent goes silent after the caller speaks" / Hindi-switch
+    // symptom). Native barge-in still runs via NovaSessionManager.onCompletionStart.
+    if (AudioRouter.PROACTIVE_BARGE_IN_ENABLED && this.novaSessionManager.isAgentSpeaking(sessionId)) {
+      // Never interrupt the opening greeting — early telephony line noise / echo
+      // of the agent's own audio can exceed the RMS threshold before the caller
+      // has actually spoken, killing the greeting mid-playback. Barge-in is only
+      // enabled once the greeting turn completes (turnCount >= 1).
+      if (this.novaSessionManager.isGreetingPhase(sessionId)) {
+        // Silently skip — greeting must play to completion.
+      } else {
+        const rms = AudioRouter.computeRms(pcm16);
+        if (rms >= AudioRouter.BARGE_IN_RMS_THRESHOLD) {
+          const now = Date.now();
+          const lastBarge = this.lastBargeInAt.get(sessionId) ?? 0;
+          if (now - lastBarge >= AudioRouter.BARGE_IN_COOLDOWN_MS) {
+            this.lastBargeInAt.set(sessionId, now);
+            this.log.warn('⚡ BARGE-IN DETECTED — caller speech during AI playback — stopping output immediately', {
+              sessionId,
+              callId,
+              rms: Math.round(rms),
+              threshold: AudioRouter.BARGE_IN_RMS_THRESHOLD,
+              seqNum,
+            });
+            this.handleInterruption(callId, sessionId);
+          }
         }
       }
     }
@@ -197,6 +222,7 @@ export class AudioRouter {
     });
 
     // Step 3: Stream to Nova Sonic
+    latencyRegistry.markStartup(sessionId, 'firstCallerAudio');
     this.novaSessionManager.pushAudio(sessionId, cleanPcm16);
 
     // Per-frame inbound cost (microseconds): decode, krisp, total.
@@ -212,10 +238,82 @@ export class AudioRouter {
     });
   }
 
+  // ─── Instant greeting ──────────────────────────────────────────────────────
+
+  /**
+   * Stream a pre-rendered greeting (PCM16 @ Nova output rate, cached at boot) to the
+   * caller as fast as possible. Used for the instant opening greeting so Nova stays
+   * off the critical path — the caller hears audio within ~1s of the stream opening
+   * instead of after a 5–7s cold Nova bootstrap.
+   *
+   * The whole clip is downsampled + codec-encoded once, then framed into ~20ms
+   * telephony frames so the first frame plays immediately and the caller can barge
+   * in. Deliberately bypasses the per-turn latencyRegistry — this is not a model turn.
+   */
+  async playGreeting(callId: string, sessionId: string, pcm16: Buffer): Promise<void> {
+    this.log.info('[GREETING] step4 — playGreeting() entered', { sessionId, callId, pcm16Bytes: pcm16.length });
+    if (pcm16.length === 0) {
+      this.log.warn('[GREETING] step4 — empty greeting buffer, nothing to play', { sessionId, callId });
+      return;
+    }
+
+    const codec = Env.audio.telephonyCodec;
+
+    let encoded: Buffer;
+    try {
+      // processOutbound downsamples from Nova's output rate to 8kHz and encodes to
+      // the telephony codec — exactly the same path Nova's live audio takes.
+      encoded = await this.audioProcessor.processOutbound(pcm16, codec);
+    } catch (err) {
+      this.log.error('[GREETING] step4 — greeting conversion FAILED — caller gets the live Nova greeting instead', err as Error, {
+        sessionId, callId,
+      });
+      return;
+    }
+
+    // 20ms frames at the telephony rate: pcmu/pcma = 1 byte/sample, pcm16 = 2.
+    const frameBytes =
+      codec === 'pcm16'
+        ? pcmFrameBytes(20, Env.audio.telephonySampleRate, 16, 1)
+        : pcmFrameBytes(20, Env.audio.telephonySampleRate, 8, 1);
+
+    let framesSent = 0;
+    let framesFailed = 0;
+    for (const frame of chunkBuffer(encoded, frameBytes)) {
+      // sendAudio returns false if the Twilio WS isn't OPEN / no stream registered —
+      // i.e. step 6 (Twilio receives the frame) did NOT happen for that frame.
+      if (this.twilioService.sendAudio(callId, toBase64(frame))) {
+        if (framesSent === 0) latencyRegistry.markStartup(sessionId, 'greetingFirstFrame');
+        framesSent++;
+      } else framesFailed++;
+    }
+    latencyRegistry.markStartup(sessionId, 'greetingLastFrame');
+    // First audible audio reached the caller — emit the startup latency breakdown.
+    latencyRegistry.reportStartup(sessionId, callId);
+
+    if (framesSent > 0 && framesFailed === 0) {
+      this.log.info('[GREETING] step5/6 — ✅ all greeting frames accepted by Twilio WS', {
+        sessionId, callId, framesSent, encodedBytes: encoded.length, codec,
+      });
+    } else {
+      this.log.error(
+        '[GREETING] step5/6 — greeting frames NOT delivered to Twilio (WS not OPEN or stream not registered). Caller heard nothing.',
+        new Error('twilio sendAudio returned false'),
+        { sessionId, callId, framesSent, framesFailed },
+      );
+    }
+  }
+
   // ─── Outbound: Nova Sonic → Caller ────────────────────────────────────────
 
   async routeOutbound(callId: string, sessionId: string, pcm16: Buffer): Promise<void> {
     if (pcm16.length === 0) return;
+
+    // Capture the outbound generation BEFORE the async encoding step. If an
+    // interruption bumps the generation while processOutbound() is running, the
+    // post-check below will discard the chunk — closing the race where stale
+    // audio arrives at Twilio after the clearAudio call.
+    const genAtEntry = this.outboundGeneration.get(sessionId) ?? 0;
 
     const targetCodec = Env.audio.telephonyCodec;
 
@@ -225,6 +323,22 @@ export class AudioRouter {
       encoded = await this.audioProcessor.processOutbound(pcm16, targetCodec);
     } catch (err) {
       this.log.error('Outbound audio conversion failed', err as Error, { sessionId, callId });
+      return;
+    }
+
+    // ── Post-async generation check ─────────────────────────────────────────
+    // An interruption may have occurred while processOutbound() was running.
+    // If so, outboundGeneration was bumped and clearAudio was already sent —
+    // sending this chunk now would re-fill Twilio's buffer with stale audio.
+    const genNow = this.outboundGeneration.get(sessionId) ?? 0;
+    if (genNow !== genAtEntry) {
+      this.log.debug('🚫 Outbound chunk discarded — interruption during encoding', {
+        sessionId,
+        callId,
+        genAtEntry,
+        genNow,
+        chunkBytes: encoded.length,
+      });
       return;
     }
 
@@ -238,6 +352,12 @@ export class AudioRouter {
       // latency breakdown table.
       latencyRegistry.mark(sessionId, 'firstTwilioAudio');
       latencyRegistry.report(sessionId, callId);
+
+      // Startup timeline: first AGENT audio to the caller. In the fallback (no cached
+      // greeting) path this is the greeting itself, so emit the startup breakdown here
+      // too — reportStartup is idempotent, so it prints once regardless of path.
+      latencyRegistry.markStartup(sessionId, 'firstAgentAudio');
+      latencyRegistry.reportStartup(sessionId, callId);
 
       eventBus.emit(AppEvent.AUDIO_SENT, {
         sessionId,
@@ -270,6 +390,11 @@ export class AudioRouter {
   handleInterruption(callId: string, sessionId: string): void {
     this.log.info('⚡ Stopping agent playback — flushing Twilio outbound buffer', { sessionId, callId });
 
+    // Bump outbound generation FIRST — any in-flight routeOutbound() calls that
+    // resume after an await will see the new generation and discard their chunk
+    // instead of re-filling Twilio's buffer after the clear.
+    this.outboundGeneration.set(sessionId, (this.outboundGeneration.get(sessionId) ?? 0) + 1);
+
     // this.knowlarityService.clearAudio(callId); // ← commented out
     this.twilioService.clearAudio(callId);
     this.novaSessionManager.handleInterruption(sessionId);
@@ -283,11 +408,24 @@ export class AudioRouter {
   }
 
   /**
+   * Reset the per-session barge-in cooldown. Called when a new Nova response
+   * generation starts (completionStart fired), ensuring each new response cycle
+   * gets fresh barge-in detection. Without this, the 2-second cooldown from the
+   * previous barge-in would block detection on the next response if it starts
+   * within 2 seconds — causing the "agent finishes speaking before processing
+   * the user" symptom.
+   */
+  resetBargeInCooldown(sessionId: string): void {
+    this.lastBargeInAt.delete(sessionId);
+  }
+
+  /**
    * Clean up per-session maps when a call ends. Called from MediaSessionCoordinator
    * teardown so Maps don't grow unbounded across many calls.
    */
   cleanupSession(sessionId: string): void {
     this.lastSeqNums.delete(sessionId);
     this.lastBargeInAt.delete(sessionId);
+    this.outboundGeneration.delete(sessionId);
   }
 }

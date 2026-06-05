@@ -68,47 +68,40 @@ export class NovaAudioStreamer {
    * Open the single, long-lived conversation prompt for the whole call:
    *
    *   promptStart + SYSTEM text block            (the agent persona/instructions)
-   *   USER text greeting cue ("Hello?")          (makes the agent greet first)
    *   contentStart(AUDIO, interactive:true)      (left OPEN for the whole call)
    *
-   * The cue's contentEnd is what reliably makes Nova speak the opening greeting —
-   * without it the agent never speaks first and the call sits silent. It also
-   * mirrors reality on an outbound call: the customer picks up and says "Hello?".
-   *
-   * The "double greeting" was the agent greeting again when the caller actually
-   * spoke; that is suppressed in the system prompt ("greet exactly once"), NOT by
-   * removing this cue. After the greeting the interactive audio block stays open and
-   * Nova's VAD drives every subsequent turn — no per-turn promptEnd required.
+   * Nova 2 Sonic does NOT speak first — it only responds to caller AUDIO (a USER
+   * text cue does not trigger a spoken turn; verified against the Nova 2 sample). So
+   * the opening greeting is a static WAV played separately on connect, and here we
+   * just open the SYSTEM prompt + an interactive audio block and let Nova's VAD drive
+   * every turn from the caller's first utterance. The system prompt tells Nova the
+   * greeting was already played, so it does not re-greet.
    */
-  startConversation(): void {
+  startConversation(opts?: { greetingGateMs?: number }): void {
     if (this.conversationOpen || !this.client.isOpen) return;
 
     // promptStart + SYSTEM content block (system prompt is sent once for the call).
     this.currentPromptName = this.client.startPrompt(true);
 
-    // Greeting cue: a completed USER text block whose contentEnd triggers the
-    // agent's opening greeting.
-    const cueContentName = `cue_${uuidv4().replace(/-/g, '')}`;
-    this.client.sendUserTextBlock(this.currentPromptName, cueContentName, Env.nova.greetingTrigger);
-
-    // ONE interactive audio block for the entire call. Nova's VAD drives turn-taking.
+    // ONE interactive audio block for the entire call. Nova's VAD drives turn-taking;
+    // the caller's first utterance is the first turn.
     this.audioContentName = `audio_${uuidv4().replace(/-/g, '')}`;
     this.client.openAudioBlock(this.currentPromptName, this.audioContentName, true);
 
     this.conversationOpen = true;
 
-    // Don't listen to the caller until the greeting is spoken — prevents the
-    // overlapping-"hello" re-greet loop. Safety net: open ears after 12s in case the
-    // greeting turn-complete never arrives, so the call can never go permanently deaf.
+    // Hold off feeding caller audio to Nova until the static greeting has finished
+    // playing, so the caller's reply during the greeting isn't half-captured. Opens
+    // after the greeting duration (+buffer); falls back to a short default if unknown.
     this.listening = false;
-    this.greetingGateTimer = setTimeout(() => this.startListening('greeting-gate-timeout'), 12_000);
+    const gateMs = Math.max(opts?.greetingGateMs ?? 1_500, 500);
+    this.greetingGateTimer = setTimeout(() => this.startListening('greeting-finished'), gateMs);
     if (typeof this.greetingGateTimer.unref === 'function') this.greetingGateTimer.unref();
 
-    this.log.info('Conversation opened (system + greeting cue + continuous audio block)', {
+    this.log.info('Conversation opened (SYSTEM + interactive audio block; static greeting plays separately)', {
       promptName: this.currentPromptName,
-      cueContentName,
       audioContentName: this.audioContentName,
-      greetingTrigger: Env.nova.greetingTrigger,
+      gateMs,
       interactive: true,
     });
   }
@@ -169,6 +162,22 @@ export class NovaAudioStreamer {
   }
 
   /**
+   * Inject a USER text cue into the open prompt to trigger a Nova response when the
+   * caller has been silent too long. Nova treats it as an end-of-turn signal and
+   * generates a re-engagement reply (e.g. "Are you still there?").
+   * No-op if the conversation is not open or the client is closed.
+   */
+  sendSilencePrompt(text: string): void {
+    if (!this.conversationOpen || !this.client.isOpen) return;
+    const cueContentName = `silence_${uuidv4().replace(/-/g, '')}`;
+    this.client.sendUserTextBlock(this.currentPromptName, cueContentName, text);
+    this.log.info('🔇 Silence prompt injected — waiting for Nova re-engagement response', {
+      promptName: this.currentPromptName,
+      cueContentName,
+    });
+  }
+
+  /**
    * Barge-in: Nova handles turn-taking natively on the interactive audio block, so
    * we keep the block open and simply drop any buffered inbound audio. The outbound
    * (caller-facing) audio is cleared separately by the AudioRouter via Twilio.
@@ -196,5 +205,10 @@ export class NovaAudioStreamer {
 
   get promptName(): string {
     return this.currentPromptName;
+  }
+
+  /** Whether the greeting gate has opened (caller audio is being fed to Nova). */
+  get isListening(): boolean {
+    return this.listening;
   }
 }

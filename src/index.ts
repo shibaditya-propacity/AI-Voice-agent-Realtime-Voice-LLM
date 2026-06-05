@@ -32,22 +32,38 @@ async function main(): Promise<void> {
   // 3. Attach WebSocket server
   const wsServer = new WebSocketServer(httpServer, services.twilioService);
 
-  // 4. Start listening
+  // 4. Load the static greeting WAV BEFORE accepting calls so the very first call can
+  //    play it the instant it connects (Nova 2 Sonic does not speak first). This is a
+  //    fast local file read — not a Bedrock call — so boot is not meaningfully delayed.
+  //
+  //    BUILD MARKER: if you do NOT see "[GREETING] step0" in the logs, you are running
+  //    an OLD process — rebuild (`npm run build`) and restart before testing.
+  log.info('[GREETING] step0 — static-greeting pipeline ACTIVE — loading greeting WAV BEFORE accepting calls');
+  try {
+    await services.novaSessionManager.prepareGreeting();
+  } catch (err) {
+    // prepareGreeting already swallows load errors; belt-and-suspenders so a rejection
+    // can never block boot or crash via unhandledRejection.
+    log.error('[GREETING] step1 prepareGreeting() rejected — calls will have no opening greeting', err as Error);
+  }
+
+  // 4b. Pre-warm the Bedrock connection now and keep it warm on an interval so the
+  //     first call (and calls after a quiet period) connect fast.
+  services.novaSessionManager.startPeriodicPrewarm();
+
+  // 5. NOW start listening — the greeting cache is ready, so every call (including the
+  //    first) gets the instant greeting.
   await new Promise<void>((resolve, reject) => {
     httpServer.listen(Env.server.port, () => {
-      log.info(`Server listening on port ${Env.server.port}`, {
+      log.info(`Server listening on port ${Env.server.port} — ready to accept calls`, {
         pid: process.pid,
         port: Env.server.port,
+        greetingCached: services.novaSessionManager.getCachedGreeting() !== null,
       });
       resolve();
     });
     httpServer.on('error', reject);
   });
-
-  // 4b. Pre-warm the Bedrock connection so the first call isn't cold (~5s → ~2s),
-  //     and keep it warm on an interval so calls after a quiet period stay fast.
-  //     Non-blocking: never delays startup or crashes on failure.
-  services.novaSessionManager.startPeriodicPrewarm();
 
   // 5. Graceful shutdown
   const shutdown = async (signal: string): Promise<void> => {

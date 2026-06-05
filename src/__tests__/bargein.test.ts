@@ -166,7 +166,7 @@ function buildHandlers(client: MockNovaClient) {
     ctx.responseGeneration++;
     if (ctx.conversationState === 'AI_SPEAKING' && ctx.activeContentId) {
       const now = Date.now();
-      if (now - ctx.lastBargeInAt > 1_000) {
+      if (now - ctx.lastBargeInAt > 300) {
         ctx.lastBargeInAt = now;
         ctx.cancelledContentIds.add(ctx.activeContentId);
         ctx.activeContentId = '';
@@ -286,7 +286,7 @@ class MockAudioRouterDedup {
 class MockAudioRouterBargeIn {
   private readonly lastBargeInAt = new Map<string, number>();
   readonly VAD_THRESHOLD = 500;
-  readonly COOLDOWN_MS = 2_000;
+  readonly COOLDOWN_MS = 300;
 
   bargeInCount = 0;
 
@@ -447,7 +447,7 @@ describe('Barge-in: conversation state machine', () => {
     expect(ctx.cancelledContentIds.size).toBe(0);
   });
 
-  test('BARGE-IN cooldown: second barge-in within 1s does not double-call onInterruption', () => {
+  test('BARGE-IN cooldown: second barge-in within 300ms does not double-call onInterruption', () => {
     const client = new MockNovaClient();
     const { ctx, onInterruption } = buildHandlers(client);
 
@@ -546,9 +546,9 @@ describe('Proactive barge-in: client-side VAD', () => {
     expect(bargeIn.bargeInCount).toBe(1);
   });
 
-  test('Cooldown: second loud frame within 2s does not double-trigger barge-in', () => {
+  test('Cooldown: second loud frame within 300ms does not double-trigger barge-in', () => {
     bargeIn.checkBargeIn('sess-1', LOUD_PCM, true); // first trigger
-    jest.advanceTimersByTime(500); // within cooldown
+    jest.advanceTimersByTime(100); // within cooldown
     const second = bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
     expect(second).toBe(false);
     expect(bargeIn.bargeInCount).toBe(1); // still 1
@@ -556,7 +556,7 @@ describe('Proactive barge-in: client-side VAD', () => {
 
   test('Barge-in re-triggers after cooldown expires', () => {
     bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
-    jest.advanceTimersByTime(2_001); // past cooldown
+    jest.advanceTimersByTime(301); // past cooldown
     const second = bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
     expect(second).toBe(true);
     expect(bargeIn.bargeInCount).toBe(2);
@@ -769,6 +769,33 @@ describe('Transcript contamination prevention', () => {
     expect(ctx.finalizedTranscripts).toHaveLength(0);
   });
 
+  test('Rapid re-interruption after cooldown reset works (resetBargeInCooldown)', () => {
+    const client = new MockNovaClient();
+    const { ctx, onInterruption } = buildHandlers(client);
+
+    // First response → barge-in
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    // Barge-in fires
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+    expect(onInterruption).toHaveBeenCalledTimes(1);
+
+    // New response starts — in production, onNewResponse resets the AudioRouter cooldown.
+    // Here we verify the Nova-side cooldown was set, then manually simulate the reset
+    // that happens via ctx.onNewResponse() in the real onCompletionStart handler.
+    // The second completionStart already bumped lastBargeInAt. Reset it to simulate
+    // the cooldown reset that onNewResponse() provides.
+    ctx.lastBargeInAt = 0;
+
+    // New response plays
+    client.emit('content-start', 'audio-B', 'AUDIO');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+
+    // Another barge-in immediately — should fire because cooldown was reset
+    client.emit('completion-start', 'compl-3', 'prompt-1');
+    expect(onInterruption).toHaveBeenCalledTimes(2);
+  });
+
   test('No transcript leakage: only current generation transcripts survive a full barge-in cycle', () => {
     const client = new MockNovaClient();
     const { ctx } = buildHandlers(client);
@@ -796,6 +823,261 @@ describe('Transcript contamination prevention', () => {
     // Only the new response should be finalized — zero stale transcripts
     expect(ctx.finalizedTranscripts).toHaveLength(1);
     expect(ctx.finalizedTranscripts[0].text).toBe('Clean new response');
+    expect(ctx.conversationState).toBe('LISTENING');
+  });
+});
+
+describe('Cooldown reset: AudioRouter barge-in re-fires after cooldown clear', () => {
+  let bargeIn: MockAudioRouterBargeIn;
+
+  beforeEach(() => {
+    bargeIn = new MockAudioRouterBargeIn();
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test('After cooldown reset, barge-in fires immediately without waiting', () => {
+    // First barge-in
+    bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+    expect(bargeIn.bargeInCount).toBe(1);
+
+    // Only 50ms later — normally within cooldown
+    jest.advanceTimersByTime(50);
+
+    // Reset cooldown (simulates what AudioRouter.resetBargeInCooldown does)
+    bargeIn.cleanup('sess-1');
+
+    // Barge-in should fire immediately
+    const triggered = bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+    expect(triggered).toBe(true);
+    expect(bargeIn.bargeInCount).toBe(2);
+  });
+});
+
+describe('Silence re-engagement', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test('Silence prompt fires 3 seconds after agent finishes speaking', () => {
+    const silencePromptCalls: string[] = [];
+
+    // Simulate a minimal silence re-engagement flow
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let conversationState: ConversationState = 'LISTENING';
+    const SILENCE_TIMEOUT_MS = 3_000;
+    const SILENCE_PROMPT = '[The caller has been silent for several seconds. Say exactly: "I may not have heard you. Are you still there?"]';
+
+    // Agent finishes speaking → start silence timer
+    conversationState = 'LISTENING';
+    silenceTimer = setTimeout(() => {
+      silenceTimer = null;
+      if (conversationState === 'LISTENING') {
+        silencePromptCalls.push(SILENCE_PROMPT);
+      }
+    }, SILENCE_TIMEOUT_MS);
+
+    // At 2 seconds — timer should NOT have fired
+    jest.advanceTimersByTime(2_000);
+    expect(silencePromptCalls).toHaveLength(0);
+
+    // At 3 seconds — timer fires
+    jest.advanceTimersByTime(1_000);
+    expect(silencePromptCalls).toHaveLength(1);
+    expect(silencePromptCalls[0]).toContain('I may not have heard you. Are you still there?');
+  });
+
+  test('Silence timer is cancelled when caller speaks (completionStart)', () => {
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let conversationState: ConversationState = 'LISTENING';
+    const silencePromptCalls: string[] = [];
+    const SILENCE_TIMEOUT_MS = 3_000;
+
+    // Agent finishes → start timer
+    silenceTimer = setTimeout(() => {
+      silenceTimer = null;
+      if (conversationState === 'LISTENING') {
+        silencePromptCalls.push('re-engage');
+      }
+    }, SILENCE_TIMEOUT_MS);
+
+    // Caller speaks at 1.5 seconds → cancel timer
+    jest.advanceTimersByTime(1_500);
+    clearTimeout(silenceTimer!);
+    silenceTimer = null;
+    conversationState = 'AI_THINKING';
+
+    // Past the 3-second mark — nothing should fire
+    jest.advanceTimersByTime(2_000);
+    expect(silencePromptCalls).toHaveLength(0);
+  });
+
+  test('Silence timer is cancelled on client-side barge-in', () => {
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let conversationState: ConversationState = 'LISTENING';
+    const silencePromptCalls: string[] = [];
+    const SILENCE_TIMEOUT_MS = 3_000;
+
+    // Agent finishes → start timer
+    silenceTimer = setTimeout(() => {
+      silenceTimer = null;
+      if (conversationState === 'LISTENING') {
+        silencePromptCalls.push('re-engage');
+      }
+    }, SILENCE_TIMEOUT_MS);
+
+    // Simulate handleInterruption cancelling the timer
+    jest.advanceTimersByTime(500);
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
+    }
+    conversationState = 'INTERRUPTED';
+
+    jest.advanceTimersByTime(3_000);
+    expect(silencePromptCalls).toHaveLength(0);
+  });
+
+  test('Silence prompt does NOT fire if agent is already speaking again', () => {
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let conversationState: ConversationState = 'LISTENING';
+    const silencePromptCalls: string[] = [];
+    const SILENCE_TIMEOUT_MS = 3_000;
+
+    // Agent finishes → start timer
+    silenceTimer = setTimeout(() => {
+      silenceTimer = null;
+      if (conversationState === 'LISTENING') {
+        silencePromptCalls.push('re-engage');
+      }
+    }, SILENCE_TIMEOUT_MS);
+
+    // Agent starts speaking again at 2s (e.g. Nova responded to something)
+    jest.advanceTimersByTime(2_000);
+    conversationState = 'AI_SPEAKING';
+
+    // Timer fires at 3s but state is AI_SPEAKING → no prompt
+    jest.advanceTimersByTime(1_000);
+    expect(silencePromptCalls).toHaveLength(0);
+  });
+});
+
+describe('Outbound generation guard: in-flight audio discarded after interruption', () => {
+  /**
+   * Simulates the AudioRouter outbound generation guard that prevents stale
+   * audio from reaching Twilio after a barge-in. The real code uses an async
+   * processOutbound() step; this mock uses a deferred promise to simulate it.
+   */
+  class MockOutboundRouter {
+    private generation = new Map<string, number>();
+    readonly sentChunks: string[] = [];
+
+    /** Simulate routeOutbound: capture gen → async work → check gen → send */
+    async routeOutbound(sessionId: string, label: string, resolveEncoding: () => void): Promise<void> {
+      const genAtEntry = this.generation.get(sessionId) ?? 0;
+
+      // Simulate async processOutbound — caller resolves when ready
+      await new Promise<void>((r) => {
+        // Store the resolve fn so the test can control timing
+        resolveEncoding();
+        r();
+      });
+
+      const genNow = this.generation.get(sessionId) ?? 0;
+      if (genNow !== genAtEntry) return; // discarded
+
+      this.sentChunks.push(label);
+    }
+
+    handleInterruption(sessionId: string): void {
+      this.generation.set(sessionId, (this.generation.get(sessionId) ?? 0) + 1);
+    }
+
+    cleanup(sessionId: string): void {
+      this.generation.delete(sessionId);
+    }
+  }
+
+  test('Chunks dispatched before interruption are discarded after async step', async () => {
+    const router = new MockOutboundRouter();
+
+    // Chunk dispatched before interruption (gen=0)
+    const p1 = router.routeOutbound('sess-1', 'chunk-before', () => {});
+
+    // Interruption bumps generation to 1
+    router.handleInterruption('sess-1');
+
+    // Chunk dispatched after interruption (gen=1) — should succeed
+    const p2 = router.routeOutbound('sess-1', 'chunk-after', () => {});
+
+    await Promise.all([p1, p2]);
+
+    // Only the post-interruption chunk should have been sent
+    expect(router.sentChunks).toEqual(['chunk-after']);
+  });
+
+  test('Multiple interruptions discard all prior chunks', async () => {
+    const router = new MockOutboundRouter();
+
+    const p1 = router.routeOutbound('sess-1', 'gen0-chunk', () => {});
+    router.handleInterruption('sess-1');
+
+    const p2 = router.routeOutbound('sess-1', 'gen1-chunk', () => {});
+    router.handleInterruption('sess-1');
+
+    const p3 = router.routeOutbound('sess-1', 'gen2-chunk', () => {});
+
+    await Promise.all([p1, p2, p3]);
+
+    // Only the chunk from the latest generation survives
+    expect(router.sentChunks).toEqual(['gen2-chunk']);
+  });
+
+  test('Cleanup removes generation state', async () => {
+    const router = new MockOutboundRouter();
+
+    router.handleInterruption('sess-1'); // gen=1
+    router.cleanup('sess-1');
+
+    // After cleanup, gen resets to 0 — chunk should succeed
+    const p = router.routeOutbound('sess-1', 'post-cleanup', () => {});
+    await p;
+    expect(router.sentChunks).toEqual(['post-cleanup']);
+  });
+
+  test('Post-interruption behavior: interrupted response discarded, new response flows', () => {
+    const client = new MockNovaClient();
+    const { ctx, routedChunks, onInterruption } = buildHandlers(client);
+
+    // Agent starts speaking
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('audio-output', Buffer.from('agent-speaking'), 'audio-A', 'compl-1');
+    expect(routedChunks.map(b => b.toString())).toContain('agent-speaking');
+
+    // User interrupts — Nova fires new completion
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+    expect(onInterruption).toHaveBeenCalled();
+
+    // Stale audio from interrupted response — discarded
+    client.emit('audio-output', Buffer.from('stale-after-interrupt'), 'audio-A', 'compl-1');
+
+    // Agent generates new response to user's interruption
+    client.emit('content-start', 'audio-B', 'AUDIO');
+    client.emit('audio-output', Buffer.from('new-response'), 'audio-B', 'compl-2');
+    client.emit('content-end', 'audio-B', 'END_TURN');
+    client.emit('turn-complete', 'END_TURN');
+
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).not.toContain('stale-after-interrupt');
+    expect(routed).toContain('new-response');
     expect(ctx.conversationState).toBe('LISTENING');
   });
 });

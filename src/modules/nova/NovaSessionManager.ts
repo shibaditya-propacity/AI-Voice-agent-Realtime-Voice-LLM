@@ -13,6 +13,7 @@ import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
 import { latencyRegistry, clearVad } from '../../shared/LatencyRegistry';
 import { withRetry } from '../../utils/helpers';
+import { loadGreetingWav } from '../audio/WavLoader';
 import { SessionManager } from '../session/SessionManager';
 import { NovaClient } from './NovaClient';
 import { NovaAudioStreamer } from './NovaAudioStreamer';
@@ -34,6 +35,12 @@ interface NovaContext {
    * Clears Twilio's outbound audio buffer and stops queued frames.
    */
   onInterruption: () => void;
+  /**
+   * Called at the start of every new response generation (completionStart).
+   * Used by AudioRouter to reset the per-session barge-in cooldown so each
+   * new response cycle gets fresh barge-in detection.
+   */
+  onNewResponse: () => void;
   /** Cleanup fn that removes all client event listeners — called in destroySession(). */
   unsubscribeClientEvents: () => void;
 
@@ -76,6 +83,20 @@ interface NovaContext {
    * root cause).
    */
   contentIdToGeneration: Map<string, number>;
+  /**
+   * Silence re-engagement timer. Starts when the agent finishes speaking
+   * (state → LISTENING). Cancelled when the caller starts speaking
+   * (completionStart received). When it fires, a USER text cue is injected
+   * into the open Nova prompt to trigger a "Are you still there?" response.
+   */
+  silenceTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * True when the opening greeting was played to the caller from the boot-time
+   * cache and Nova was primed with it (so Nova does NOT speak a greeting). In this
+   * mode the first Nova turn is the caller's real reply — NOT a greeting — so the
+   * greeting-gate logic in onTurnComplete must not treat turn #1 as the greeting.
+   */
+  primedGreeting: boolean;
 }
 
 export class NovaSessionManager {
@@ -85,6 +106,14 @@ export class NovaSessionManager {
 
   /** Timer for periodic Bedrock connection re-warming (keep-alive). */
   private prewarmTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * The static opening greeting loaded ONCE at boot from a WAV (PCM16 @ Nova output
+   * rate so it flows through the existing outbound pipeline) plus its duration.
+   * Played to every caller the instant the call connects — Nova 2 Sonic does not
+   * speak first, so this is the only opening greeting. null if no/invalid WAV.
+   */
+  private cachedGreeting: { audioPcm16: Buffer; durationMs: number } | null = null;
 
   constructor(sessionManager: SessionManager) {
     this.sessionManager = sessionManager;
@@ -123,9 +152,13 @@ export class NovaSessionManager {
    * ~5 min). Re-warming is skipped while calls are active — live traffic already
    * keeps the connection alive. Pass intervalMs <= 0 to do a one-shot warm only.
    */
-  startPeriodicPrewarm(intervalMs: number = Env.nova.prewarmIntervalMs): void {
-    // Immediate warm at boot.
-    void this.prewarm();
+  startPeriodicPrewarm(
+    intervalMs: number = Env.nova.prewarmIntervalMs,
+    opts: { warmImmediately?: boolean } = {},
+  ): void {
+    // Immediate warm at boot, unless the caller already warmed the connection
+    // (e.g. prepareGreeting() ran a full synthesis first) — then skip the redundant warm.
+    if (opts.warmImmediately !== false) void this.prewarm();
 
     if (intervalMs <= 0) return;
 
@@ -139,6 +172,40 @@ export class NovaSessionManager {
     if (typeof this.prewarmTimer.unref === 'function') this.prewarmTimer.unref();
 
     this.log.info('Periodic Bedrock pre-warm started', { intervalMs });
+  }
+
+  /**
+   * Synthesize the opening greeting ONCE at boot and cache its audio + text so every
+   * call can play it INSTANTLY (within ~1s) instead of waiting 5–7s for a cold
+   * Bedrock stream + system-prompt prefill + greeting generation. Also warms the
+   * connection. Best-effort and idempotent — on failure, calls fall back to the live
+   * Nova greeting with no regression.
+   */
+  async prepareGreeting(): Promise<void> {
+    if (this.cachedGreeting) return;
+    const wavPath = Env.nova.greetingWavPath;
+    this.log.info('[GREETING] step1 — loading static greeting WAV', { wavPath });
+    try {
+      // Resample to Nova's output rate so the clip flows through the SAME outbound
+      // pipeline (downsample → telephony codec) that live Nova audio uses.
+      const { pcm16, durationMs } = loadGreetingWav(wavPath, Env.nova.audioOutputSampleRate);
+      if (pcm16.length === 0) throw new Error('decoded greeting WAV is empty');
+      this.cachedGreeting = { audioPcm16: pcm16, durationMs };
+      this.log.info('[GREETING] step2 — greeting CACHED from WAV — plays instantly on connect', {
+        wavPath, audioBytes: pcm16.length, durationMs,
+      });
+    } catch (err) {
+      this.log.error(
+        '[GREETING] step2 FAILED — could not load greeting WAV; calls will have NO opening greeting (agent responds once the caller speaks). Put a 16-bit PCM WAV at the configured path.',
+        err as Error,
+        { wavPath },
+      );
+    }
+  }
+
+  /** The cached static greeting (PCM16 @ Nova output rate + duration), or null. */
+  getCachedGreeting(): { audioPcm16: Buffer; durationMs: number } | null {
+    return this.cachedGreeting;
   }
 
   /** Stop the periodic re-warm timer (called on shutdown). */
@@ -155,6 +222,8 @@ export class NovaSessionManager {
     callId: string,
     onAudioOutput: (chunk: Buffer) => void,
     onInterruption: () => void,
+    onNewResponse: () => void,
+    greetingOptions?: { greetingGateMs: number },
   ): Promise<void> {
     if (this.sessions.has(sessionId)) {
       throw new Error(`Nova session already exists for session ${sessionId}`);
@@ -200,6 +269,7 @@ export class NovaSessionManager {
           outputAudioBytes: 0,
           onAudioOutput,
           onInterruption,
+          onNewResponse,
           unsubscribeClientEvents: () => { /* populated below */ },
           // Conversation state machine — starts LISTENING (greeting gate in streamer
           // prevents caller audio from being sent until the greeting turn completes).
@@ -210,6 +280,12 @@ export class NovaSessionManager {
           responseGeneration: 0,
           activeResponseGeneration: 0,
           contentIdToGeneration: new Map(),
+          silenceTimer: null,
+          // Nova never produces the opening greeting anymore (a static WAV does), so
+          // there is no Nova "greeting phase" to protect — always true. This keeps
+          // isGreetingPhase() false so the caller's FIRST real turn is fully
+          // interruptible and barge-in/greeting-protection logic does not misfire.
+          primedGreeting: true,
         };
 
         ctx.unsubscribeClientEvents = this.wireClientEvents(ctx);
@@ -237,7 +313,7 @@ export class NovaSessionManager {
         });
 
         client.initialize();
-        streamer.startConversation();
+        streamer.startConversation(greetingOptions);
         await client.connect();
 
         info.state = 'session-active';
@@ -303,6 +379,12 @@ export class NovaSessionManager {
 
     const log = Logger.forSession(sessionId, ctx.callId, 'NovaSessionManager');
 
+    // Cancel any pending silence re-engagement timer — the caller spoke.
+    if (ctx.silenceTimer) {
+      clearTimeout(ctx.silenceTimer);
+      ctx.silenceTimer = null;
+    }
+
     // Cancel the in-flight audio output block so stale chunks are discarded.
     if (ctx.activeContentId) {
       ctx.cancelledContentIds.add(ctx.activeContentId);
@@ -343,6 +425,22 @@ export class NovaSessionManager {
     return this.sessions.get(sessionId)?.conversationState === 'AI_SPEAKING';
   }
 
+  /**
+   * True while Nova is speaking the opening greeting (turnCount === 0). Proactive
+   * barge-in must be suppressed during this phase — early telephony line noise /
+   * echo can exceed the RMS threshold and kill the greeting mid-playback before the
+   * caller has actually spoken.
+   *
+   * Only applies to the FALLBACK (Nova-spoken) greeting. In primed mode the greeting
+   * was played locally and Nova never speaks it, so turnCount === 0 spans the agent's
+   * first REAL response — barge-in there must work normally, hence the primedGreeting
+   * exclusion.
+   */
+  isGreetingPhase(sessionId: string): boolean {
+    const ctx = this.sessions.get(sessionId);
+    return ctx !== undefined && ctx.info.turnCount === 0 && !ctx.primedGreeting;
+  }
+
   /** Current conversation state for a session. Used for logging and debugging. */
   getConversationState(sessionId: string): ConversationState | undefined {
     return this.sessions.get(sessionId)?.conversationState;
@@ -352,6 +450,10 @@ export class NovaSessionManager {
     const ctx = this.sessions.get(sessionId);
     if (!ctx) return;
 
+    if (ctx.silenceTimer) {
+      clearTimeout(ctx.silenceTimer);
+      ctx.silenceTimer = null;
+    }
     ctx.unsubscribeClientEvents();
     ctx.client.close();
     this.sessions.delete(sessionId);
@@ -413,7 +515,7 @@ export class NovaSessionManager {
      *      stop any queued outbound frames.
      *   3. Transition to AI_THINKING for the incoming new response.
      *
-     * A 1-second cooldown prevents the same barge-in event from being logged
+     * A 300ms cooldown prevents the same barge-in event from being logged
      * or processed multiple times if completionStart fires repeatedly.
      */
     const onCompletionStart = (completionId: string): void => {
@@ -422,9 +524,46 @@ export class NovaSessionManager {
       // Increment generation FIRST so we can use it for stale turn-complete detection.
       ctx.responseGeneration++;
 
+      // ── Greeting protection ───────────────────────────────────────────────
+      // During the greeting phase (turnCount === 0), Nova may fire a spurious
+      // second completionStart — e.g. its VAD on the empty interactive audio
+      // block times out and interprets silence as an end-of-utterance. If we
+      // let the barge-in block fire, it would cancel the greeting content,
+      // clear Twilio's buffer, and kill the greeting mid-playback.
+      //
+      // Fix: skip the barge-in block entirely during the greeting. Undo the
+      // generation increment so the greeting's turn-complete is still the
+      // "current" response and can open the greeting gate normally.
+      // Only the FALLBACK greeting (Nova-spoken) needs this protection. In primed
+      // mode Nova never speaks the greeting, so turnCount === 0 covers the agent's
+      // first real response, which MUST remain interruptible.
+      const isGreetingPhase = ctx.info.turnCount === 0 && !ctx.primedGreeting;
+      if (isGreetingPhase && ctx.conversationState === 'AI_SPEAKING' && ctx.activeContentId) {
+        ctx.responseGeneration--; // undo — greeting must stay the current generation
+        log.warn('⚠️ Ignoring spurious completionStart during greeting — greeting must play to completion', {
+          completionId,
+          generation: ctx.responseGeneration,
+          activeContentId: ctx.activeContentId,
+          outputAudioBytes: ctx.outputAudioBytes,
+        });
+        return; // greeting continues uninterrupted
+      }
+
+      // Cancel any pending silence re-engagement timer — the caller spoke.
+      if (ctx.silenceTimer) {
+        clearTimeout(ctx.silenceTimer);
+        ctx.silenceTimer = null;
+      }
+
+      // Reset the AudioRouter barge-in cooldown for this new response cycle.
+      // Without this, the 2-second cooldown from the PREVIOUS barge-in blocks
+      // detection on the new response if it starts within 2 seconds — causing
+      // the "agent finishes speaking before processing the user" symptom.
+      ctx.onNewResponse();
+
       if (ctx.conversationState === 'AI_SPEAKING' && ctx.activeContentId) {
         const now = Date.now();
-        if (now - ctx.lastBargeInAt > 1_000) {
+        if (now - ctx.lastBargeInAt > 300) {
           ctx.lastBargeInAt = now;
           ctx.cancelledContentIds.add(ctx.activeContentId);
           this.log.warn('⚡ BARGE-IN (Nova-side): new completionStart while AI was speaking — cancelling active content', {
@@ -642,7 +781,9 @@ export class NovaSessionManager {
      */
     const onTurnComplete = (stopReason: string): void => {
       ctx.info.turnCount += 1;
-      const isGreetingTurn = ctx.info.turnCount === 1;
+      // In primed mode Nova never speaks a greeting (the cached one was played
+      // locally), so turn #1 is the caller's first real reply — not a greeting.
+      const isGreetingTurn = !ctx.primedGreeting && ctx.info.turnCount === 1;
 
       // Determine if this turn-complete is for the currently active response or
       // for a previous (barge-in interrupted) response.
@@ -680,10 +821,38 @@ export class NovaSessionManager {
 
       // The greeting is done playing → start feeding caller audio to Nova. Before
       // this, inbound audio was dropped so an overlapping "hello" couldn't trigger a
-      // repeat greeting. Only open ears on a CURRENT turn-complete — a stale
-      // turn-complete from a barge-in interrupted greeting must not open the gate.
-      if (isGreetingTurn && isCurrentResponse) {
-        ctx.streamer.startListening('greeting-complete');
+      // repeat greeting. Open the gate on ANY turn-complete that fires while the gate
+      // is still closed. startListening() is idempotent so this is safe even if
+      // called from a stale turn-complete — we still know the greeting audio finished
+      // and the caller should now be heard.
+      if (!ctx.streamer.isListening) {
+        ctx.streamer.startListening(
+          isCurrentResponse ? 'greeting-complete' : 'greeting-complete-stale-turn',
+        );
+      }
+
+      // ── Silence re-engagement timer ───────────────────────────────────────
+      // After the agent finishes speaking normally (not a stale barge-in
+      // turn-complete), start a timer. If the caller says nothing within the
+      // configured window, inject a USER text cue so Nova asks "Are you still
+      // there?". Cancelled in onCompletionStart when the caller speaks.
+      if (isCurrentResponse && Env.nova.silenceTimeoutMs > 0) {
+        if (ctx.silenceTimer) {
+          clearTimeout(ctx.silenceTimer);
+        }
+        ctx.silenceTimer = setTimeout(() => {
+          ctx.silenceTimer = null;
+          // Only fire if still waiting for the caller (no new completionStart
+          // arrived and the agent is not already speaking again).
+          if (ctx.conversationState === 'LISTENING' && ctx.streamer.isListening) {
+            log.info('🔇 Silence timeout — injecting re-engagement prompt', {
+              sessionId,
+              silenceTimeoutMs: Env.nova.silenceTimeoutMs,
+            });
+            ctx.streamer.sendSilencePrompt(Env.nova.silencePrompt);
+          }
+        }, Env.nova.silenceTimeoutMs);
+        if (typeof ctx.silenceTimer.unref === 'function') ctx.silenceTimer.unref();
       }
 
       this.sessionManager.incrementTurn(sessionId);
