@@ -17,6 +17,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { Env } from '../../config';
+import { callTrace } from '../../shared/CallTraceLogger';
 import { Logger } from '../../shared/Logger';
 import { toBase64, pcmFrameBytes } from '../../utils/helpers';
 import { AudioBuffer } from '../audio/AudioBuffer';
@@ -25,6 +26,8 @@ import { NovaClient } from './NovaClient';
 export class NovaAudioStreamer {
   private readonly client: NovaClient;
   private readonly log: Logger;
+  private readonly sessionId: string;
+  private readonly callId: string;
 
   private readonly buffer: AudioBuffer;
   private readonly minChunkBytes: number;
@@ -49,6 +52,8 @@ export class NovaAudioStreamer {
   constructor(sessionId: string, callId: string, client: NovaClient) {
     this.client = client;
     this.log = Logger.forSession(sessionId, callId, 'NovaAudioStreamer');
+    this.sessionId = sessionId;
+    this.callId = callId;
 
     this.buffer = new AudioBuffer({
       maxBytes: Env.audio.bufferMaxBytes,
@@ -68,20 +73,35 @@ export class NovaAudioStreamer {
    * Open the single, long-lived conversation prompt for the whole call:
    *
    *   promptStart + SYSTEM text block            (the agent persona/instructions)
+   *   USER text cue ("Hello?") + contentEnd      (primes Nova's conversational mode)
    *   contentStart(AUDIO, interactive:true)      (left OPEN for the whole call)
    *
-   * Nova 2 Sonic does NOT speak first — it only responds to caller AUDIO (a USER
-   * text cue does not trigger a spoken turn; verified against the Nova 2 sample). So
-   * the opening greeting is a static WAV played separately on connect, and here we
-   * just open the SYSTEM prompt + an interactive audio block and let Nova's VAD drive
-   * every turn from the caller's first utterance. The system prompt tells Nova the
-   * greeting was already played, so it does not re-greet.
+   * The USER text cue is required per the Nova 2 Sonic event sequence. Its contentEnd
+   * triggers Nova to start a response (the greeting). The opening greeting audio is a
+   * pre-recorded WAV played separately, and the system prompt tells Nova the greeting
+   * was already played so it does not re-greet. The interactive audio block then stays
+   * open for the entire call — Nova's VAD drives every turn from the caller's first
+   * utterance onward.
    */
   startConversation(opts?: { greetingGateMs?: number }): void {
     if (this.conversationOpen || !this.client.isOpen) return;
 
     // promptStart + SYSTEM content block (system prompt is sent once for the call).
     this.currentPromptName = this.client.startPrompt(true);
+
+    // USER text cue — required to prime Nova 2 Sonic's conversational mode.
+    // Per the documented event sequence (NovaClient header / AWS docs), a USER text
+    // block with contentEnd must precede the interactive AUDIO block. Without it,
+    // Nova opens the audio block but never activates its VAD for turn-taking —
+    // resulting in complete silence after the greeting. The static WAV greeting is
+    // played separately; the system prompt tells Nova the greeting was already played,
+    // so Nova does not re-greet in response to this cue.
+    const cueContentName = `cue_${uuidv4().replace(/-/g, '')}`;
+    this.client.sendUserTextBlock(
+      this.currentPromptName,
+      cueContentName,
+      'Hello?',
+    );
 
     // ONE interactive audio block for the entire call. Nova's VAD drives turn-taking;
     // the caller's first utterance is the first turn.
@@ -98,8 +118,9 @@ export class NovaAudioStreamer {
     this.greetingGateTimer = setTimeout(() => this.startListening('greeting-finished'), gateMs);
     if (typeof this.greetingGateTimer.unref === 'function') this.greetingGateTimer.unref();
 
-    this.log.info('Conversation opened (SYSTEM + interactive audio block; static greeting plays separately)', {
+    this.log.info('Conversation opened (SYSTEM + USER cue + interactive audio block; static greeting plays separately)', {
       promptName: this.currentPromptName,
+      cueContentName,
       audioContentName: this.audioContentName,
       gateMs,
       interactive: true,
@@ -118,6 +139,7 @@ export class NovaAudioStreamer {
       this.greetingGateTimer = null;
     }
     this.buffer.clear(); // drop anything that arrived during the greeting
+    callTrace.event(this.callId, this.sessionId, 'mic.open', { reason });
     this.log.info('Greeting done — now listening to caller audio', { reason });
   }
 

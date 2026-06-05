@@ -16,6 +16,7 @@
 
 import { Env } from '../../config';
 import { AppEvent } from '../../events/EventTypes';
+import { callTrace } from '../../shared/CallTraceLogger';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
 import { latencyRegistry } from '../../shared/LatencyRegistry';
@@ -82,6 +83,7 @@ export class MediaSessionCoordinator {
     this.callToSession.set(callId, sessionId);
     const t0 = nowMs(); // startup-latency anchor: Twilio stream 'start' → first audio out
     latencyRegistry.markStartup(sessionId, 'streamStart', t0);
+    callTrace.start(callId, sessionId, { callerNumber, direction });
 
     // 2. INSTANT GREETING: if the opening greeting was synthesized + cached at boot,
     //    play it to the caller RIGHT NOW (the WebSocket is already open, so the first
@@ -128,6 +130,7 @@ export class MediaSessionCoordinator {
     //    With a cached greeting this connect happens UNDER the greeting playback, so
     //    its latency is hidden from the caller.
     latencyRegistry.markStartup(sessionId, 'novaConnectStart');
+    callTrace.event(callId, sessionId, 'nova.connect.start', {});
     try {
       await this.novaSessionManager.createSession(
         sessionId,
@@ -157,6 +160,9 @@ export class MediaSessionCoordinator {
         greetingOptions,
       );
       latencyRegistry.markStartup(sessionId, 'novaConnected');
+      callTrace.event(callId, sessionId, 'nova.connected', {
+        novaReadyMs: nowMs() - t0,
+      });
       log.info('⏱  Nova session ready', {
         sessionId,
         callId,
@@ -242,6 +248,8 @@ export class MediaSessionCoordinator {
     // 4. Terminate and destroy in-memory session
     this.sessionManager.terminateSession(sessionId, reason);
     this.sessionManager.destroySession(sessionId, reason);
+
+    callTrace.end(callId, { reason, durationMs });
 
     eventBus.emit(AppEvent.CALL_ENDED, {
       sessionId,

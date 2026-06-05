@@ -12,6 +12,7 @@
 import 'dotenv/config';
 import http from 'http';
 import { Env } from './config';
+import { callTrace } from './shared/CallTraceLogger';
 import { rootLogger as log } from './shared/Logger';
 import { createApp } from './app';
 import { WebSocketServer } from './infrastructure/WebSocketServer';
@@ -83,6 +84,9 @@ async function main(): Promise<void> {
 
     // Dispose session manager (clears idle timer)
     services.sessionManager.dispose();
+
+    // Flush any in-progress call traces to disk
+    callTrace.dispose();
 
     log.info('Shutdown complete');
     process.exit(0);
