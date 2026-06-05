@@ -13,6 +13,7 @@
 
 import { Request, Response, Router } from 'express';
 import WebSocket from 'ws';
+import { Env } from '../../config';
 import { Logger } from '../../shared/Logger';
 import { TwilioService } from './TwilioService';
 import { TwilioOutboundCallRequest } from './TwilioTypes';
@@ -71,10 +72,23 @@ export function createTwilioRouter(
     }
 
     // Construct the WebSocket URL for the media stream.
-    // Twilio requires wss:// — derive it from the Host header or the configured base URL.
-    const host = req.headers.host ?? '';
-    const streamUrl = `wss://${host}/stream`;
+    //
+    // Prefer TWILIO_WEBHOOK_BASE_URL (which we know Twilio can reach — we used it
+    // to create the call) over req.headers.host (which can be wrong behind
+    // proxies, tunnels, or load balancers).
+    //
+    // Convert https:// → wss:// (or http:// → ws://) and append /stream.
+    let streamUrl: string;
+    const baseUrl = Env.twilio.webhookBaseUrl;
+    if (baseUrl) {
+      streamUrl = baseUrl.replace(/^https?:\/\//, (m) => m === 'https://' ? 'wss://' : 'ws://') + '/stream';
+    } else {
+      // Fallback: derive from Host header (less reliable behind proxies).
+      const host = req.headers.host ?? 'localhost';
+      streamUrl = `wss://${host}/stream`;
+    }
 
+    log.info('Returning TwiML with media stream', { callSid, streamUrl });
     res.type('text/xml').send(twimlStreamResponse(streamUrl, callerNumber));
   });
 

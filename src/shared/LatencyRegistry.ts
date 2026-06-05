@@ -48,9 +48,20 @@ interface InboundStats {
   totalUs: number;
 }
 
+/** Ordered stages of call startup, from telephony ingress to first audio out. */
+export type StartupStage =
+  | 'streamStart'        // Twilio 'start' event received (call connected)
+  | 'novaConnectStart'   // began opening the Bedrock bidirectional stream
+  | 'novaConnected'      // Bedrock stream open (createSession returned)
+  | 'greetingFirstFrame' // first cached-greeting frame handed to Twilio
+  | 'greetingLastFrame'  // last cached-greeting frame handed to Twilio
+  | 'firstCallerAudio'   // first caller audio frame forwarded to Nova
+  | 'firstAgentAudio';   // first agent audio frame sent to the caller
+
 class LatencyRegistry {
   private turns = new Map<string, TurnTiming>();
   private inbound = new Map<string, InboundStats>();
+  private startup = new Map<string, Map<StartupStage, number>>();
 
   /** Record a turn mark. First write of each mark per turn wins (idempotent). */
   mark(sessionId: string, m: TurnMark, ts = Date.now()): void {
@@ -134,9 +145,59 @@ class LatencyRegistry {
     });
   }
 
+  // ─── Startup timeline (call connect → first audio out) ────────────────────
+
+  /** Record a startup-stage timestamp. First write of each stage wins (idempotent). */
+  markStartup(sessionId: string, stage: StartupStage, ts = Date.now()): void {
+    const m = this.startup.get(sessionId) ?? new Map<StartupStage, number>();
+    if (!m.has(stage)) {
+      m.set(stage, ts);
+      this.startup.set(sessionId, m);
+    }
+  }
+
+  /**
+   * Print the startup latency breakdown — every stage as ms since 'streamStart'.
+   * Call once the first audio (greeting or agent) has reached the caller. Reports
+   * once per session. This is the "10s of dead air" diagnostic: whichever stage gap
+   * is large is where the startup latency lives.
+   */
+  reportStartup(sessionId: string, callId: string): void {
+    const m = this.startup.get(sessionId);
+    const t0 = m?.get('streamStart');
+    if (!m || t0 === undefined) return;
+    if (m.has('reported' as StartupStage)) return;
+    m.set('reported' as StartupStage, 1);
+
+    const order: StartupStage[] = [
+      'streamStart', 'novaConnectStart', 'novaConnected',
+      'greetingFirstFrame', 'greetingLastFrame', 'firstCallerAudio', 'firstAgentAudio',
+    ];
+    const timeline = order.map((stage) => {
+      const ts = m.get(stage);
+      return { stage, msSinceConnect: ts !== undefined ? ts - t0 : null };
+    });
+
+    // Time-to-first-audible-audio = whichever of greeting/agent audio came first.
+    const firstAudio = [m.get('greetingFirstFrame'), m.get('firstAgentAudio')]
+      .filter((x): x is number => x !== undefined)
+      .sort((a, b) => a - b)[0];
+    const timeToFirstAudioMs = firstAudio !== undefined ? firstAudio - t0 : null;
+
+    log.info('⏱  STARTUP LATENCY BREAKDOWN (ms since call connect)', {
+      sessionId,
+      callId,
+      timeToFirstAudioMs,
+      target: '<1000ms',
+      withinTarget: timeToFirstAudioMs !== null && timeToFirstAudioMs < 1000,
+      timeline,
+    });
+  }
+
   clear(sessionId: string): void {
     this.turns.delete(sessionId);
     this.inbound.delete(sessionId);
+    this.startup.delete(sessionId);
   }
 }
 

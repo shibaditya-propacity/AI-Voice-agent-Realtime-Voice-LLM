@@ -14,9 +14,11 @@
  *   4. Destroy the in-memory session
  */
 
+import { Env } from '../../config';
 import { AppEvent } from '../../events/EventTypes';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
+import { latencyRegistry } from '../../shared/LatencyRegistry';
 import { nowMs } from '../../utils/helpers';
 import { KrispService } from '../krisp/KrispService';
 import { NovaSessionManager } from '../nova/NovaSessionManager';
@@ -78,10 +80,54 @@ export class MediaSessionCoordinator {
 
     const { sessionId } = session;
     this.callToSession.set(callId, sessionId);
+    const t0 = nowMs(); // startup-latency anchor: Twilio stream 'start' → first audio out
+    latencyRegistry.markStartup(sessionId, 'streamStart', t0);
 
-    // 2. Open Nova Sonic session FIRST so the greeting starts as fast as possible.
-    //    (Krisp is only needed once the caller speaks — i.e. after the greeting —
-    //    so initializing it before Nova just adds dead time to greeting latency.)
+    // 2. INSTANT GREETING: if the opening greeting was synthesized + cached at boot,
+    //    play it to the caller RIGHT NOW (the WebSocket is already open, so the first
+    //    audio reaches the caller within ~1s) and prime Nova with it as its own prior
+    //    turn. This takes Nova entirely off the critical path for the first words —
+    //    the cold-stream + system-prompt-prefill + greeting-generation cost (the old
+    //    5–7s of dead air) now happens in the background while the caller hears the
+    //    greeting. When the caller replies, Nova is already connected and listening.
+    //
+    //    If no greeting was cached (synthesis failed / still running), greetingOptions
+    //    stays undefined and Nova speaks the greeting itself — the original behaviour,
+    //    no regression.
+    let greetingOptions: { greetingGateMs: number } | undefined;
+    const cachedGreeting = this.novaSessionManager.getCachedGreeting();
+    log.info('[GREETING] step3 — getCachedGreeting() on call start', {
+      sessionId, callId,
+      result: cachedGreeting ? 'HIT' : 'MISS',
+      audioBytes: cachedGreeting?.audioPcm16.length ?? 0,
+    });
+    if (cachedGreeting) {
+      const greetingDurationMs = cachedGreeting.durationMs;
+      // Fire-and-forget — start the static greeting flowing to the caller NOW, in
+      // parallel with the Nova connect below. Do NOT await: the point is zero dead air.
+      log.info('[GREETING] step4 — calling playGreeting() (static WAV)', { sessionId, callId, greetingDurationMs });
+      this.audioRouter
+        .playGreeting(callId, sessionId, cachedGreeting.audioPcm16)
+        .then(() => log.info('[GREETING] step5 — playGreeting() resolved', { sessionId, callId, sinceStartMs: nowMs() - t0 }))
+        .catch((err) => log.error('[GREETING] step5 — playGreeting() error', err as Error, { sessionId, callId }));
+      // Open the caller's mic ~300ms after the greeting audio finishes playing.
+      greetingOptions = { greetingGateMs: greetingDurationMs + 300 };
+      log.info('▶️  Static greeting playing — Nova session initializing in parallel', {
+        sessionId, callId, greetingDurationMs,
+      });
+    } else {
+      // No greeting WAV cached → no opening greeting. Nova still answers once the
+      // caller speaks (it does not speak first). Check [GREETING] step2 at boot.
+      log.warn('[GREETING] step3 MISS — no greeting WAV cached; NO opening greeting. Agent responds once the caller speaks. Put a 16-bit PCM WAV at NOVA_GREETING_WAV_PATH (see [GREETING] step2 at boot).', {
+        sessionId, callId,
+      });
+    }
+
+    // 3. Open Nova Sonic session (Krisp is only needed once the caller speaks — i.e.
+    //    after the greeting — so initializing it before Nova just adds dead time).
+    //    With a cached greeting this connect happens UNDER the greeting playback, so
+    //    its latency is hidden from the caller.
+    latencyRegistry.markStartup(sessionId, 'novaConnectStart');
     try {
       await this.novaSessionManager.createSession(
         sessionId,
@@ -101,7 +147,22 @@ export class MediaSessionCoordinator {
           // directly, so both paths converge here.
           this.audioRouter.handleInterruption(callId, sessionId);
         },
+        () => {
+          // onNewResponse: called at the start of every new Nova response generation.
+          // Resets the AudioRouter barge-in cooldown so each new response cycle gets
+          // fresh barge-in detection — prevents the 2-second cooldown from the previous
+          // barge-in blocking interruption of the new response.
+          this.audioRouter.resetBargeInCooldown(sessionId);
+        },
+        greetingOptions,
       );
+      latencyRegistry.markStartup(sessionId, 'novaConnected');
+      log.info('⏱  Nova session ready', {
+        sessionId,
+        callId,
+        novaReadyMs: nowMs() - t0,
+        mode: greetingOptions ? 'primed (greeting already played from cache)' : 'live-nova-greeting',
+      });
     } catch (err) {
       log.error('Failed to open Nova Sonic session', err as Error, { sessionId, callId });
       // Teardown partial state

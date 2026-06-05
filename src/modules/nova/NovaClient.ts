@@ -245,17 +245,40 @@ export class NovaClient extends EventEmitter {
       const response = await Promise.race([client.send(command), timeout]);
       const connectMs = Date.now() - startedAt;
 
-      // Drain the valid session to completion so it closes cleanly (Nova ends it
-      // after sessionEnd). Output is fully discarded — never touches live state.
+      // Fire-and-forget: drain the warm-up stream in the background so it closes
+      // cleanly. Do NOT await — the connection is warm once send() returns; the
+      // drain just prevents a lingering HTTP/2 stream from consuming resources.
+      //
+      // CRITICAL: the old `await Promise.race([drain, 3s timeout])` could block the
+      // Node event loop for minutes if the SDK's async iterator performed a
+      // synchronous HTTP/2 read under the hood, because the setTimeout callback
+      // couldn't fire while the thread was blocked. A fire-and-forget drain with a
+      // hard stream destroy avoids this entirely.
       if (response.body) {
-        const drain = (async () => {
-          for await (const _item of response.body!) {
-            /* discard warm-up output */
-          }
+        const body = response.body;
+        const destroyTimer = setTimeout(() => {
+          try {
+            // Destroy the underlying stream to unblock the for-await-of iterator.
+            const s = body as unknown as { destroy?: (err?: Error) => void };
+            if (typeof s.destroy === 'function') {
+              s.destroy(new Error('prewarm drain timeout'));
+            }
+          } catch { /* best-effort */ }
+        }, 3_000);
+        // Prevent the destroy timer from keeping the process alive.
+        if (typeof (destroyTimer as NodeJS.Timeout).unref === 'function') {
+          (destroyTimer as NodeJS.Timeout).unref();
+        }
+
+        // Background drain — errors are expected (stream destroyed by timer).
+        (async () => {
+          try {
+            for await (const _item of body) { /* discard warm-up output */ }
+          } catch { /* stream destroyed — expected */ }
+          clearTimeout(destroyTimer);
         })();
-        const drainTimeout = new Promise<void>((resolve) => setTimeout(resolve, 3_000));
-        await Promise.race([drain, drainTimeout]);
       }
+
       log.info('Bedrock connection pre-warmed — first call reuses the warm connection', {
         connectMs,
         elapsedMs: Date.now() - startedAt,
