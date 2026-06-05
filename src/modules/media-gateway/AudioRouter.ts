@@ -15,6 +15,7 @@
 
 import { Env } from '../../config';
 import { AppEvent } from '../../events/EventTypes';
+import { callTrace } from '../../shared/CallTraceLogger';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
 import { fromBase64, toBase64, nowMs, pcmFrameBytes, chunkBuffer } from '../../utils/helpers';
@@ -223,6 +224,10 @@ export class AudioRouter {
 
     // Step 3: Stream to Nova Sonic
     latencyRegistry.markStartup(sessionId, 'firstCallerAudio');
+    callTrace.eventOnce(callId, sessionId, 'caller.audio.first', {
+      seqNum,
+      pcmBytes: cleanPcm16.length,
+    });
     this.novaSessionManager.pushAudio(sessionId, cleanPcm16);
 
     // Per-frame inbound cost (microseconds): decode, krisp, total.
@@ -252,6 +257,7 @@ export class AudioRouter {
    */
   async playGreeting(callId: string, sessionId: string, pcm16: Buffer): Promise<void> {
     this.log.info('[GREETING] step4 — playGreeting() entered', { sessionId, callId, pcm16Bytes: pcm16.length });
+    callTrace.event(callId, sessionId, 'greeting.play.start', { pcm16Bytes: pcm16.length });
     if (pcm16.length === 0) {
       this.log.warn('[GREETING] step4 — empty greeting buffer, nothing to play', { sessionId, callId });
       return;
@@ -290,6 +296,12 @@ export class AudioRouter {
     latencyRegistry.markStartup(sessionId, 'greetingLastFrame');
     // First audible audio reached the caller — emit the startup latency breakdown.
     latencyRegistry.reportStartup(sessionId, callId);
+
+    callTrace.event(callId, sessionId, 'greeting.play.end', {
+      framesSent,
+      framesFailed,
+      encodedBytes: encoded.length,
+    });
 
     if (framesSent > 0 && framesFailed === 0) {
       this.log.info('[GREETING] step5/6 — ✅ all greeting frames accepted by Twilio WS', {
@@ -351,6 +363,9 @@ export class AudioRouter {
       // Mark first audio chunk reaching Twilio for this turn → completes the
       // latency breakdown table.
       latencyRegistry.mark(sessionId, 'firstTwilioAudio');
+      callTrace.eventOnce(callId, sessionId, 'agent.audio.routed', {
+        encodedBytes: encoded.length,
+      });
       latencyRegistry.report(sessionId, callId);
 
       // Startup timeline: first AGENT audio to the caller. In the fallback (no cached
@@ -388,6 +403,7 @@ export class AudioRouter {
    * NovaSessionManager guards against double-cancellation.
    */
   handleInterruption(callId: string, sessionId: string): void {
+    callTrace.event(callId, sessionId, 'interruption', {});
     this.log.info('⚡ Stopping agent playback — flushing Twilio outbound buffer', { sessionId, callId });
 
     // Bump outbound generation FIRST — any in-flight routeOutbound() calls that

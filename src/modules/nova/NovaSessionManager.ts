@@ -9,6 +9,7 @@
 
 import { Env } from '../../config';
 import { AppEvent } from '../../events/EventTypes';
+import { callTrace } from '../../shared/CallTraceLogger';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
 import { latencyRegistry, clearVad } from '../../shared/LatencyRegistry';
@@ -281,10 +282,10 @@ export class NovaSessionManager {
           activeResponseGeneration: 0,
           contentIdToGeneration: new Map(),
           silenceTimer: null,
-          // Nova never produces the opening greeting anymore (a static WAV does), so
-          // there is no Nova "greeting phase" to protect — always true. This keeps
-          // isGreetingPhase() false so the caller's FIRST real turn is fully
-          // interruptible and barge-in/greeting-protection logic does not misfire.
+          // The static WAV greeting plays instantly on connect; Nova's first response
+          // (triggered by the USER text cue) overlaps with or follows it. Setting
+          // primedGreeting true keeps isGreetingPhase() false so the first turn is
+          // fully interruptible and barge-in detection works normally from the start.
           primedGreeting: true,
         };
 
@@ -483,6 +484,8 @@ export class NovaSessionManager {
     const prev = ctx.conversationState;
     if (prev === next) return;
     ctx.conversationState = next;
+    callTrace.setState(ctx.callId, next);
+    callTrace.event(ctx.callId, ctx.sessionId, 'state.transition', { from: prev, to: next });
     log.info(`STATE TRANSITION: ${prev} → ${next}`, {
       sessionId: ctx.sessionId,
       callId: ctx.callId,
@@ -609,6 +612,10 @@ export class NovaSessionManager {
 
       this.transitionState(ctx, 'AI_THINKING', log);
       ctx.outputAudioBytes = 0;
+      callTrace.event(callId, sessionId, 'nova.completion.start', {
+        completionId,
+        generation: ctx.responseGeneration,
+      });
       log.info('Nova response generation started', { completionId, generation: ctx.responseGeneration });
     };
 
@@ -631,6 +638,10 @@ export class NovaSessionManager {
         ctx.currentAssistantTranscript = '';
         ctx.outputAudioBytes = 0;
         this.transitionState(ctx, 'AI_SPEAKING', log);
+        callTrace.event(callId, sessionId, 'nova.content.start.audio', {
+          contentId,
+          generation: ctx.responseGeneration,
+        });
         log.info('✅ Nova audio response started — audio is flowing to caller', {
           contentId,
           generation: ctx.responseGeneration,
@@ -678,6 +689,10 @@ export class NovaSessionManager {
       if (ctx.outputAudioBytes === chunk.length) {
         // First audio chunk for this response (Nova model time-to-first-audio)
         latencyRegistry.mark(sessionId, 'firstNovaAudio');
+        callTrace.event(callId, sessionId, 'nova.audio.first', {
+          contentId,
+          chunkBytes: chunk.length,
+        });
         log.info('✅ First audio chunk routed to caller — response generation completed', {
           chunkBytes: chunk.length,
           contentId,
@@ -763,10 +778,16 @@ export class NovaSessionManager {
       ctx.contentIdToGeneration.delete(contentId);
 
       if (ctx.currentUserTranscript) {
+        callTrace.event(callId, sessionId, 'transcript.user', {
+          text: ctx.currentUserTranscript.slice(0, 200),
+        });
         this.sessionManager.addTranscriptEntry(sessionId, 'user', ctx.currentUserTranscript, true);
         ctx.currentUserTranscript = '';
       }
       if (ctx.currentAssistantTranscript) {
+        callTrace.event(callId, sessionId, 'transcript.assistant', {
+          text: ctx.currentAssistantTranscript.slice(0, 200),
+        });
         this.sessionManager.addTranscriptEntry(sessionId, 'assistant', ctx.currentAssistantTranscript, true);
         ctx.currentAssistantTranscript = '';
       }
@@ -812,6 +833,12 @@ export class NovaSessionManager {
         });
       }
 
+      callTrace.event(callId, sessionId, 'nova.turn.complete', {
+        stopReason,
+        turnCount: ctx.info.turnCount,
+        isGreetingTurn,
+        isCurrentResponse,
+      });
       log.info(
         isGreetingTurn
           ? '✅ Nova greeting complete — opening ears to the caller now'
