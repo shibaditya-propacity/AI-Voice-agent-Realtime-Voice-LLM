@@ -163,6 +163,27 @@ export class SessionManager {
   }
 
   /**
+   * Remove all non-final (interim) transcript entries from history.
+   * Called during barge-in to discard partial/overlapping transcripts so only
+   * complete, finalized utterances remain in the transcript record.
+   */
+  purgeInterimTranscripts(sessionId: string): void {
+    const session = this.store.get(sessionId);
+    if (!session) return;
+
+    const cleaned = session.transcriptHistory.filter(e => e.isFinal);
+    if (cleaned.length < session.transcriptHistory.length) {
+      log.info('Purged interim transcript entries on interruption', {
+        sessionId,
+        callId: session.callId,
+        removed: session.transcriptHistory.length - cleaned.length,
+        remaining: cleaned.length,
+      });
+      this.store.update(sessionId, { transcriptHistory: cleaned });
+    }
+  }
+
+  /**
    * Increment the turn index (called when one side finishes speaking).
    */
   incrementTurn(sessionId: string): CallSession {

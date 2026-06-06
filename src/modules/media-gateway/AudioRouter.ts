@@ -67,10 +67,10 @@ export class AudioRouter {
   private static readonly BARGE_IN_COOLDOWN_MS = 300;
 
   /**
-   * Whether the proactive client-side RMS barge-in is enabled. DEFAULT OFF — Nova 2
-   * Sonic handles barge-in natively (via the completionStart-while-AI_SPEAKING path
-   * in NovaSessionManager), and this RMS heuristic false-triggers on echo / caller
-   * backchannel, cancelling the agent's turn → silence. See Env.audio.proactiveBargeIn.
+   * Whether the proactive client-side RMS barge-in is enabled. Runs on post-Krisp
+   * (noise-suppressed) audio to avoid false positives from agent echo. Complements
+   * Nova's native barge-in (completionStart-while-AI_SPEAKING in NovaSessionManager)
+   * with faster client-side interruption. See Env.audio.proactiveBargeIn.
    */
   private static readonly PROACTIVE_BARGE_IN_ENABLED = Env.audio.proactiveBargeIn;
 
@@ -150,41 +150,6 @@ export class AudioRouter {
     }
     const tDecoded = process.hrtime.bigint();
 
-    // ── Proactive barge-in detection (DEFAULT OFF) ───────────────────────────
-    // Optional, opt-in fast interruption: if the agent is speaking and the caller's
-    // RMS energy exceeds the threshold, interrupt immediately rather than waiting for
-    // Nova's endpointing. DISABLED by default because Nova 2 Sonic already handles
-    // barge-in natively and this RMS heuristic false-triggers on telephony echo of
-    // the agent's own voice and on caller backchannel, killing the agent's turn with
-    // no replacement (the "agent goes silent after the caller speaks" / Hindi-switch
-    // symptom). Native barge-in still runs via NovaSessionManager.onCompletionStart.
-    if (AudioRouter.PROACTIVE_BARGE_IN_ENABLED && this.novaSessionManager.isAgentSpeaking(sessionId)) {
-      // Never interrupt the opening greeting — early telephony line noise / echo
-      // of the agent's own audio can exceed the RMS threshold before the caller
-      // has actually spoken, killing the greeting mid-playback. Barge-in is only
-      // enabled once the greeting turn completes (turnCount >= 1).
-      if (this.novaSessionManager.isGreetingPhase(sessionId)) {
-        // Silently skip — greeting must play to completion.
-      } else {
-        const rms = AudioRouter.computeRms(pcm16);
-        if (rms >= AudioRouter.BARGE_IN_RMS_THRESHOLD) {
-          const now = Date.now();
-          const lastBarge = this.lastBargeInAt.get(sessionId) ?? 0;
-          if (now - lastBarge >= AudioRouter.BARGE_IN_COOLDOWN_MS) {
-            this.lastBargeInAt.set(sessionId, now);
-            this.log.warn('⚡ BARGE-IN DETECTED — caller speech during AI playback — stopping output immediately', {
-              sessionId,
-              callId,
-              rms: Math.round(rms),
-              threshold: AudioRouter.BARGE_IN_RMS_THRESHOLD,
-              seqNum,
-            });
-            this.handleInterruption(callId, sessionId);
-          }
-        }
-      }
-    }
-
     // Energy VAD (measurement only): timestamp when the caller stops speaking so we
     // can measure Nova's endpointing latency. Does not alter the audio path.
     const speechEndAt = detectSpeechEnd(sessionId, pcm16);
@@ -212,6 +177,44 @@ export class AudioRouter {
       cleanPcm16 = pcm16;
     }
     const tKrisp = process.hrtime.bigint();
+
+    // ── Proactive barge-in detection (post-Krisp) ───────────────────────────
+    // Fast client-side interruption: if the agent is speaking and the caller's
+    // RMS energy (measured on noise-suppressed audio) exceeds the threshold,
+    // interrupt immediately rather than waiting for Nova's endpointing. Running
+    // on cleanPcm16 (post-Krisp) eliminates false positives from telephony echo
+    // of the agent's own voice while preserving real caller speech.
+    if (AudioRouter.PROACTIVE_BARGE_IN_ENABLED && this.novaSessionManager.isAgentSpeaking(sessionId)) {
+      // Never interrupt the opening greeting — early telephony line noise / echo
+      // of the agent's own audio can exceed the RMS threshold before the caller
+      // has actually spoken, killing the greeting mid-playback. Barge-in is only
+      // enabled once the greeting turn completes (turnCount >= 1).
+      if (this.novaSessionManager.isGreetingPhase(sessionId)) {
+        // Silently skip — greeting must play to completion.
+      } else {
+        const rms = AudioRouter.computeRms(cleanPcm16);
+        if (rms >= AudioRouter.BARGE_IN_RMS_THRESHOLD) {
+          const now = Date.now();
+          const lastBarge = this.lastBargeInAt.get(sessionId) ?? 0;
+          if (now - lastBarge >= AudioRouter.BARGE_IN_COOLDOWN_MS) {
+            this.lastBargeInAt.set(sessionId, now);
+            callTrace.event(callId, sessionId, 'bargein.user-speech-start', {
+              rms: Math.round(rms),
+              threshold: AudioRouter.BARGE_IN_RMS_THRESHOLD,
+              seqNum,
+            });
+            this.log.warn('⚡ BARGE-IN DETECTED — caller speech during AI playback — stopping output immediately', {
+              sessionId,
+              callId,
+              rms: Math.round(rms),
+              threshold: AudioRouter.BARGE_IN_RMS_THRESHOLD,
+              seqNum,
+            });
+            this.handleInterruption(callId, sessionId);
+          }
+        }
+      }
+    }
 
     eventBus.emit(AppEvent.AUDIO_PROCESSED, {
       sessionId,
