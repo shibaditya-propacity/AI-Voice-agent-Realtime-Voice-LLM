@@ -100,18 +100,16 @@ export const Env = {
       '',
       // ── Language ──
       'LANGUAGE: Default English. Stay in the chosen language until the caller switches.',
-      'If the caller asks for Hindi/Hinglish, just switch to Hinglish after a SHORT acknowledgement, then keep going. Vary the opener: "Sure.", "Haan, bilkul.", "Okay, hum Hinglish mein baat kar sakte hain."',
-      'NEVER describe your own language ability. Forbidden replies: "main Hinglish mein baat kar sakta hoon", "main aap Hinglish mein baat kar sakta hoon", "Yes, main ...", "main shuddh Hindi mein baat kar sakta hoon", or any translation- or assistant-style line. Acknowledge briefly and move on.',
+      'If the caller asks for Hindi/Hinglish, just switch to Hinglish after a SHORT acknowledgement, then keep going. Vary the opener: "Sure.", "Haan, bilkul.", "Bilkul mein hindi mein baat kar sakte hain."',
       '',
       // ── Hinglish + pronunciation ──
       'HINGLISH: Speak like an educated Indian professional, not a translator.',
       'NEVER translate or localize these — preserve them exactly as written: numbers, prices, percentages, dates, days (Monday, Tuesday...), months, phone numbers, emails, URLs, BHK (1/2/2.5/3 BHK), and brand, company, project, area and city names.',
       'Pronounce every numeral in English: "two", "two point five", "three", "forty-five lakh", "two BHK" — NEVER Hindi number words like "do", "dhai", "teen", "paintaalis".',
-      'Good: "Aaj Tuesday hai", "2 BHK available hai", "Price 45 lakh se start hoti hai." Bad: "Aaj Mangalvaar hai", "Do BHK", "Paintaalis lakh."',
       '',
       // ── Human conversation style ──
-      'STYLE: 1-3 short, natural sentences per reply, one question at a time. Sound calm, confident and human — a phone call, not an email.',
-      'Default acknowledgements: okay, sure, alright, haan, theek hai, samajh gaya. Use "ji" sparingly — at most 1 in 10 replies, and never start every reply with it; overusing "ji" sounds robotic. Occasionally (5-10%) a filler: ek second, let me check.',
+      'STYLE: 1-2 short, natural sentences per reply, one question at a time. Sound calm, confident and human — a phone call, not an email.',
+      'Default acknowledgements: okay, sure, alright, haan, theek hai. Use "ji" sparingly — at most 1 in 10 replies, and never start every reply with it. Occasionally (5-10%) a filler: ek second, let me check.',
       'NEVER use praise or enthusiasm: "very good", "bohot accha", "excellent", "wonderful", "great choice", "fantastic", repeated enthusiasm, corporate or assistant-style language.',
       '',
       // ── Greeting ──
@@ -177,7 +175,7 @@ export const Env = {
     // If the caller says nothing for this many ms after the agent finishes speaking,
     // inject a silence re-engagement cue so Nova asks "Are you still there?".
     // Set to 0 to disable silence re-engagement entirely.
-    silenceTimeoutMs: optionalInt('NOVA_SILENCE_TIMEOUT_MS', 3_000),
+    silenceTimeoutMs: optionalInt('NOVA_SILENCE_TIMEOUT_MS', 4_000),
     // Text injected as a USER turn when silence is detected. Nova responds to this
     // cue with the re-engagement phrase defined in its system prompt context.
     silencePrompt: optionalEnv('NOVA_SILENCE_PROMPT', '[The caller has been silent for several seconds. Say exactly: "I may not have heard you. Are you still there?"]'),
@@ -194,14 +192,12 @@ export const Env = {
     vadRmsThreshold: optionalInt('VAD_RMS_THRESHOLD', 700),
     vadSilenceHangoverMs: optionalInt('VAD_SILENCE_HANGOVER_MS', 120),
     // Proactive client-side barge-in: immediately interrupt agent playback when the
-    // caller's RMS energy exceeds vadRmsThreshold, WITHOUT waiting for Nova's own VAD.
-    // DEFAULT OFF. Nova 2 Sonic handles barge-in natively and gracefully; this RMS
-    // heuristic false-triggers on telephony echo of the agent's own voice and on
-    // caller backchannel ("haan", "ok"), cancelling the agent's turn with no
-    // replacement → the agent goes silent (notably when the caller talks over it,
-    // e.g. asking to switch to Hindi). Enable only if you specifically need
-    // interruption faster than Nova's endpointing.
-    proactiveBargeIn: optionalBool('AUDIO_PROACTIVE_BARGEIN', false),
+    // caller's RMS energy (measured on post-Krisp noise-suppressed audio) exceeds
+    // vadRmsThreshold, WITHOUT waiting for Nova's own VAD. Running on clean audio
+    // avoids false positives from telephony echo of the agent's own voice.
+    // DEFAULT ON. Complements Nova's native barge-in with faster client-side
+    // interruption for true real-time barge-in behavior.
+    proactiveBargeIn: optionalBool('AUDIO_PROACTIVE_BARGEIN', true),
   },
 
   session: {

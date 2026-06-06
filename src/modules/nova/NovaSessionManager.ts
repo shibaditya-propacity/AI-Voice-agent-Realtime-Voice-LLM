@@ -98,6 +98,37 @@ interface NovaContext {
    * greeting-gate logic in onTurnComplete must not treat turn #1 as the greeting.
    */
   primedGreeting: boolean;
+  /**
+   * Set when barge-in fires, cleared when the new response's final user transcript
+   * arrives (or on turn-complete as safety). While true, interim (non-final) user
+   * transcripts are suppressed — only the final, stabilized user utterance is stored.
+   * This prevents partial/overlapping speech fragments captured during the interruption
+   * overlap period from polluting the transcript history.
+   */
+  bargeInPending: boolean;
+  /**
+   * True after the silence re-engagement prompt has fired. Prevents the timer
+   * from looping (turn-complete after the re-engagement response would start
+   * another timer → another prompt → loop). Reset when the caller actually
+   * speaks (USER text arrives or completionStart from real caller speech).
+   */
+  silencePromptFired: boolean;
+  /**
+   * Epoch-ms of the most recent user speech signal: updated when Nova emits
+   * USER text-output (interim/final transcript) or when a final user content
+   * block ends. The silence timer callback checks this timestamp as a last-resort
+   * guard — if user speech was detected within the timeout window, the prompt is
+   * suppressed even if the timer fires (race-condition safety net).
+   */
+  lastUserSpeechAt: number;
+  /**
+   * Watchdog timer started when the AUDIO content block ends. If Nova's
+   * `completionEnd` doesn't arrive within 5s, forces a synthetic turn-complete
+   * so the state machine recovers from AI_SPEAKING → LISTENING and the silence
+   * re-engagement timer can start. Without this, a missing completionEnd leaves
+   * the call permanently stuck at AI_SPEAKING with no recovery.
+   */
+  turnCompleteWatchdog: ReturnType<typeof setTimeout> | null;
 }
 
 export class NovaSessionManager {
@@ -287,6 +318,10 @@ export class NovaSessionManager {
           // primedGreeting true keeps isGreetingPhase() false so the first turn is
           // fully interruptible and barge-in detection works normally from the start.
           primedGreeting: true,
+          bargeInPending: false,
+          silencePromptFired: false,
+          lastUserSpeechAt: 0,
+          turnCompleteWatchdog: null,
         };
 
         ctx.unsubscribeClientEvents = this.wireClientEvents(ctx);
@@ -384,7 +419,9 @@ export class NovaSessionManager {
     if (ctx.silenceTimer) {
       clearTimeout(ctx.silenceTimer);
       ctx.silenceTimer = null;
+      log.debug('🔇 Silence timer cancelled — barge-in interruption', { sessionId });
     }
+    ctx.silencePromptFired = false;
 
     // Cancel the in-flight audio output block so stale chunks are discarded.
     if (ctx.activeContentId) {
@@ -413,11 +450,39 @@ export class NovaSessionManager {
       ctx.currentUserTranscript = '';
     }
 
+    // Purge any interim (non-final) transcript entries from session history and gate
+    // future interim user transcripts until the user's final utterance arrives.
+    this.sessionManager.purgeInterimTranscripts(sessionId);
+    ctx.bargeInPending = true;
+
     // Clear the inbound audio buffer in the streamer.
     ctx.streamer.handleInterruption();
 
     this.transitionState(ctx, 'INTERRUPTED', log);
     ctx.info.state = 'prompt-active';
+
+    // Ensure a recovery timer is running. If the existing watchdog is active
+    // (content-end already fired), it will cover INTERRUPTED recovery. Otherwise
+    // start one — without it, the state can stay stuck at INTERRUPTED forever
+    // if Nova never sends a completionStart (e.g. the RMS spike was noise).
+    if (!ctx.turnCompleteWatchdog) {
+      ctx.turnCompleteWatchdog = setTimeout(() => {
+        ctx.turnCompleteWatchdog = null;
+        if (ctx.conversationState === 'INTERRUPTED') {
+          log.warn('⏰ INTERRUPTED recovery: no completionStart received — forcing turn-complete', {
+            sessionId,
+            callId: ctx.callId,
+          });
+          callTrace.event(ctx.callId, sessionId, 'watchdog.turn-complete', {
+            generation: ctx.responseGeneration,
+            recoveredState: 'INTERRUPTED',
+          });
+          ctx.client.emit('turn-complete', 'INTERRUPTED_RECOVERY');
+        }
+      }, 5_000);
+      if (typeof ctx.turnCompleteWatchdog.unref === 'function') ctx.turnCompleteWatchdog.unref();
+    }
+
     this.log.info('⚡ Interruption handled — state → INTERRUPTED, stale audio/text will be discarded', { sessionId });
   }
 
@@ -451,9 +516,23 @@ export class NovaSessionManager {
     const ctx = this.sessions.get(sessionId);
     if (!ctx) return;
 
+    this.log.info('📊 CALL TOKEN USAGE SUMMARY', {
+      sessionId,
+      callId: ctx.callId,
+      inputTokens: ctx.info.inputTokens,
+      outputTokens: ctx.info.outputTokens,
+      totalTokens: ctx.info.inputTokens + ctx.info.outputTokens,
+      turnCount: ctx.info.turnCount,
+      durationMs: Date.now() - ctx.info.createdAt,
+    });
+
     if (ctx.silenceTimer) {
       clearTimeout(ctx.silenceTimer);
       ctx.silenceTimer = null;
+    }
+    if (ctx.turnCompleteWatchdog) {
+      clearTimeout(ctx.turnCompleteWatchdog);
+      ctx.turnCompleteWatchdog = null;
     }
     ctx.unsubscribeClientEvents();
     ctx.client.close();
@@ -524,6 +603,12 @@ export class NovaSessionManager {
     const onCompletionStart = (completionId: string): void => {
       latencyRegistry.startTurn(sessionId);
 
+      // Cancel any pending turn-complete watchdog — new completion supersedes it.
+      if (ctx.turnCompleteWatchdog) {
+        clearTimeout(ctx.turnCompleteWatchdog);
+        ctx.turnCompleteWatchdog = null;
+      }
+
       // Increment generation FIRST so we can use it for stale turn-complete detection.
       ctx.responseGeneration++;
 
@@ -556,7 +641,9 @@ export class NovaSessionManager {
       if (ctx.silenceTimer) {
         clearTimeout(ctx.silenceTimer);
         ctx.silenceTimer = null;
+        log.debug('🔇 Silence timer cancelled — completionStart received (caller spoke)', { sessionId, completionId });
       }
+      ctx.silencePromptFired = false;
 
       // Reset the AudioRouter barge-in cooldown for this new response cycle.
       // Without this, the 2-second cooldown from the PREVIOUS barge-in blocks
@@ -589,6 +676,11 @@ export class NovaSessionManager {
             timestamp: now,
             confidence: 1.0,
           });
+          // Purge any interim (non-final) transcript entries from session history so
+          // only complete utterances remain. Gate future interim user transcripts until
+          // the user's final, stabilized utterance arrives after the interruption.
+          this.sessionManager.purgeInterimTranscripts(sessionId);
+          ctx.bargeInPending = true;
         }
       }
 
@@ -740,8 +832,23 @@ export class NovaSessionManager {
 
       if (role === 'USER') {
         latencyRegistry.mark(sessionId, 'firstUserText');
+        ctx.lastUserSpeechAt = Date.now();
+        // Cancel any pending silence re-engagement timer — the caller is speaking.
+        if (ctx.silenceTimer) {
+          clearTimeout(ctx.silenceTimer);
+          ctx.silenceTimer = null;
+          log.debug('🔇 Silence timer cancelled — user speech detected (text-output)', { sessionId });
+        }
+        // Reset the anti-loop guard — real caller speech resets the silence cycle.
+        ctx.silencePromptFired = false;
         ctx.currentUserTranscript += text;
-        this.sessionManager.addTranscriptEntry(sessionId, 'user', ctx.currentUserTranscript, false);
+        // During barge-in recovery, suppress interim user transcripts — only the final
+        // stabilized utterance (stored by onContentEnd) will enter transcript history.
+        // This prevents partial/overlapping speech fragments from the interruption
+        // period from polluting the session context.
+        if (!ctx.bargeInPending) {
+          this.sessionManager.addTranscriptEntry(sessionId, 'user', ctx.currentUserTranscript, false);
+        }
       } else {
         latencyRegistry.mark(sessionId, 'firstAssistantText');
         ctx.currentAssistantTranscript += text;
@@ -778,11 +885,22 @@ export class NovaSessionManager {
       ctx.contentIdToGeneration.delete(contentId);
 
       if (ctx.currentUserTranscript) {
+        ctx.lastUserSpeechAt = Date.now();
+        // Cancel any pending silence timer — valid final user transcript received.
+        if (ctx.silenceTimer) {
+          clearTimeout(ctx.silenceTimer);
+          ctx.silenceTimer = null;
+          log.debug('🔇 Silence timer cancelled — final user transcript received', { sessionId });
+        }
+        ctx.silencePromptFired = false;
         callTrace.event(callId, sessionId, 'transcript.user', {
           text: ctx.currentUserTranscript.slice(0, 200),
         });
         this.sessionManager.addTranscriptEntry(sessionId, 'user', ctx.currentUserTranscript, true);
         ctx.currentUserTranscript = '';
+        // Barge-in recovery complete — the final, stabilized user transcript has been
+        // stored. Resume normal interim transcript handling for subsequent turns.
+        ctx.bargeInPending = false;
       }
       if (ctx.currentAssistantTranscript) {
         callTrace.event(callId, sessionId, 'transcript.assistant', {
@@ -790,6 +908,34 @@ export class NovaSessionManager {
         });
         this.sessionManager.addTranscriptEntry(sessionId, 'assistant', ctx.currentAssistantTranscript, true);
         ctx.currentAssistantTranscript = '';
+      }
+
+      // ── Turn-complete watchdog ──────────────────────────────────────────────
+      // When the AUDIO content block ends, Nova should send completionEnd shortly
+      // after. If it doesn't arrive within 5s the state machine is stuck at
+      // AI_SPEAKING — no silence timer, no recovery, call hangs until disconnect.
+      // Start a watchdog that forces a synthetic turn-complete if completionEnd is
+      // missing. Cancelled in onTurnComplete (normal) or onCompletionStart (barge-in).
+      if (contentId === ctx.activeContentId && ctx.conversationState === 'AI_SPEAKING') {
+        callTrace.event(callId, sessionId, 'nova.content.end.audio', { contentId });
+        if (ctx.turnCompleteWatchdog) clearTimeout(ctx.turnCompleteWatchdog);
+        ctx.turnCompleteWatchdog = setTimeout(() => {
+          ctx.turnCompleteWatchdog = null;
+          if (ctx.conversationState === 'AI_SPEAKING' || ctx.conversationState === 'INTERRUPTED') {
+            log.warn('⏰ WATCHDOG: forcing turn-complete to recover from stuck state', {
+              sessionId, callId,
+              conversationState: ctx.conversationState,
+              generation: ctx.responseGeneration,
+              activeResponseGeneration: ctx.activeResponseGeneration,
+            });
+            callTrace.event(callId, sessionId, 'watchdog.turn-complete', {
+              generation: ctx.responseGeneration,
+              recoveredState: ctx.conversationState,
+            });
+            client.emit('turn-complete', 'WATCHDOG_TIMEOUT');
+          }
+        }, 5_000);
+        if (typeof ctx.turnCompleteWatchdog.unref === 'function') ctx.turnCompleteWatchdog.unref();
       }
     };
 
@@ -801,6 +947,12 @@ export class NovaSessionManager {
      * re-open the flood gate while the agent is already speaking again.
      */
     const onTurnComplete = (stopReason: string): void => {
+      // Cancel watchdog — completionEnd arrived (or watchdog itself fired).
+      if (ctx.turnCompleteWatchdog) {
+        clearTimeout(ctx.turnCompleteWatchdog);
+        ctx.turnCompleteWatchdog = null;
+      }
+
       ctx.info.turnCount += 1;
       // In primed mode Nova never speaks a greeting (the cached one was played
       // locally), so turn #1 is the caller's first real reply — not a greeting.
@@ -823,6 +975,9 @@ export class NovaSessionManager {
       if (isCurrentResponse) {
         // Normal completion — go back to listening.
         this.transitionState(ctx, 'LISTENING', log);
+        // Safety: ensure bargeInPending is cleared on turn-complete even if no user
+        // text block arrived (e.g. barge-in with no transcribed user speech).
+        ctx.bargeInPending = false;
       } else {
         // Stale turn-complete from a barge-in interrupted response.
         // A newer response is already in progress — don't override its state.
@@ -862,22 +1017,52 @@ export class NovaSessionManager {
       // After the agent finishes speaking normally (not a stale barge-in
       // turn-complete), start a timer. If the caller says nothing within the
       // configured window, inject a USER text cue so Nova asks "Are you still
-      // there?". Cancelled in onCompletionStart when the caller speaks.
-      if (isCurrentResponse && Env.nova.silenceTimeoutMs > 0) {
+      // there?". Cancelled when the caller speaks (onTextOutput/USER,
+      // onContentEnd/USER, onCompletionStart, handleInterruption).
+      if (isCurrentResponse && Env.nova.silenceTimeoutMs > 0 && !ctx.silencePromptFired) {
         if (ctx.silenceTimer) {
           clearTimeout(ctx.silenceTimer);
+          log.debug('🔇 Silence timer reset — replacing previous timer on turn-complete', { sessionId });
         }
+        const timerStartedAt = Date.now();
+        log.debug('🔇 Silence timer started', {
+          sessionId,
+          silenceTimeoutMs: Env.nova.silenceTimeoutMs,
+          turnCount: ctx.info.turnCount,
+          stopReason,
+        });
         ctx.silenceTimer = setTimeout(() => {
           ctx.silenceTimer = null;
-          // Only fire if still waiting for the caller (no new completionStart
-          // arrived and the agent is not already speaking again).
-          if (ctx.conversationState === 'LISTENING' && ctx.streamer.isListening) {
-            log.info('🔇 Silence timeout — injecting re-engagement prompt', {
+          const now = Date.now();
+          // Guard 1: only fire if still waiting for the caller.
+          if (ctx.conversationState !== 'LISTENING' || !ctx.streamer.isListening) {
+            log.debug('🔇 Silence timer expired but suppressed — not in LISTENING state', {
               sessionId,
-              silenceTimeoutMs: Env.nova.silenceTimeoutMs,
+              conversationState: ctx.conversationState,
+              isListening: ctx.streamer.isListening,
             });
-            ctx.streamer.sendSilencePrompt(Env.nova.silencePrompt);
+            return;
           }
+          // Guard 2: if user speech was detected within the timeout window
+          // (race condition safety net — timer survived despite speech).
+          const msSinceUserSpeech = ctx.lastUserSpeechAt > 0 ? now - ctx.lastUserSpeechAt : Infinity;
+          if (msSinceUserSpeech < Env.nova.silenceTimeoutMs) {
+            log.info('🔇 Silence timer expired but suppressed — user spoke recently', {
+              sessionId,
+              msSinceUserSpeech: Math.round(msSinceUserSpeech),
+              lastUserSpeechAt: ctx.lastUserSpeechAt,
+            });
+            return;
+          }
+          log.info('🔇 Silence timer fired — injecting re-engagement prompt', {
+            sessionId,
+            silenceTimeoutMs: Env.nova.silenceTimeoutMs,
+            elapsedMs: now - timerStartedAt,
+            lastUserSpeechAt: ctx.lastUserSpeechAt,
+            msSinceUserSpeech: msSinceUserSpeech === Infinity ? 'never' : Math.round(msSinceUserSpeech),
+          });
+          ctx.silencePromptFired = true;
+          ctx.streamer.sendSilencePrompt(Env.nova.silencePrompt);
         }, Env.nova.silenceTimeoutMs);
         if (typeof ctx.silenceTimer.unref === 'function') ctx.silenceTimer.unref();
       }
