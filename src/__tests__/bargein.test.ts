@@ -33,6 +33,11 @@ const SILENT_PCM = makePcm16(320, 0);
 /** Loud PCM16 buffer (RMS well above vadRmsThreshold=500) */
 const LOUD_PCM = makePcm16(320, 8000);
 
+/** Mirrors NovaSessionManager.hasActualWords — at least one letter/digit. */
+function hasActualWords(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
 // ─── Mock Nova Client ─────────────────────────────────────────────────────────
 // Simulates the Nova event stream locally without AWS.
 
@@ -249,6 +254,23 @@ function buildHandlers(client: MockNovaClient) {
     if (role === 'USER') {
       ctx.awaitingUserSpeech = false;
       ctx.currentUserTranscript += text;
+      // Transcript-confirmed barge-in: real words while AI_SPEAKING interrupt now,
+      // preserving the live transcript + re-stamping the block (mirrors production
+      // handleInterruption with the preserve hint). Fires once (next delta is INTERRUPTED).
+      if (ctx.conversationState === 'AI_SPEAKING' && hasActualWords(ctx.currentUserTranscript)) {
+        ctx.responseGeneration++;
+        ctx.lastTurnCompleteGeneration = -1;
+        ctx.awaitingUserSpeech = false;
+        if (ctx.activeContentId) {
+          ctx.cancelledContentIds.add(ctx.activeContentId);
+          ctx.activeContentId = '';
+        }
+        ctx.currentAssistantTranscript = '';
+        ctx.contentIdToGeneration.set(contentId, ctx.responseGeneration);
+        ctx.bargeInPending = true;
+        transitionState('INTERRUPTED');
+        onInterruption();
+      }
     } else {
       // Self-followup guard: discard ASSISTANT text after turn-complete with no user speech.
       if (ctx.awaitingUserSpeech) return;
@@ -389,6 +411,20 @@ function buildHandlers(client: MockNovaClient) {
     onInterruption();
   };
 
+  /**
+   * Simulates NovaSessionManager.handleVadEndDuringInterruption() — VAD end fired
+   * while INTERRUPTED. Recovers immediately unless a real word-bearing transcript
+   * was captured (genuine barge-in → let it promote).
+   */
+  const handleVadEnd = (): void => {
+    if (ctx.conversationState !== 'INTERRUPTED') return;
+    if (hasActualWords(ctx.currentUserTranscript)) return;
+    ctx.currentUserTranscript = '';
+    ctx.bargeInPending = false;
+    ctx.awaitingUserSpeech = true;
+    transitionState('LISTENING');
+  };
+
   client.on('completion-start', handleCompletionStart);
   client.on('content-start', handleContentStart);
   client.on('audio-output', handleAudioOutput);
@@ -396,7 +432,7 @@ function buildHandlers(client: MockNovaClient) {
   client.on('content-end', handleContentEnd);
   client.on('turn-complete', handleTurnComplete);
 
-  return { ctx, routedChunks, onAudioOutput, onInterruption, handleProactiveBargeIn };
+  return { ctx, routedChunks, onAudioOutput, onInterruption, handleProactiveBargeIn, handleVadEnd };
 }
 
 // ─── AudioRouter sequence dedup logic under test ──────────────────────────────
@@ -422,22 +458,54 @@ class MockAudioRouterDedup {
 
 class MockAudioRouterBargeIn {
   private readonly lastBargeInAt = new Map<string, number>();
+  private readonly pending = new Map<string, { startMs: number; lastSpeechMs: number }>();
   readonly VAD_THRESHOLD = 500;
   readonly COOLDOWN_MS = 300;
+  readonly CONFIRM_MS = 400;
+  readonly GAP_MS = 120;
 
   bargeInCount = 0;
 
-  /** Returns true if barge-in should be triggered for this frame. */
+  /**
+   * Returns true only when sustained speech reaches the confirm window — mirrors
+   * AudioRouter's pending→confirm model. A single loud frame enters PENDING and
+   * returns false; bursts that stop before CONFIRM_MS are discarded.
+   */
   checkBargeIn(sessionId: string, pcm16: Buffer, agentSpeaking: boolean): boolean {
-    if (!agentSpeaking) return false;
+    if (!agentSpeaking) { this.pending.delete(sessionId); return false; }
     const rms = this.computeRms(pcm16);
-    if (rms < this.VAD_THRESHOLD) return false;
     const now = Date.now();
-    const last = this.lastBargeInAt.get(sessionId) ?? 0;
-    if (now - last < this.COOLDOWN_MS) return false;
-    this.lastBargeInAt.set(sessionId, now);
-    this.bargeInCount++;
-    return true;
+    const pending = this.pending.get(sessionId);
+    if (rms >= this.VAD_THRESHOLD) {
+      if (!pending) {
+        this.pending.set(sessionId, { startMs: now, lastSpeechMs: now });
+        return false;
+      }
+      pending.lastSpeechMs = now;
+      if (now - pending.startMs >= this.CONFIRM_MS) {
+        const last = this.lastBargeInAt.get(sessionId) ?? 0;
+        if (now - last < this.COOLDOWN_MS) return false;
+        this.lastBargeInAt.set(sessionId, now);
+        this.pending.delete(sessionId);
+        this.bargeInCount++;
+        return true;
+      }
+      return false;
+    }
+    if (pending && now - pending.lastSpeechMs > this.GAP_MS) {
+      this.pending.delete(sessionId);
+    }
+    return false;
+  }
+
+  /** Feed continuous loud speech for `ms`, one 20ms frame at a time (fake timers). */
+  sustainSpeech(sessionId: string, ms: number): boolean {
+    let triggered = false;
+    for (let t = 0; t <= ms; t += 20) {
+      if (this.checkBargeIn(sessionId, LOUD_PCM, true)) triggered = true;
+      jest.advanceTimersByTime(20);
+    }
+    return triggered;
   }
 
   private computeRms(pcm16: Buffer): number {
@@ -453,6 +521,7 @@ class MockAudioRouterBargeIn {
 
   cleanup(sessionId: string): void {
     this.lastBargeInAt.delete(sessionId);
+    this.pending.delete(sessionId);
   }
 }
 
@@ -666,7 +735,12 @@ describe('Proactive barge-in: client-side VAD', () => {
   });
 
   test('No barge-in when agent is NOT speaking (LISTENING state)', () => {
-    const triggered = bargeIn.checkBargeIn('sess-1', LOUD_PCM, false);
+    // Even sustained loud audio does not interrupt when the agent is not speaking.
+    let triggered = false;
+    for (let t = 0; t <= 600; t += 20) {
+      if (bargeIn.checkBargeIn('sess-1', LOUD_PCM, false)) triggered = true;
+      jest.advanceTimersByTime(20);
+    }
     expect(triggered).toBe(false);
     expect(bargeIn.bargeInCount).toBe(0);
   });
@@ -677,39 +751,72 @@ describe('Proactive barge-in: client-side VAD', () => {
     expect(bargeIn.bargeInCount).toBe(0);
   });
 
-  test('Barge-in triggered for loud audio while agent is speaking', () => {
+  test('A single loud frame does NOT interrupt — only enters PENDING', () => {
     const triggered = bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+    expect(triggered).toBe(false);
+    expect(bargeIn.bargeInCount).toBe(0);
+  });
+
+  test('Short burst (< 300ms) then silence does NOT interrupt', () => {
+    // 280ms of speech, then it stops.
+    for (let t = 0; t < 280; t += 20) {
+      bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+      jest.advanceTimersByTime(20);
+    }
+    // Silence past the gap tolerance — pending is discarded.
+    for (let t = 0; t < 200; t += 20) {
+      bargeIn.checkBargeIn('sess-1', SILENT_PCM, true);
+      jest.advanceTimersByTime(20);
+    }
+    expect(bargeIn.bargeInCount).toBe(0);
+  });
+
+  test('Sustained speech >= 400ms DOES interrupt', () => {
+    const triggered = bargeIn.sustainSpeech('sess-1', 400);
     expect(triggered).toBe(true);
     expect(bargeIn.bargeInCount).toBe(1);
   });
 
-  test('Cooldown: second loud frame within 300ms does not double-trigger barge-in', () => {
-    bargeIn.checkBargeIn('sess-1', LOUD_PCM, true); // first trigger
-    jest.advanceTimersByTime(100); // within cooldown
-    const second = bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
-    expect(second).toBe(false);
-    expect(bargeIn.bargeInCount).toBe(1); // still 1
+  test('Brief inter-word dips (< gap) do not reset the pending run', () => {
+    // ~200ms speech, a single 20ms dip (< 120ms gap), then more speech past 400ms.
+    for (let t = 0; t < 200; t += 20) {
+      bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+      jest.advanceTimersByTime(20);
+    }
+    bargeIn.checkBargeIn('sess-1', SILENT_PCM, true); // brief dip
+    jest.advanceTimersByTime(20);
+    let triggered = false;
+    for (let t = 0; t < 240; t += 20) {
+      if (bargeIn.checkBargeIn('sess-1', LOUD_PCM, true)) triggered = true;
+      jest.advanceTimersByTime(20);
+    }
+    expect(triggered).toBe(true);
+    expect(bargeIn.bargeInCount).toBe(1);
   });
 
-  test('Barge-in re-triggers after cooldown expires', () => {
-    bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
-    jest.advanceTimersByTime(301); // past cooldown
-    const second = bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
-    expect(second).toBe(true);
-    expect(bargeIn.bargeInCount).toBe(2);
+  test('Once confirmed, no further triggers while the agent is no longer speaking', () => {
+    expect(bargeIn.sustainSpeech('sess-1', 400)).toBe(true);
+    expect(bargeIn.bargeInCount).toBe(1);
+    // After the barge-in, the agent stops speaking (state leaves AI_SPEAKING in
+    // production). Further loud frames with agentSpeaking=false must not re-trigger.
+    for (let t = 0; t <= 600; t += 20) {
+      expect(bargeIn.checkBargeIn('sess-1', LOUD_PCM, false)).toBe(false);
+      jest.advanceTimersByTime(20);
+    }
+    expect(bargeIn.bargeInCount).toBe(1);
   });
 
   test('Different sessions can both trigger barge-in independently', () => {
-    bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
-    bargeIn.checkBargeIn('sess-2', LOUD_PCM, true);
+    expect(bargeIn.sustainSpeech('sess-1', 400)).toBe(true);
+    expect(bargeIn.sustainSpeech('sess-2', 400)).toBe(true);
     expect(bargeIn.bargeInCount).toBe(2);
   });
 
-  test('cleanup removes cooldown state for session', () => {
-    bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+  test('cleanup removes pending + cooldown state for session', () => {
+    bargeIn.sustainSpeech('sess-1', 400);
     bargeIn.cleanup('sess-1');
-    // After cleanup, sess-1 barge-in should fire again immediately
-    const after = bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+    // After cleanup, a fresh sustained run fires again immediately (cooldown cleared).
+    const after = bargeIn.sustainSpeech('sess-1', 400);
     expect(after).toBe(true);
     expect(bargeIn.bargeInCount).toBe(2);
   });
@@ -1047,19 +1154,19 @@ describe('Cooldown reset: AudioRouter barge-in re-fires after cooldown clear', (
     jest.useRealTimers();
   });
 
-  test('After cooldown reset, barge-in fires immediately without waiting', () => {
-    // First barge-in
-    bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+  test('After cooldown reset, barge-in fires again on the next sustained run', () => {
+    // First barge-in (sustained 400ms)
+    expect(bargeIn.sustainSpeech('sess-1', 400)).toBe(true);
     expect(bargeIn.bargeInCount).toBe(1);
 
-    // Only 50ms later — normally within cooldown
+    // Only 50ms later — still within cooldown
     jest.advanceTimersByTime(50);
 
-    // Reset cooldown (simulates what AudioRouter.resetBargeInCooldown does)
+    // Reset cooldown + pending (simulates AudioRouter.resetBargeInCooldown)
     bargeIn.cleanup('sess-1');
 
-    // Barge-in should fire immediately
-    const triggered = bargeIn.checkBargeIn('sess-1', LOUD_PCM, true);
+    // A fresh sustained run fires immediately (no cooldown wait)
+    const triggered = bargeIn.sustainSpeech('sess-1', 400);
     expect(triggered).toBe(true);
     expect(bargeIn.bargeInCount).toBe(2);
   });
@@ -2246,5 +2353,96 @@ describe('Interruption recovery: cancelled generation never resumes', () => {
     const assistants = ctx.finalizedTranscripts.filter(t => t.role === 'assistant');
     expect(assistants).toHaveLength(1);
     expect(assistants[0].text).toBe('Theek hai, hindi mein baat karte hain');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS: False barge-in suppression + transcript-confirmed barge-in
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('False barge-in suppression and transcript-confirmed barge-in', () => {
+  test('Real words during AI_SPEAKING trigger barge-in and preserve the transcript', () => {
+    const client = new MockNovaClient();
+    const { ctx, onInterruption } = buildHandlers(client);
+
+    // Agent speaking
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+
+    // Caller's real words arrive on a USER block while the agent is speaking.
+    client.emit('content-start', 'user-1', 'TEXT');
+    client.emit('text-output', 'stop please', 'user-1', 'USER');
+
+    // Confirmed barge-in: INTERRUPTED, old audio cancelled, transcript PRESERVED.
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+    expect(onInterruption).toHaveBeenCalledTimes(1);
+    expect(ctx.cancelledContentIds.has('audio-A')).toBe(true);
+    expect(ctx.currentUserTranscript).toBe('stop please');
+
+    // The (re-stamped) user block finalizes + promotes — nothing is lost.
+    client.emit('content-end', 'user-1', 'END_TURN');
+    const userFinals = ctx.finalizedTranscripts.filter(t => t.role === 'user');
+    expect(userFinals.map(t => t.text)).toEqual(['stop please']);
+    expect(ctx.promotedTurns).toEqual(['stop please']);
+    expect(ctx.conversationState).toBe('LISTENING');
+  });
+
+  test('Punctuation-only / empty USER text does NOT trigger barge-in', () => {
+    const client = new MockNovaClient();
+    const { ctx, onInterruption } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+
+    client.emit('content-start', 'user-1', 'TEXT');
+    client.emit('text-output', '... ', 'user-1', 'USER');
+    client.emit('text-output', '?!', 'user-1', 'USER');
+
+    // No real words → agent keeps speaking, never interrupted.
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+    expect(onInterruption).not.toHaveBeenCalled();
+  });
+
+  test('VAD end during INTERRUPTED with NO transcript recovers to LISTENING immediately', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, handleVadEnd } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+
+    // Proactive (e.g. 400ms of sustained noise) barge-in → INTERRUPTED, no transcript.
+    handleProactiveBargeIn();
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+    expect(ctx.currentUserTranscript).toBe('');
+
+    handleVadEnd();
+    expect(ctx.conversationState).toBe('LISTENING');
+    expect(ctx.bargeInPending).toBe(false);
+    expect(ctx.awaitingUserSpeech).toBe(true);
+  });
+
+  test('VAD end during INTERRUPTED with a real transcript does NOT recover (genuine barge-in proceeds)', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, handleVadEnd } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+
+    handleProactiveBargeIn();
+    // Caller's real words arrive while INTERRUPTED (kept, not discarded).
+    client.emit('content-start', 'user-1', 'TEXT');
+    client.emit('text-output', 'switch to hindi', 'user-1', 'USER');
+    expect(ctx.currentUserTranscript).toBe('switch to hindi');
+
+    // VAD end fires, but a real transcript exists → must NOT recover.
+    handleVadEnd();
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // Genuine barge-in finalizes + promotes normally.
+    client.emit('content-end', 'user-1', 'END_TURN');
+    expect(ctx.promotedTurns).toEqual(['switch to hindi']);
+    expect(ctx.conversationState).toBe('LISTENING');
   });
 });
