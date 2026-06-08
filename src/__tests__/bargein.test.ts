@@ -126,6 +126,16 @@ interface TestContext {
   currentUserTranscript: string;
   /** Finalized transcript entries — simulates SessionManager.addTranscriptEntry(). */
   finalizedTranscripts: Array<{ role: string; text: string; isFinal: boolean }>;
+  /** Transcripts promoted to a new USER turn — simulates streamer.promoteUserTurn(). */
+  promotedTurns: string[];
+  /** Mirrors NovaContext.bargeInPending — suppresses interim transcripts during barge-in. */
+  bargeInPending: boolean;
+  /** Mirrors NovaContext.lastTurnCompleteGeneration — deduplicates turn-complete. */
+  lastTurnCompleteGeneration: number;
+  /** Mirrors NovaContext.awaitingUserSpeech — self-followup guard. */
+  awaitingUserSpeech: boolean;
+  /** Mirrors NovaContext.lastFinalizedUserText — promotion dedup. */
+  lastFinalizedUserText: string;
 }
 
 /**
@@ -146,6 +156,11 @@ function buildHandlers(client: MockNovaClient) {
     currentAssistantTranscript: '',
     currentUserTranscript: '',
     finalizedTranscripts: [],
+    promotedTurns: [],
+    bargeInPending: false,
+    lastTurnCompleteGeneration: -1,
+    awaitingUserSpeech: false,
+    lastFinalizedUserText: '',
   };
 
   const routedChunks: Buffer[] = [];
@@ -164,6 +179,9 @@ function buildHandlers(client: MockNovaClient) {
   // ── completion-start ──
   const handleCompletionStart = (completionId: string): void => {
     ctx.responseGeneration++;
+    ctx.lastTurnCompleteGeneration = -1;
+    ctx.awaitingUserSpeech = false;
+    ctx.lastFinalizedUserText = '';
     if (ctx.conversationState === 'AI_SPEAKING' && ctx.activeContentId) {
       const now = Date.now();
       if (now - ctx.lastBargeInAt > 300) {
@@ -172,6 +190,7 @@ function buildHandlers(client: MockNovaClient) {
         ctx.activeContentId = '';
         transitionState('INTERRUPTED');
         onInterruption();
+        ctx.bargeInPending = true;
       }
     }
     // Discard partial transcripts from the interrupted response
@@ -183,10 +202,25 @@ function buildHandlers(client: MockNovaClient) {
 
   // ── content-start ──
   const handleContentStart = (contentId: string, type: string): void => {
+    // A cancelled content block must never regain ownership.
+    if (ctx.cancelledContentIds.has(contentId)) return;
+
     // Record generation for EVERY content block (AUDIO or TEXT)
     ctx.contentIdToGeneration.set(contentId, ctx.responseGeneration);
 
     if (type === 'AUDIO') {
+      // INTERRUPTED guard: reject audio blocks from a resumed interrupted response.
+      if (ctx.conversationState === 'INTERRUPTED') {
+        ctx.cancelledContentIds.add(contentId);
+        return;
+      }
+
+      // Self-followup guard: reject AUDIO after turn-complete with no user speech.
+      if (ctx.awaitingUserSpeech) {
+        ctx.cancelledContentIds.add(contentId);
+        return;
+      }
+
       ctx.activeContentId = contentId;
       ctx.activeResponseGeneration = ctx.responseGeneration;
       ctx.currentAssistantTranscript = '';
@@ -203,53 +237,156 @@ function buildHandlers(client: MockNovaClient) {
 
   // ── text-output ──
   const handleTextOutput = (text: string, contentId: string, role: string): void => {
-    // Stale generation filter
+    // Cancelled content filter: text from a cancelled block is always discarded.
+    if (ctx.cancelledContentIds.has(contentId)) return;
+    // Stale generation filter (applies to USER + ASSISTANT)
     const gen = ctx.contentIdToGeneration.get(contentId);
     if (gen !== undefined && gen < ctx.responseGeneration) return;
-    if (ctx.conversationState === 'INTERRUPTED') return;
+    // INTERRUPTED discards ASSISTANT leftovers only — USER text is the caller's live
+    // barge-in speech and must be kept (root-cause fix).
+    if (ctx.conversationState === 'INTERRUPTED' && role !== 'USER') return;
 
     if (role === 'USER') {
+      ctx.awaitingUserSpeech = false;
       ctx.currentUserTranscript += text;
     } else {
+      // Self-followup guard: discard ASSISTANT text after turn-complete with no user speech.
+      if (ctx.awaitingUserSpeech) return;
       ctx.currentAssistantTranscript += text;
+      // Control-token guard: suppress interim while it looks like a JSON control token.
+      if (ctx.currentAssistantTranscript.trimStart().startsWith('{')) return;
     }
   };
 
   // ── content-end ──
   const handleContentEnd = (contentId: string): void => {
+    // Cancelled content filter: a cancelled block can never finalize transcripts.
+    if (ctx.cancelledContentIds.has(contentId)) {
+      ctx.contentIdToGeneration.delete(contentId);
+      return;
+    }
     // Stale generation filter
     const gen = ctx.contentIdToGeneration.get(contentId);
     if (gen !== undefined && gen < ctx.responseGeneration) {
       ctx.contentIdToGeneration.delete(contentId);
       return;
     }
-    if (ctx.conversationState === 'INTERRUPTED') {
+    // INTERRUPTED early-return only when no USER transcript is pending — a pending
+    // USER transcript is the caller's live barge-in speech and must be finalized.
+    if (ctx.conversationState === 'INTERRUPTED' && !ctx.currentUserTranscript) {
       ctx.contentIdToGeneration.delete(contentId);
       return;
     }
 
+    const interrupted = ctx.conversationState === 'INTERRUPTED';
     ctx.contentIdToGeneration.delete(contentId);
 
     if (ctx.currentUserTranscript) {
-      ctx.finalizedTranscripts.push({ role: 'user', text: ctx.currentUserTranscript, isFinal: true });
+      const finalUserText = ctx.currentUserTranscript;
+      ctx.finalizedTranscripts.push({ role: 'user', text: finalUserText, isFinal: true });
       ctx.currentUserTranscript = '';
+      if (!interrupted) {
+        ctx.bargeInPending = false;
+      }
+      // Promote a transcript finalized during INTERRUPTED into a new USER turn and
+      // recover to LISTENING (mirrors NovaSessionManager.executePromotion). Promotion
+      // is immediate and bypasses dedup — interrupted speech is never suppressed.
+      if (interrupted) {
+        if (ctx.activeContentId) {
+          ctx.cancelledContentIds.add(ctx.activeContentId);
+          ctx.activeContentId = '';
+        }
+        ctx.currentAssistantTranscript = '';
+        ctx.conversationState = 'LISTENING';
+        // Promoted turn is caller input → allow the agent's reply through. Nova
+        // streams the promoted response without a completionStart in this
+        // deployment, so awaitingUserSpeech must be false or the reply is dropped.
+        ctx.awaitingUserSpeech = false;
+        ctx.bargeInPending = false;
+        ctx.promotedTurns.push(finalUserText);
+      }
+      ctx.lastFinalizedUserText = finalUserText;
     }
     if (ctx.currentAssistantTranscript) {
-      ctx.finalizedTranscripts.push({ role: 'assistant', text: ctx.currentAssistantTranscript, isFinal: true });
-      ctx.currentAssistantTranscript = '';
+      const at = ctx.currentAssistantTranscript.trim();
+      const isControlToken =
+        at.startsWith('{') && at.endsWith('}') && /"interrupted"\s*:/.test(at);
+      // Never finalize a Nova control token ({"interrupted":true}) into history/output.
+      if (isControlToken) {
+        ctx.currentAssistantTranscript = '';
+      } else if (interrupted) {
+        // Discard assistant leftovers if interrupted.
+        ctx.currentAssistantTranscript = '';
+      } else if (ctx.awaitingUserSpeech) {
+        // Self-followup guard: discard assistant text finalized after turn-complete
+        // with no intervening user speech.
+        ctx.currentAssistantTranscript = '';
+      } else {
+        ctx.finalizedTranscripts.push({ role: 'assistant', text: ctx.currentAssistantTranscript, isFinal: true });
+        ctx.currentAssistantTranscript = '';
+      }
+    }
+
+    // Settling timer at audio content-end (mirrors production code).
+    // In tests, we emit turn-complete immediately for simplicity — the settling
+    // timer's 500ms delay is tested via jest.useFakeTimers in dedicated tests.
+    if (contentId === ctx.activeContentId && ctx.conversationState === 'AI_SPEAKING') {
+      client.emit('turn-complete', 'AUDIO_COMPLETE');
     }
   };
 
   // ── turn-complete ──
   const handleTurnComplete = (): void => {
-    const isCurrentResponse = ctx.responseGeneration === ctx.activeResponseGeneration;
-    ctx.cancelledContentIds.clear();
-    ctx.contentIdToGeneration.clear();
-    ctx.activeContentId = '';
-    if (isCurrentResponse) {
-      transitionState('LISTENING');
+    // Deduplicate: audio content-end fires turn-complete immediately, and
+    // completionEnd may fire another. Process once per generation.
+    if (ctx.lastTurnCompleteGeneration === ctx.activeResponseGeneration
+      && ctx.conversationState === 'LISTENING') {
+      ctx.cancelledContentIds.clear();
+      ctx.contentIdToGeneration.clear();
+      ctx.activeContentId = '';
+      return;
     }
-    // else: stale turn-complete from interrupted old response — leave state alone
+    ctx.lastTurnCompleteGeneration = ctx.activeResponseGeneration;
+
+    const isCurrentResponse = ctx.responseGeneration === ctx.activeResponseGeneration;
+    if (isCurrentResponse) {
+      // Normal completion — release protection maps and go back to listening.
+      ctx.cancelledContentIds.clear();
+      ctx.contentIdToGeneration.clear();
+      ctx.activeContentId = '';
+      transitionState('LISTENING');
+      ctx.bargeInPending = false;
+      ctx.awaitingUserSpeech = true;
+    }
+    // else: stale turn-complete from interrupted old response — leave state and
+    // protection maps intact so late-arriving stale events are still blocked.
+  };
+
+  /**
+   * Simulates NovaSessionManager.handleInterruption() — proactive barge-in from
+   * AudioRouter RMS detection. Mirrors the Round 2 production code: bumps
+   * responseGeneration, cancels active content, transitions to INTERRUPTED.
+   * Does NOT clear contentIdToGeneration (that was the bug we fixed).
+   */
+  const handleProactiveBargeIn = (): void => {
+    // Bump generation so stale-generation filters work.
+    // CRITICAL: do NOT set activeResponseGeneration — leave it at the old value
+    // so the interrupted response's turn-complete is correctly detected as stale
+    // (responseGeneration !== activeResponseGeneration).
+    ctx.responseGeneration++;
+    ctx.lastTurnCompleteGeneration = -1;
+    ctx.awaitingUserSpeech = false; // caller spoke
+
+    if (ctx.activeContentId) {
+      ctx.cancelledContentIds.add(ctx.activeContentId);
+      ctx.activeContentId = '';
+    }
+    ctx.currentAssistantTranscript = '';
+    ctx.currentUserTranscript = '';
+    // DO NOT clear contentIdToGeneration — old blocks must retain their gen mapping
+    ctx.bargeInPending = true;
+    transitionState('INTERRUPTED');
+    onInterruption();
   };
 
   client.on('completion-start', handleCompletionStart);
@@ -259,7 +396,7 @@ function buildHandlers(client: MockNovaClient) {
   client.on('content-end', handleContentEnd);
   client.on('turn-complete', handleTurnComplete);
 
-  return { ctx, routedChunks, onAudioOutput, onInterruption };
+  return { ctx, routedChunks, onAudioOutput, onInterruption, handleProactiveBargeIn };
 }
 
 // ─── AudioRouter sequence dedup logic under test ──────────────────────────────
@@ -769,6 +906,77 @@ describe('Transcript contamination prevention', () => {
     expect(ctx.finalizedTranscripts).toHaveLength(0);
   });
 
+  test('USER transcript during INTERRUPTED is KEPT and finalized (caller barge-in speech not lost)', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // Agent speaking
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+
+    // Proactive (AudioRouter) barge-in → INTERRUPTED, no new completionStart yet.
+    ctx.conversationState = 'INTERRUPTED';
+    ctx.cancelledContentIds.add('audio-A');
+
+    // Caller's live ASR for the barge-in utterance arrives WHILE INTERRUPTED.
+    client.emit('content-start', 'user-text-B', 'TEXT');
+    client.emit('text-output', 'my name is', 'user-text-B', 'USER');
+    client.emit('text-output', ' Shiva', 'user-text-B', 'USER');
+    // Root-cause fix: USER text is kept, not discarded.
+    expect(ctx.currentUserTranscript).toBe('my name is Shiva');
+
+    // content-end still INTERRUPTED → must FINALIZE the user transcript (not drop it).
+    client.emit('content-end', 'user-text-B', 'END_TURN');
+    const userFinals = ctx.finalizedTranscripts.filter((t) => t.role === 'user');
+    expect(userFinals).toHaveLength(1);
+    expect(userFinals[0].text).toBe('my name is Shiva');
+
+    // …and it must be PROMOTED into a new USER turn + recover to LISTENING, so Nova
+    // responds to it instead of resuming the interrupted response.
+    expect(ctx.promotedTurns).toEqual(['my name is Shiva']);
+    expect(ctx.conversationState).toBe('LISTENING');
+    expect(ctx.cancelledContentIds.has('audio-A')).toBe(true);
+  });
+
+  test('Nova control token {"interrupted":true} is never finalized into transcript/output', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    // A normal assistant response finalizes fine.
+    client.emit('content-start', 'text-A', 'TEXT');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('text-output', 'Bilkul, theek hai.', 'text-A', 'ASSISTANT');
+    client.emit('content-end', 'text-A', 'END_TURN');
+
+    // Nova then emits its barge-in control token as a separate assistant text block.
+    client.emit('content-start', 'text-ctrl', 'TEXT');
+    client.emit('text-output', '{ "interrupted" : true }', 'text-ctrl', 'ASSISTANT');
+    // Interim must be suppressed (not surfaced).
+    client.emit('content-end', 'text-ctrl', 'END_TURN');
+
+    const assistantTexts = ctx.finalizedTranscripts.filter((t) => t.role === 'assistant').map((t) => t.text);
+    expect(assistantTexts).toEqual(['Bilkul, theek hai.']);
+    expect(assistantTexts.some((t) => t.includes('interrupted'))).toBe(false);
+  });
+
+  test('USER transcript finalized in LISTENING (normal) is NOT promoted', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // Normal turn — no interruption.
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'user-text-A', 'TEXT');
+    client.emit('text-output', 'my name is Shiva', 'user-text-A', 'USER');
+    // Simulate normal listening state when the final arrives.
+    ctx.conversationState = 'LISTENING';
+    client.emit('content-end', 'user-text-A', 'END_TURN');
+
+    expect(ctx.finalizedTranscripts.filter((t) => t.role === 'user')).toHaveLength(1);
+    // Not interrupted → no promotion (Nova answers the audio turn natively).
+    expect(ctx.promotedTurns).toHaveLength(0);
+  });
+
   test('Rapid re-interruption after cooldown reset works (resetBargeInCooldown)', () => {
     const client = new MockNovaClient();
     const { ctx, onInterruption } = buildHandlers(client);
@@ -1073,11 +1281,970 @@ describe('Outbound generation guard: in-flight audio discarded after interruptio
     client.emit('content-start', 'audio-B', 'AUDIO');
     client.emit('audio-output', Buffer.from('new-response'), 'audio-B', 'compl-2');
     client.emit('content-end', 'audio-B', 'END_TURN');
-    client.emit('turn-complete', 'END_TURN');
 
     const routed = routedChunks.map(b => b.toString());
     expect(routed).not.toContain('stale-after-interrupt');
     expect(routed).toContain('new-response');
     expect(ctx.conversationState).toBe('LISTENING');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS: Multi-fragment interruption aggregation
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Multi-fragment interruption aggregation', () => {
+  test('First interrupted fragment is promoted immediately; later fragments are finalized but not re-promoted', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // Agent speaking
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+
+    // Proactive barge-in → INTERRUPTED
+    ctx.conversationState = 'INTERRUPTED';
+    ctx.cancelledContentIds.add('audio-A');
+    ctx.bargeInPending = true;
+
+    // First fragment: "हाँ, मैं" — finalized at VAD-end → promoted immediately,
+    // state recovers to LISTENING and bargeInPending is cleared.
+    client.emit('content-start', 'user-text-1', 'TEXT');
+    client.emit('text-output', 'हाँ, मैं', 'user-text-1', 'USER');
+    client.emit('content-end', 'user-text-1', 'END_TURN');
+
+    expect(ctx.conversationState).toBe('LISTENING');
+    expect(ctx.bargeInPending).toBe(false);
+    expect(ctx.promotedTurns).toEqual(['हाँ, मैं']);
+
+    // Second fragment: "भी" — arrives after recovery (state LISTENING), so it is
+    // finalized into history but NOT separately promoted (exactly one promoted turn
+    // per interruption).
+    client.emit('content-start', 'user-text-2', 'TEXT');
+    client.emit('text-output', 'भी', 'user-text-2', 'USER');
+    client.emit('content-end', 'user-text-2', 'END_TURN');
+
+    const userFinals = ctx.finalizedTranscripts.filter(t => t.role === 'user');
+    expect(userFinals).toHaveLength(2);
+    expect(userFinals[0].text).toBe('हाँ, मैं');
+    expect(userFinals[1].text).toBe('भी');
+    expect(ctx.promotedTurns).toHaveLength(1);
+  });
+
+  test('bargeInPending is cleared on normal (non-interrupted) content-end', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // Normal turn — no interruption
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'user-text-A', 'TEXT');
+    client.emit('text-output', 'Hello', 'user-text-A', 'USER');
+
+    // Manually set bargeInPending to verify it gets cleared
+    ctx.bargeInPending = true;
+    // Force state to LISTENING (non-interrupted)
+    ctx.conversationState = 'LISTENING';
+    client.emit('content-end', 'user-text-A', 'END_TURN');
+
+    expect(ctx.bargeInPending).toBe(false);
+  });
+
+  test('bargeInPending is cleared by turn-complete (safety net)', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    ctx.bargeInPending = true;
+
+    client.emit('content-end', 'audio-A', 'END_TURN');
+    // turn-complete fired immediately by content-end → bargeInPending cleared
+    expect(ctx.bargeInPending).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS: Duplicate assistant suppression
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Duplicate assistant suppression', () => {
+  test('Assistant text from cancelled content block is discarded (text-output)', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-A', 'TEXT');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+
+    // Cancel text-A content block (simulates interruption cleanup)
+    ctx.cancelledContentIds.add('text-A');
+
+    // Text arrives for cancelled content — must be discarded
+    client.emit('text-output', 'This should be suppressed', 'text-A', 'ASSISTANT');
+    expect(ctx.currentAssistantTranscript).toBe('');
+  });
+
+  test('Assistant text from cancelled content block is discarded (content-end)', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-A', 'TEXT');
+    client.emit('text-output', 'Partial response', 'text-A', 'ASSISTANT');
+
+    // Cancel the block
+    ctx.cancelledContentIds.add('text-A');
+
+    // content-end for cancelled block — must not finalize
+    client.emit('content-end', 'text-A', 'END_TURN');
+    expect(ctx.finalizedTranscripts).toHaveLength(0);
+  });
+
+  test('Only current generation assistant text is finalized after barge-in cycle', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // Response 1
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-1', 'TEXT');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('text-output', 'Old response', 'text-1', 'ASSISTANT');
+
+    // Barge-in
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+
+    // Stale text from old generation
+    client.emit('text-output', ' continues', 'text-1', 'ASSISTANT');
+    client.emit('content-end', 'text-1', 'END_TURN');
+
+    // Response 2
+    client.emit('content-start', 'text-2', 'TEXT');
+    client.emit('content-start', 'audio-2', 'AUDIO');
+    client.emit('text-output', 'New response', 'text-2', 'ASSISTANT');
+    client.emit('content-end', 'text-2', 'END_TURN');
+    client.emit('content-end', 'audio-2', 'END_TURN');
+
+    // Only new response finalized
+    const assistantTexts = ctx.finalizedTranscripts
+      .filter(t => t.role === 'assistant')
+      .map(t => t.text);
+    expect(assistantTexts).toEqual(['New response']);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS: Cancelled generation transcript discard
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Cancelled generation transcript discard', () => {
+  test('Cancelled content block cannot emit USER transcripts via text-output', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'user-text-A', 'TEXT');
+
+    // Cancel
+    ctx.cancelledContentIds.add('user-text-A');
+
+    client.emit('text-output', 'Stale user text', 'user-text-A', 'USER');
+    expect(ctx.currentUserTranscript).toBe('');
+  });
+
+  test('Cancelled content block content-end never finalizes transcript', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-A', 'TEXT');
+    client.emit('text-output', 'Some text', 'text-A', 'ASSISTANT');
+
+    // Cancel and then try to finalize
+    ctx.cancelledContentIds.add('text-A');
+    client.emit('content-end', 'text-A', 'END_TURN');
+
+    expect(ctx.finalizedTranscripts).toHaveLength(0);
+    // currentAssistantTranscript should still contain text (it was accumulated
+    // before cancellation, but content-end was blocked from finalizing it)
+    expect(ctx.currentAssistantTranscript).toBe('Some text');
+  });
+
+  test('Cancelled generation cannot regain ownership via content-start', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    expect(ctx.activeContentId).toBe('audio-A');
+
+    // Cancel audio-A
+    ctx.cancelledContentIds.add('audio-A');
+    ctx.activeContentId = '';
+
+    // content-start for cancelled block is already in cancelledContentIds —
+    // it remains blocked for audio-output
+    client.emit('audio-output', Buffer.from('stale'), 'audio-A', 'compl-1');
+    // Should be discarded by audio-output handler
+  });
+
+  test('Audio from cancelled content is discarded even if state is not INTERRUPTED', () => {
+    const client = new MockNovaClient();
+    const { routedChunks } = buildHandlers(client);
+
+    // Normal response → barge-in → new response
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('audio-output', Buffer.from('live'), 'audio-A', 'compl-1');
+
+    // Barge-in: new completionStart → AI_THINKING (not INTERRUPTED!)
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+
+    // New response starts → AI_SPEAKING
+    client.emit('content-start', 'audio-B', 'AUDIO');
+
+    // Late audio from old content-A arrives while state is AI_SPEAKING (for B)
+    client.emit('audio-output', Buffer.from('stale-from-A'), 'audio-A', 'compl-1');
+
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).toContain('live');
+    expect(routed).not.toContain('stale-from-A');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS: Watchdog non-interference
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Watchdog non-interference', () => {
+  test('Audio content-end fires turn-complete immediately (not via watchdog)', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    const states: ConversationState[] = [];
+
+    // Normal response
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    states.push(ctx.conversationState); // AI_THINKING
+
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    states.push(ctx.conversationState); // AI_SPEAKING
+
+    client.emit('audio-output', Buffer.from('chunk'), 'audio-A', 'compl-1');
+
+    // content-end for AUDIO fires turn-complete IMMEDIATELY
+    client.emit('content-end', 'audio-A', 'END_TURN');
+    states.push(ctx.conversationState); // LISTENING (immediate, no 5s delay)
+
+    expect(states).toEqual(['AI_THINKING', 'AI_SPEAKING', 'LISTENING']);
+  });
+
+  test('Duplicate turn-complete after audio content-end is deduplicated', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // Normal response
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('audio-output', Buffer.from('chunk'), 'audio-A', 'compl-1');
+
+    // content-end fires turn-complete immediately → LISTENING
+    client.emit('content-end', 'audio-A', 'END_TURN');
+    expect(ctx.conversationState).toBe('LISTENING');
+
+    // Simulate a late completionEnd also firing turn-complete
+    client.emit('turn-complete', 'COMPLETION_END');
+    // Should still be LISTENING (deduplicated, no double processing)
+    expect(ctx.conversationState).toBe('LISTENING');
+  });
+
+  test('INTERRUPTED recovery turn-complete is NOT deduplicated', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // Normal response → audio completes
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('content-end', 'audio-A', 'END_TURN');
+    expect(ctx.conversationState).toBe('LISTENING');
+
+    // Proactive barge-in → INTERRUPTED
+    ctx.conversationState = 'INTERRUPTED';
+    ctx.cancelledContentIds.add('audio-A');
+
+    // Recovery turn-complete (from INTERRUPTED recovery watchdog)
+    client.emit('turn-complete', 'INTERRUPTED_RECOVERY');
+    // Should process (not deduplicate) because state is INTERRUPTED, not LISTENING
+    expect(ctx.conversationState).toBe('LISTENING');
+  });
+
+  test('Normal response completes without watchdog interference', () => {
+    const client = new MockNovaClient();
+    const { ctx, routedChunks } = buildHandlers(client);
+
+    // Full normal response cycle
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-A', 'TEXT');
+    client.emit('text-output', 'Hello there!', 'text-A', 'ASSISTANT');
+    client.emit('content-end', 'text-A', 'END_TURN');
+
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('audio-output', Buffer.from('audio-data'), 'audio-A', 'compl-1');
+    client.emit('content-end', 'audio-A', 'END_TURN');
+
+    // State should be LISTENING (immediate, no watchdog needed)
+    expect(ctx.conversationState).toBe('LISTENING');
+
+    // Transcript finalized correctly
+    const assistants = ctx.finalizedTranscripts.filter(t => t.role === 'assistant');
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0].text).toBe('Hello there!');
+
+    // Audio routed correctly
+    expect(routedChunks.map(b => b.toString())).toContain('audio-data');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS (Round 2): Proactive barge-in generation tracking
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Proactive barge-in: generation tracking', () => {
+  test('handleProactiveBargeIn bumps responseGeneration so stale events are filtered', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    // Agent starts speaking
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-A', 'TEXT');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('text-output', 'Hello, how can I help', 'text-A', 'ASSISTANT');
+    expect(ctx.responseGeneration).toBe(1);
+
+    // Proactive barge-in (AudioRouter RMS detection)
+    handleProactiveBargeIn();
+
+    // Generation must have been bumped, but activeResponseGeneration stays at old
+    // value so the interrupted response's turn-complete is detected as stale.
+    expect(ctx.responseGeneration).toBe(2);
+    expect(ctx.activeResponseGeneration).toBe(1); // NOT bumped — stale detection
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // Stale text from old generation (gen=1) must be discarded
+    client.emit('text-output', ' you today?', 'text-A', 'ASSISTANT');
+    expect(ctx.currentAssistantTranscript).toBe('');
+
+    // Stale content-end from old generation must not finalize
+    client.emit('content-end', 'text-A', 'END_TURN');
+    expect(ctx.finalizedTranscripts).toHaveLength(0);
+  });
+
+  test('contentIdToGeneration is NOT cleared on proactive barge-in — stale events are tracked', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-A', 'TEXT');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+
+    // Verify old content blocks are in the generation map
+    expect(ctx.contentIdToGeneration.get('text-A')).toBe(1);
+    expect(ctx.contentIdToGeneration.get('audio-A')).toBe(1);
+
+    // Proactive barge-in
+    handleProactiveBargeIn();
+
+    // contentIdToGeneration must NOT be cleared — old blocks retain their gen
+    expect(ctx.contentIdToGeneration.get('text-A')).toBe(1);
+    expect(ctx.contentIdToGeneration.get('audio-A')).toBe(1);
+
+    // Stale text from text-A (gen=1, current=2) is filtered
+    client.emit('text-output', 'stale text', 'text-A', 'ASSISTANT');
+    expect(ctx.currentAssistantTranscript).toBe('');
+  });
+
+  test('Stale assistant transcript from interrupted response never reaches finalizedTranscripts', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, routedChunks } = buildHandlers(client);
+
+    // Response 1: agent speaks
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-1', 'TEXT');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('text-output', 'Bilkul, theek hai.', 'text-1', 'ASSISTANT');
+    client.emit('audio-output', Buffer.from('audio-data-1'), 'audio-1', 'compl-1');
+
+    // Proactive barge-in
+    handleProactiveBargeIn();
+
+    // Stale text from old gen arrives
+    client.emit('text-output', ' Aap ka naam kya hai?', 'text-1', 'ASSISTANT');
+    client.emit('content-end', 'text-1', 'END_TURN');
+
+    // Stale audio from old gen
+    client.emit('audio-output', Buffer.from('stale-audio'), 'audio-1', 'compl-1');
+    client.emit('content-end', 'audio-1', 'END_TURN');
+
+    // No finalized transcripts from the interrupted response
+    expect(ctx.finalizedTranscripts).toHaveLength(0);
+
+    // Stale audio not routed
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).not.toContain('stale-audio');
+  });
+
+  test('New content blocks after proactive barge-in work normally', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, routedChunks } = buildHandlers(client);
+
+    // Response 1
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('audio-output', Buffer.from('live-audio'), 'audio-1', 'compl-1');
+
+    // Proactive barge-in
+    handleProactiveBargeIn();
+
+    // Nova responds natively with new completionStart
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+
+    // New response
+    client.emit('content-start', 'text-2', 'TEXT');
+    client.emit('content-start', 'audio-2', 'AUDIO');
+    client.emit('text-output', 'Fresh response', 'text-2', 'ASSISTANT');
+    client.emit('audio-output', Buffer.from('new-audio'), 'audio-2', 'compl-2');
+    client.emit('content-end', 'text-2', 'END_TURN');
+    client.emit('content-end', 'audio-2', 'END_TURN');
+
+    // New response accepted
+    const assistants = ctx.finalizedTranscripts.filter(t => t.role === 'assistant');
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0].text).toBe('Fresh response');
+
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).toContain('new-audio');
+    expect(ctx.conversationState).toBe('LISTENING');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS (Round 2): INTERRUPTED guard on AUDIO content-start
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('INTERRUPTED guard: AUDIO content-start rejection', () => {
+  test('AUDIO content-start during INTERRUPTED is rejected — no transition to AI_SPEAKING', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    // Agent speaking
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+
+    // Proactive barge-in → INTERRUPTED
+    handleProactiveBargeIn();
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // Nova resumes interrupted response with a new AUDIO block — must be rejected
+    client.emit('content-start', 'audio-2', 'AUDIO');
+    expect(ctx.conversationState).toBe('INTERRUPTED'); // NOT AI_SPEAKING
+    expect(ctx.activeContentId).toBe(''); // NOT set to audio-2
+    expect(ctx.cancelledContentIds.has('audio-2')).toBe(true);
+
+    // Audio from rejected block is discarded
+    client.emit('audio-output', Buffer.from('resumed-audio'), 'audio-2', 'compl-1');
+    // No audio routed (all discarded)
+  });
+
+  test('TEXT content-start during INTERRUPTED is allowed (USER speech)', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+
+    handleProactiveBargeIn();
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // TEXT content blocks (USER ASR) during INTERRUPTED must still be accepted
+    client.emit('content-start', 'user-text-1', 'TEXT');
+    // Should not be in cancelledContentIds
+    expect(ctx.cancelledContentIds.has('user-text-1')).toBe(false);
+    // contentIdToGeneration should track it at the current generation
+    expect(ctx.contentIdToGeneration.get('user-text-1')).toBe(ctx.responseGeneration);
+  });
+
+  test('Multiple AUDIO blocks during INTERRUPTED are all rejected', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, routedChunks } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+
+    handleProactiveBargeIn();
+
+    // Nova sends multiple AUDIO blocks trying to resume
+    client.emit('content-start', 'audio-2', 'AUDIO');
+    client.emit('audio-output', Buffer.from('resumed-1'), 'audio-2', 'compl-1');
+    client.emit('content-start', 'audio-3', 'AUDIO');
+    client.emit('audio-output', Buffer.from('resumed-2'), 'audio-3', 'compl-1');
+
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+    expect(ctx.cancelledContentIds.has('audio-2')).toBe(true);
+    expect(ctx.cancelledContentIds.has('audio-3')).toBe(true);
+    // Only pre-barge-in audio was routed
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).not.toContain('resumed-1');
+    expect(routed).not.toContain('resumed-2');
+  });
+
+  test('After INTERRUPTED recovery via completionStart, AUDIO blocks are accepted', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, routedChunks } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+
+    handleProactiveBargeIn();
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // AUDIO during INTERRUPTED — rejected
+    client.emit('content-start', 'audio-rejected', 'AUDIO');
+    expect(ctx.cancelledContentIds.has('audio-rejected')).toBe(true);
+
+    // Nova sends new completionStart → recovers from INTERRUPTED
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+    expect(ctx.conversationState).toBe('AI_THINKING');
+
+    // New AUDIO block — accepted
+    client.emit('content-start', 'audio-new', 'AUDIO');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+    expect(ctx.activeContentId).toBe('audio-new');
+    expect(ctx.cancelledContentIds.has('audio-new')).toBe(false);
+
+    client.emit('audio-output', Buffer.from('new-audio'), 'audio-new', 'compl-2');
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).toContain('new-audio');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS (Round 3): Self-followup guard (awaitingUserSpeech)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Self-followup guard: awaitingUserSpeech', () => {
+  test('After turn-complete, AUDIO content-start is rejected until user speaks', () => {
+    const client = new MockNovaClient();
+    const { ctx, routedChunks } = buildHandlers(client);
+
+    // Normal response
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('audio-output', Buffer.from('response-1'), 'audio-1', 'compl-1');
+    client.emit('content-end', 'audio-1', 'END_TURN');
+    // turn-complete fires → LISTENING, awaitingUserSpeech = true
+    expect(ctx.conversationState).toBe('LISTENING');
+    expect(ctx.awaitingUserSpeech).toBe(true);
+
+    // Nova sends a continuation AUDIO block (self-followup) — must be REJECTED
+    client.emit('content-start', 'audio-2', 'AUDIO');
+    expect(ctx.conversationState).toBe('LISTENING'); // NOT AI_SPEAKING
+    expect(ctx.cancelledContentIds.has('audio-2')).toBe(true);
+
+    // Audio from rejected block is discarded
+    client.emit('audio-output', Buffer.from('self-followup'), 'audio-2', 'compl-1');
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).not.toContain('self-followup');
+  });
+
+  test('After turn-complete, ASSISTANT text is discarded until user speaks', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // Normal response
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-1', 'TEXT');
+    client.emit('text-output', 'First response', 'text-1', 'ASSISTANT');
+    client.emit('content-end', 'text-1', 'END_TURN');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('content-end', 'audio-1', 'END_TURN');
+    expect(ctx.awaitingUserSpeech).toBe(true);
+
+    // Nova sends a repetition TEXT block (self-followup) — must be DISCARDED
+    client.emit('content-start', 'text-2', 'TEXT');
+    client.emit('text-output', 'First response repeated', 'text-2', 'ASSISTANT');
+    expect(ctx.currentAssistantTranscript).toBe(''); // discarded by guard
+
+    // content-end should not finalize the discarded text
+    client.emit('content-end', 'text-2', 'END_TURN');
+    const assistants = ctx.finalizedTranscripts.filter(t => t.role === 'assistant');
+    expect(assistants).toHaveLength(1); // only original, not the repeat
+    expect(assistants[0].text).toBe('First response');
+  });
+
+  test('USER text-output clears awaitingUserSpeech — next response plays normally', () => {
+    const client = new MockNovaClient();
+    const { ctx, routedChunks } = buildHandlers(client);
+
+    // Turn 1 completes → awaitingUserSpeech = true
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('content-end', 'audio-1', 'END_TURN');
+    expect(ctx.awaitingUserSpeech).toBe(true);
+
+    // User speaks — clears the guard
+    client.emit('content-start', 'user-text', 'TEXT');
+    client.emit('text-output', 'hello', 'user-text', 'USER');
+    expect(ctx.awaitingUserSpeech).toBe(false);
+    client.emit('content-end', 'user-text', 'END_TURN');
+
+    // Agent response — should be accepted
+    client.emit('content-start', 'text-2', 'TEXT');
+    client.emit('text-output', 'Hi there', 'text-2', 'ASSISTANT');
+    expect(ctx.currentAssistantTranscript).toBe('Hi there');
+
+    client.emit('content-start', 'audio-2', 'AUDIO');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+    client.emit('audio-output', Buffer.from('response-2'), 'audio-2', 'compl-1');
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).toContain('response-2');
+  });
+
+  test('completionStart clears awaitingUserSpeech', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    // First completion + turn-complete
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('content-end', 'audio-1', 'END_TURN');
+    expect(ctx.awaitingUserSpeech).toBe(true);
+
+    // New completionStart (Nova VAD detected user speech)
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+    expect(ctx.awaitingUserSpeech).toBe(false);
+  });
+
+  test('handleProactiveBargeIn clears awaitingUserSpeech', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    // Turn completes → awaitingUserSpeech = true
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('content-end', 'audio-1', 'END_TURN');
+    expect(ctx.awaitingUserSpeech).toBe(true);
+
+    // Proactive barge-in — caller spoke
+    handleProactiveBargeIn();
+    expect(ctx.awaitingUserSpeech).toBe(false);
+  });
+
+  test('Full self-followup scenario: multi-block response suppresses continuation', () => {
+    const client = new MockNovaClient();
+    const { ctx, routedChunks } = buildHandlers(client);
+
+    // Agent response part 1
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'text-1', 'TEXT');
+    client.emit('text-output', 'Okay Shiva, we have 78 units in a', 'text-1', 'ASSISTANT');
+    client.emit('content-end', 'text-1', 'END_TURN');
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('audio-output', Buffer.from('audio-part1'), 'audio-1', 'compl-1');
+    client.emit('content-end', 'audio-1', 'END_TURN');
+    // turn-complete → LISTENING, awaitingUserSpeech = true
+    expect(ctx.conversationState).toBe('LISTENING');
+
+    // Agent sends continuation part 2 (self-followup) — SUPPRESSED
+    client.emit('content-start', 'text-2', 'TEXT');
+    client.emit('text-output', ' great location near Hinjewadi', 'text-2', 'ASSISTANT');
+    client.emit('content-end', 'text-2', 'END_TURN');
+    client.emit('content-start', 'audio-2', 'AUDIO');
+    // audio-2 is cancelled by self-followup guard
+    expect(ctx.cancelledContentIds.has('audio-2')).toBe(true);
+
+    // Only part 1 finalized
+    const assistants = ctx.finalizedTranscripts.filter(t => t.role === 'assistant');
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0].text).toBe('Okay Shiva, we have 78 units in a');
+
+    // Only part 1 audio routed
+    const routed = routedChunks.map(b => b.toString());
+    expect(routed).toContain('audio-part1');
+
+    // User speaks → next response works normally
+    client.emit('content-start', 'user-text', 'TEXT');
+    client.emit('text-output', 'tell me more', 'user-text', 'USER');
+    client.emit('content-end', 'user-text', 'END_TURN');
+    expect(ctx.awaitingUserSpeech).toBe(false);
+
+    client.emit('content-start', 'text-3', 'TEXT');
+    client.emit('text-output', 'Sure! The project has...', 'text-3', 'ASSISTANT');
+    client.emit('content-end', 'text-3', 'END_TURN');
+    client.emit('content-start', 'audio-3', 'AUDIO');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS (Round 3): Promotion deduplication
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Promotion deduplication', () => {
+  test('Interrupted speech is promoted even when it duplicates the last finalized text (dedup bypassed)', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    // User says "can you speak in hindi" — finalized normally
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'user-text-1', 'TEXT');
+    client.emit('text-output', 'can you speak in hindi', 'user-text-1', 'USER');
+    client.emit('content-end', 'user-text-1', 'END_TURN');
+    expect(ctx.lastFinalizedUserText).toBe('can you speak in hindi');
+
+    // Agent starts responding in Hindi
+    client.emit('content-start', 'audio-1', 'AUDIO');
+    client.emit('audio-output', Buffer.from('hindi-response'), 'audio-1', 'compl-1');
+
+    // Barge-in during Hindi response
+    handleProactiveBargeIn();
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // Nova ASR re-emits the SAME "can you speak in hindi" while INTERRUPTED.
+    client.emit('content-start', 'user-text-2', 'TEXT');
+    client.emit('text-output', 'can you speak in hindi', 'user-text-2', 'USER');
+    client.emit('content-end', 'user-text-2', 'END_TURN');
+
+    // capturedWhileInterrupted bypasses ALL dedupe — interrupted speech is never
+    // dropped. It MUST be promoted so the caller always gets a response (no silence).
+    expect(ctx.promotedTurns).toEqual(['can you speak in hindi']);
+    const userFinals = ctx.finalizedTranscripts.filter(t => t.role === 'user');
+    expect(userFinals).toHaveLength(2);
+  });
+
+  test('Different user transcript during barge-in IS promoted', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    // User says "can you speak in hindi" — finalized normally
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'user-text-1', 'TEXT');
+    client.emit('text-output', 'can you speak in hindi', 'user-text-1', 'USER');
+    client.emit('content-end', 'user-text-1', 'END_TURN');
+
+    // Agent starts responding
+    client.emit('content-start', 'audio-1', 'AUDIO');
+
+    // Barge-in
+    handleProactiveBargeIn();
+
+    // User says something DIFFERENT while INTERRUPTED
+    client.emit('content-start', 'user-text-2', 'TEXT');
+    client.emit('text-output', 'actually tell me the price', 'user-text-2', 'USER');
+    client.emit('content-end', 'user-text-2', 'END_TURN');
+
+    // Should be promoted (different text)
+    expect(ctx.promotedTurns).toEqual(['actually tell me the price']);
+  });
+
+  test('lastFinalizedUserText is cleared on completionStart', () => {
+    const client = new MockNovaClient();
+    const { ctx } = buildHandlers(client);
+
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'user-text', 'TEXT');
+    client.emit('text-output', 'hello', 'user-text', 'USER');
+    client.emit('content-end', 'user-text', 'END_TURN');
+    expect(ctx.lastFinalizedUserText).toBe('hello');
+
+    // New completionStart clears it
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+    expect(ctx.lastFinalizedUserText).toBe('');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS (Round 3): Hindi language switch during interruption
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Hindi language switch during interruption', () => {
+  test('Interruption produces exactly one promoted turn — no stale assistant leakage', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, routedChunks } = buildHandlers(client);
+
+    // Normal turn: user says "can you speak in hindi"
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'user-text-1', 'TEXT');
+    client.emit('text-output', 'can you speak in hindi', 'user-text-1', 'USER');
+    client.emit('content-end', 'user-text-1', 'END_TURN');
+
+    // Agent responds in Hindi
+    client.emit('content-start', 'text-hindi', 'TEXT');
+    client.emit('text-output', 'Bilkul, hindi mein baat karte hain', 'text-hindi', 'ASSISTANT');
+    client.emit('content-end', 'text-hindi', 'END_TURN');
+    client.emit('content-start', 'audio-hindi', 'AUDIO');
+    client.emit('audio-output', Buffer.from('hindi-audio'), 'audio-hindi', 'compl-1');
+
+    // Barge-in during Hindi audio
+    handleProactiveBargeIn();
+
+    // Nova re-emits same user text while INTERRUPTED → promoted (dedup bypassed),
+    // exactly once for this interruption.
+    client.emit('content-start', 'user-text-2', 'TEXT');
+    client.emit('text-output', 'can you speak in hindi', 'user-text-2', 'USER');
+    client.emit('content-end', 'user-text-2', 'END_TURN');
+
+    expect(ctx.promotedTurns).toEqual(['can you speak in hindi']);
+
+    // Only the original (pre-barge-in) Hindi assistant transcript is finalized —
+    // the interrupted response's partial assistant text never leaks.
+    const assistants = ctx.finalizedTranscripts.filter(t => t.role === 'assistant');
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0].text).toBe('Bilkul, hindi mein baat karte hain');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW TESTS (Round 4): Interruption recovery — no resumed generation
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Interruption recovery: cancelled generation never resumes', () => {
+  test('Interrupted turn-complete is stale after proactive barge-in — state stays INTERRUPTED', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    // Normal response starts
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('audio-output', Buffer.from('old-audio'), 'audio-A', 'compl-1');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+
+    // Proactive barge-in
+    handleProactiveBargeIn();
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // Old response's turn-complete arrives — must be STALE, not treated as current
+    client.emit('turn-complete', 'END_TURN');
+
+    // With the fix: responseGeneration(2) !== activeResponseGeneration(1)
+    // so isCurrentResponse is false — state must NOT transition to LISTENING.
+    // cancelledContentIds must NOT be cleared.
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+    expect(ctx.cancelledContentIds.size).toBeGreaterThan(0);
+  });
+
+  test('Promoted response plays without a completionStart (Nova omits it in this deployment)', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, routedChunks } = buildHandlers(client);
+
+    // Agent speaking
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('audio-output', Buffer.from('old-audio-1'), 'audio-A', 'compl-1');
+
+    // Proactive barge-in
+    handleProactiveBargeIn();
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // User transcript captured during interruption → promotion fires
+    client.emit('content-start', 'user-text', 'TEXT');
+    client.emit('text-output', 'Can you speak in Hindi?', 'user-text', 'USER');
+    client.emit('content-end', 'user-text', 'END_TURN');
+
+    // After promotion: state=LISTENING, awaitingUserSpeech=false so the agent's
+    // reply is allowed through (the self-followup guard must NOT swallow it).
+    expect(ctx.conversationState).toBe('LISTENING');
+    expect(ctx.awaitingUserSpeech).toBe(false);
+
+    // Nova streams the promoted response with NO completionStart (real Nova behavior
+    // in this deployment). It must be accepted and reach the caller — not discarded
+    // as a self-followup. This is the silence regression that was fixed.
+    client.emit('content-start', 'audio-new', 'AUDIO');
+    expect(ctx.conversationState).toBe('AI_SPEAKING');
+    client.emit('audio-output', Buffer.from('hindi-reply'), 'audio-new', 'compl-1');
+    client.emit('content-end', 'audio-new', 'END_TURN');
+
+    const fresh = routedChunks.filter(b => b.toString() === 'hindi-reply');
+    expect(fresh).toHaveLength(1);
+  });
+
+  test('Full interruption scenario: only new response audio reaches caller', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn, routedChunks } = buildHandlers(client);
+
+    // Turn 1: Agent says "Akshay Vista is located in..."
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-old', 'AUDIO');
+    client.emit('audio-output', Buffer.from('akshay-vista'), 'audio-old', 'compl-1');
+    expect(routedChunks.map(b => b.toString())).toContain('akshay-vista');
+
+    // User interrupts: "Can you speak in Hindi?"
+    handleProactiveBargeIn();
+    const routedBeforeRecovery = routedChunks.length;
+
+    // Old response continues internally — all discarded
+    client.emit('audio-output', Buffer.from('pimple-gurav'), 'audio-old', 'compl-1');
+    client.emit('content-end', 'audio-old', 'END_TURN');
+
+    // Old turn-complete — stale, ignored
+    client.emit('turn-complete', 'END_TURN');
+    expect(ctx.conversationState).toBe('INTERRUPTED');
+
+    // User transcript captured → promotion
+    client.emit('content-start', 'user-txt', 'TEXT');
+    client.emit('text-output', 'Can you speak in Hindi?', 'user-txt', 'USER');
+    client.emit('content-end', 'user-txt', 'END_TURN');
+    expect(ctx.conversationState).toBe('LISTENING');
+    expect(ctx.promotedTurns).toContain('Can you speak in Hindi?');
+
+    // Nova responds to promoted text
+    client.emit('completion-start', 'compl-2', 'prompt-1');
+    client.emit('content-start', 'audio-hindi', 'AUDIO');
+    client.emit('audio-output', Buffer.from('ji-bilkul'), 'audio-hindi', 'compl-2');
+    client.emit('content-end', 'audio-hindi', 'END_TURN');
+
+    // Verify: no stale audio leaked after barge-in
+    const afterBarge = routedChunks.slice(routedBeforeRecovery);
+    const staleLeaked = afterBarge.filter(b =>
+      b.toString() === 'pimple-gurav',
+    );
+    expect(staleLeaked).toHaveLength(0);
+
+    // Verify: new response audio DID reach the caller
+    const freshAudio = afterBarge.filter(b => b.toString() === 'ji-bilkul');
+    expect(freshAudio).toHaveLength(1);
+
+    // Verify: conversation history has no partial assistant text from interrupted response
+    const assistants = ctx.finalizedTranscripts.filter(t => t.role === 'assistant');
+    const partialLeak = assistants.filter(t => t.text.includes('akshay') || t.text.includes('pimple'));
+    expect(partialLeak).toHaveLength(0);
+  });
+
+  test('Promoted response text is finalized without a completionStart', () => {
+    const client = new MockNovaClient();
+    const { ctx, handleProactiveBargeIn } = buildHandlers(client);
+
+    // Agent speaking
+    client.emit('completion-start', 'compl-1', 'prompt-1');
+    client.emit('content-start', 'audio-A', 'AUDIO');
+    client.emit('audio-output', Buffer.from('audio'), 'audio-A', 'compl-1');
+
+    // Proactive barge-in
+    handleProactiveBargeIn();
+
+    // User transcript → promotion fires → LISTENING, awaitingUserSpeech=false
+    client.emit('content-start', 'user-txt', 'TEXT');
+    client.emit('text-output', 'switch to Hindi', 'user-txt', 'USER');
+    client.emit('content-end', 'user-txt', 'END_TURN');
+    expect(ctx.awaitingUserSpeech).toBe(false);
+
+    // The agent's reply (TEXT) streams with no completionStart — must be accepted
+    // and finalized, not swallowed by the self-followup guard.
+    client.emit('content-start', 'text-reply', 'TEXT');
+    client.emit('text-output', 'Theek hai, hindi mein baat karte hain', 'text-reply', 'ASSISTANT');
+    client.emit('content-end', 'text-reply', 'END_TURN');
+
+    const assistants = ctx.finalizedTranscripts.filter(t => t.role === 'assistant');
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0].text).toBe('Theek hai, hindi mein baat karte hain');
   });
 });
