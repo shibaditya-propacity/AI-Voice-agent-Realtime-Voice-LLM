@@ -252,6 +252,11 @@ export const Env = {
     // DEFAULT ON. Complements Nova's native barge-in with faster client-side
     // interruption for true real-time barge-in behavior.
     proactiveBargeIn: optionalBool('AUDIO_PROACTIVE_BARGEIN', true),
+    // Proactive barge-in confirmation: the caller's RMS must stay above
+    // vadRmsThreshold for this many ms of (near-)continuous speech before playback
+    // is interrupted. Filters noise, echo, breathing and handset artifacts (which
+    // don't sustain). A word-bearing transcript from Nova also confirms instantly.
+    bargeInConfirmMs: optionalInt('AUDIO_BARGEIN_CONFIRM_MS', 400),
   },
 
   session: {

@@ -67,20 +67,31 @@ export class AudioRouter {
   private static readonly BARGE_IN_COOLDOWN_MS = 300;
 
   /**
-   * Number of consecutive inbound frames whose RMS must exceed the threshold
-   * before a proactive barge-in triggers. Prevents single-frame noise spikes
-   * (residual echo, Krisp artifacts, codec transients) from killing the agent's
-   * turn. At 20ms per frame, 3 frames = 60ms of sustained energy — imperceptible
-   * latency for real speech, but filters out transient spikes (observed: noise at
-   * RMS 760–874 on single frames; real speech sustains at 1300+ for many frames).
+   * Sustained-speech duration (ms) required to CONFIRM a proactive barge-in. The
+   * caller must stay above the RMS threshold this long (brief inter-word dips up to
+   * BARGE_IN_GAP_MS are tolerated) before playback is interrupted. Noise, echo,
+   * breathing and handset artifacts do not sustain this long, so they no longer
+   * interrupt the agent. A word-bearing Nova transcript also confirms instantly
+   * (NovaSessionManager.onTextOutput), so genuine speech still interrupts fast.
    */
-  private static readonly BARGE_IN_MIN_FRAMES = 3;
+  private static readonly BARGE_IN_CONFIRM_MS = Env.audio.bargeInConfirmMs;
 
   /**
-   * Per-session: count of consecutive inbound frames where post-Krisp RMS
-   * exceeded the barge-in threshold. Reset to 0 when any frame falls below.
+   * Max gap (ms) of sub-threshold audio tolerated inside a pending speech run
+   * before it is treated as ended. A burst that stops for longer than this without
+   * reaching the confirm window is discarded — short bursts (< confirm window)
+   * never interrupt.
    */
-  private readonly bargeInConsecutiveFrames = new Map<string, number>();
+  private static readonly BARGE_IN_GAP_MS = Env.audio.vadSilenceHangoverMs;
+
+  /**
+   * Per-session PENDING interruption. When the caller's post-Krisp RMS first
+   * crosses the threshold while the agent is speaking, we start a pending run
+   * instead of interrupting immediately. `startMs` = when the run began;
+   * `lastSpeechMs` = most recent above-threshold frame. Confirmed once
+   * (lastSpeechMs - startMs) >= BARGE_IN_CONFIRM_MS.
+   */
+  private readonly bargeInPending = new Map<string, { startMs: number; lastSpeechMs: number }>();
 
   /**
    * Whether the proactive client-side RMS barge-in is enabled. Runs on post-Krisp
@@ -171,10 +182,16 @@ export class AudioRouter {
     const speechEndAt = detectSpeechEnd(sessionId, pcm16);
     if (speechEndAt !== null) {
       latencyRegistry.setSpeechEnd(sessionId, speechEndAt);
-      callTrace.event(callId, sessionId, 'vad.speech.end', {
-        state: this.novaSessionManager.getConversationState(sessionId),
-        seqNum,
-      });
+      const convState = this.novaSessionManager.getConversationState(sessionId);
+      callTrace.event(callId, sessionId, 'vad.speech.end', { state: convState, seqNum });
+      // Recovery: if we are stuck INTERRUPTED but the speech that triggered it
+      // produced no real transcript (noise / echo / breathing), exit immediately
+      // instead of waiting for the watchdog — never remain stuck waiting for a
+      // transcript that will never arrive.
+      if (convState === 'INTERRUPTED') {
+        this.bargeInPending.delete(sessionId);
+        this.novaSessionManager.handleVadEndDuringInterruption(sessionId);
+      }
     }
 
     eventBus.emit(AppEvent.AUDIO_RECEIVED, {
@@ -215,40 +232,54 @@ export class AudioRouter {
         // Silently skip — greeting must play to completion.
       } else {
         const rms = AudioRouter.computeRms(cleanPcm16);
+        const now = Date.now();
+        const pending = this.bargeInPending.get(sessionId);
         if (rms >= AudioRouter.BARGE_IN_RMS_THRESHOLD) {
-          const consecutive = (this.bargeInConsecutiveFrames.get(sessionId) ?? 0) + 1;
-          this.bargeInConsecutiveFrames.set(sessionId, consecutive);
-
-          // Require sustained energy across multiple frames to filter single-frame
-          // noise spikes (residual echo, Krisp artifacts, codec transients).
-          if (consecutive >= AudioRouter.BARGE_IN_MIN_FRAMES) {
-            const now = Date.now();
-            const lastBarge = this.lastBargeInAt.get(sessionId) ?? 0;
-            if (now - lastBarge >= AudioRouter.BARGE_IN_COOLDOWN_MS) {
-              this.lastBargeInAt.set(sessionId, now);
-              this.bargeInConsecutiveFrames.set(sessionId, 0);
-              callTrace.event(callId, sessionId, 'bargein.user-speech-start', {
-                rms: Math.round(rms),
-                threshold: AudioRouter.BARGE_IN_RMS_THRESHOLD,
-                consecutiveFrames: consecutive,
-                seqNum,
-              });
-              this.log.warn('⚡ BARGE-IN DETECTED — sustained caller speech during AI playback — stopping output immediately', {
-                sessionId,
-                callId,
-                rms: Math.round(rms),
-                threshold: AudioRouter.BARGE_IN_RMS_THRESHOLD,
-                consecutiveFrames: consecutive,
-                seqNum,
-              });
-              this.handleInterruption(callId, sessionId);
+          if (!pending) {
+            // Speech-start: enter PENDING — do NOT interrupt yet.
+            this.bargeInPending.set(sessionId, { startMs: now, lastSpeechMs: now });
+          } else {
+            pending.lastSpeechMs = now;
+            const speechMs = now - pending.startMs;
+            // Confirm only after sustained speech ≥ the confirm window.
+            if (speechMs >= AudioRouter.BARGE_IN_CONFIRM_MS) {
+              const lastBarge = this.lastBargeInAt.get(sessionId) ?? 0;
+              if (now - lastBarge >= AudioRouter.BARGE_IN_COOLDOWN_MS) {
+                this.lastBargeInAt.set(sessionId, now);
+                this.bargeInPending.delete(sessionId);
+                callTrace.event(callId, sessionId, 'bargein.user-speech-start', {
+                  rms: Math.round(rms),
+                  threshold: AudioRouter.BARGE_IN_RMS_THRESHOLD,
+                  reason: 'sustained-speech',
+                  speechMs,
+                  seqNum,
+                });
+                this.log.warn('⚡ BARGE-IN DETECTED — sustained caller speech during AI playback — stopping output', {
+                  sessionId,
+                  callId,
+                  rms: Math.round(rms),
+                  speechMs,
+                  seqNum,
+                });
+                this.handleInterruption(callId, sessionId);
+              }
             }
           }
-        } else {
-          // Energy dropped below threshold — reset the sustained-speech counter.
-          this.bargeInConsecutiveFrames.set(sessionId, 0);
+        } else if (pending && now - pending.lastSpeechMs > AudioRouter.BARGE_IN_GAP_MS) {
+          // Pending speech run ended before reaching the confirm window → short
+          // burst / noise spike. Discard it; the agent is never interrupted.
+          const burstMs = pending.lastSpeechMs - pending.startMs;
+          this.bargeInPending.delete(sessionId);
+          callTrace.event(callId, sessionId, 'bargein.pending.cleared', {
+            reason: 'short-burst',
+            burstMs,
+            seqNum,
+          });
         }
       }
+    } else if (this.bargeInPending.has(sessionId)) {
+      // Agent is no longer speaking — drop any pending run.
+      this.bargeInPending.delete(sessionId);
     }
 
     eventBus.emit(AppEvent.AUDIO_PROCESSED, {
@@ -471,7 +502,7 @@ export class AudioRouter {
    */
   resetBargeInCooldown(sessionId: string): void {
     this.lastBargeInAt.delete(sessionId);
-    this.bargeInConsecutiveFrames.set(sessionId, 0);
+    this.bargeInPending.delete(sessionId);
   }
 
   /**
@@ -482,6 +513,6 @@ export class AudioRouter {
     this.lastSeqNums.delete(sessionId);
     this.lastBargeInAt.delete(sessionId);
     this.outboundGeneration.delete(sessionId);
-    this.bargeInConsecutiveFrames.delete(sessionId);
+    this.bargeInPending.delete(sessionId);
   }
 }

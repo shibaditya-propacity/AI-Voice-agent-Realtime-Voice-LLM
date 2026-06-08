@@ -40,6 +40,16 @@ function isNovaControlToken(text: string): boolean {
   }
 }
 
+/**
+ * True if the text contains at least one real word character (Unicode letter or
+ * digit). Used to validate a barge-in: empty / whitespace / punctuation-only
+ * transcripts (noise, echo, breathing, handset artifacts) do NOT count as speech
+ * and must never trigger or sustain an interruption.
+ */
+function hasActualWords(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
 interface NovaContext {
   sessionId: string;
   callId: string;
@@ -178,6 +188,14 @@ interface NovaContext {
    * the most recent caller utterance. Cleared on completionStart.
    */
   lastFinalizedUserText: string;
+  /**
+   * Set by the transcript-confirmed barge-in (onTextOutput sees real words while
+   * AI_SPEAKING) just before it calls onInterruption(). It tells the re-entrant
+   * handleInterruption() to PRESERVE the live USER transcript (it is the barge-in
+   * utterance, not an abandoned partial) and to re-stamp that content block to the
+   * new generation so it isn't dropped as stale. Cleared inside handleInterruption.
+   */
+  transcriptBargeInContentId: string | null;
 }
 
 export class NovaSessionManager {
@@ -375,6 +393,7 @@ export class NovaSessionManager {
           lastTurnCompleteGeneration: -1,
           awaitingUserSpeech: false,
           lastFinalizedUserText: '',
+          transcriptBargeInContentId: null,
         };
 
         ctx.unsubscribeClientEvents = this.wireClientEvents(ctx);
@@ -469,6 +488,11 @@ export class NovaSessionManager {
     const log = Logger.forSession(sessionId, ctx.callId, 'NovaSessionManager');
     this.logGenerationOwner(ctx, 'proactive-interruption');
 
+    // Transcript-confirmed barge-in: preserve the live USER utterance + the id of
+    // the content block carrying it (re-stamped to the new generation below).
+    const preserveUserContentId = ctx.transcriptBargeInContentId;
+    ctx.transcriptBargeInContentId = null;
+
     // Cancel any pending silence re-engagement timer — the caller spoke.
     if (ctx.silenceTimer) {
       clearTimeout(ctx.silenceTimer);
@@ -496,6 +520,13 @@ export class NovaSessionManager {
       sessionId,
     });
 
+    // Re-stamp the live USER block (transcript-confirmed barge-in) to the NEW
+    // generation so the stale-generation filter doesn't drop the caller's speech
+    // that is mid-stream when we interrupt.
+    if (preserveUserContentId) {
+      ctx.contentIdToGeneration.set(preserveUserContentId, ctx.responseGeneration);
+    }
+
     // Cancel the in-flight audio output block so stale chunks are discarded.
     if (ctx.activeContentId) {
       ctx.cancelledContentIds.add(ctx.activeContentId);
@@ -518,7 +549,9 @@ export class NovaSessionManager {
       });
       ctx.currentAssistantTranscript = '';
     }
-    if (ctx.currentUserTranscript) {
+    // Keep the live USER utterance for a transcript-confirmed barge-in (it IS the
+    // caller's speech); only discard a stale partial from the RMS-triggered path.
+    if (ctx.currentUserTranscript && !preserveUserContentId) {
       log.info('Discarding partial interrupted user transcript', {
         length: ctx.currentUserTranscript.length,
         generation: ctx.responseGeneration,
@@ -579,6 +612,45 @@ export class NovaSessionManager {
       sessionId,
       generation: ctx.responseGeneration,
     });
+  }
+
+  /**
+   * Called by AudioRouter when the energy-VAD detects end-of-speech while the
+   * conversation is INTERRUPTED. If no real word-bearing transcript was captured,
+   * the "interruption" was noise / echo / breathing / a handset artifact — recover
+   * immediately instead of sitting in INTERRUPTED until the 5s watchdog. A genuine
+   * barge-in (currentUserTranscript already has words) is left untouched so it can
+   * finalize and be promoted.
+   */
+  handleVadEndDuringInterruption(sessionId: string): void {
+    const ctx = this.sessions.get(sessionId);
+    if (!ctx || ctx.conversationState !== 'INTERRUPTED') return;
+    if (hasActualWords(ctx.currentUserTranscript)) return;
+
+    const log = Logger.forSession(sessionId, ctx.callId, 'NovaSessionManager');
+
+    if (ctx.turnCompleteWatchdog) {
+      clearTimeout(ctx.turnCompleteWatchdog);
+      ctx.turnCompleteWatchdog = null;
+    }
+    if (ctx.pendingPromotion) {
+      clearTimeout(ctx.pendingPromotion.timer);
+      ctx.pendingPromotion = null;
+    }
+    ctx.currentUserTranscript = '';
+    ctx.bargeInPending = false;
+    ctx.awaitingUserSpeech = true;
+    ctx.transcriptBargeInContentId = null;
+
+    callTrace.event(ctx.callId, sessionId, 'bargein.recovery', {
+      reason: 'vad-end-no-transcript',
+      generation: ctx.responseGeneration,
+    });
+    log.info('⚡ False barge-in recovered — VAD end with no transcript, exiting INTERRUPTED', {
+      sessionId, generation: ctx.responseGeneration,
+    });
+    this.transitionState(ctx, 'LISTENING', log);
+    ctx.info.state = 'prompt-active';
   }
 
   /** True if the agent is currently streaming audio to the caller. Used by AudioRouter for barge-in detection. */
@@ -1168,6 +1240,22 @@ export class NovaSessionManager {
           role: 'USER', state: ctx.conversationState, generation: ctx.responseGeneration,
           bargeInPending: ctx.bargeInPending, preview: ctx.currentUserTranscript.slice(0, 80),
         });
+        // ── Transcript-confirmed barge-in ─────────────────────────────────────
+        // Real words from the caller while the agent is speaking is a confirmed
+        // interruption — trigger it immediately (the other confirm path is 400ms of
+        // sustained RMS in AudioRouter). Preserve this block's transcript through the
+        // interruption so it can be promoted. Fires once: the next delta is INTERRUPTED.
+        if (ctx.conversationState === 'AI_SPEAKING' && hasActualWords(ctx.currentUserTranscript)) {
+          callTrace.event(callId, sessionId, 'bargein.user-speech-start', {
+            reason: 'transcript-words', state: ctx.conversationState,
+            generation: ctx.responseGeneration, preview: ctx.currentUserTranscript.slice(0, 80),
+          });
+          log.warn('⚡ BARGE-IN (transcript): caller words during AI playback — interrupting', {
+            sessionId, preview: ctx.currentUserTranscript.slice(0, 80),
+          });
+          ctx.transcriptBargeInContentId = contentId;
+          ctx.onInterruption();
+        }
         // During barge-in recovery, suppress interim user transcripts — only the final
         // stabilized utterance (stored by onContentEnd) will enter transcript history.
         // This prevents partial/overlapping speech fragments from the interruption
