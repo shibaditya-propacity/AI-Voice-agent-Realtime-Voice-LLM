@@ -109,11 +109,12 @@ export const Env = {
       '',
       // ── Human conversation style ──
       'STYLE: 1-2 short, natural sentences per reply, one question at a time. Sound calm, confident and human — a phone call, not an email.',
-      'Default acknowledgements: okay, sure, alright, haan, theek hai. Use "ji" sparingly — at most 1 in 10 replies, and never start every reply with it. Occasionally (5-10%) a filler: ek second, let me check.',
+      'FLOW: reply promptly without long pauses. Open with a brief, natural acknowledgement that flows from what the caller just said, then continue — don\'t jump straight into the next question abruptly. Keep it moving like a real conversation, not a question-answer quiz.',
+      'Default acknowledgements: okay, sure, alright, got it, understood, haan, theek hai. Use "ji" sparingly — at most 1 in 10 replies, and never start every reply with it. Vary them so no two replies in a row open the same way. Occasionally (5-10%) a filler: ek second, let me check.',
       'NEVER use praise or enthusiasm: "very good", "bohot accha", "excellent", "wonderful", "great choice", "fantastic", repeated enthusiasm, corporate or assistant-style language.',
       '',
       // ── Greeting ──
-      'GREETING ALREADY PLAYED: the caller heard "Hi, I am Arjun calling from Akshay Vista. May I know your name please?" Their first words reply to this — never re-greet or reintroduce yourself.',
+      'GREETING ALREADY PLAYED: you have already said "Hi, I am Arjun calling from Akshay Vista. May I know your name please?" — BOTH the greeting and the name request are already done. Never re-greet, never reintroduce yourself, and never ask for the name again. The caller\'s first words are their name (or reply) — respond to those directly with a brief acknowledgement and move on (Stage 2). Never use assistant-style fillers like "I\'m here".',
       '',
       // ── Goal and stages ──
       'GOAL: Book a site visit. Follow stages in order. Never skip or assume unspoken agreement.',
@@ -175,10 +176,54 @@ export const Env = {
     // If the caller says nothing for this many ms after the agent finishes speaking,
     // inject a silence re-engagement cue so Nova asks "Are you still there?".
     // Set to 0 to disable silence re-engagement entirely.
-    silenceTimeoutMs: optionalInt('NOVA_SILENCE_TIMEOUT_MS', 4_000),
+    silenceTimeoutMs: optionalInt('NOVA_SILENCE_TIMEOUT_MS', 8_000),
     // Text injected as a USER turn when silence is detected. Nova responds to this
     // cue with the re-engagement phrase defined in its system prompt context.
     silencePrompt: optionalEnv('NOVA_SILENCE_PROMPT', '[The caller has been silent for several seconds. Say exactly: "I may not have heard you. Are you still there?"]'),
+    // When a FINAL caller transcript is captured while the session is INTERRUPTED
+    // (barge-in), Nova often never answers it — it resumes its old response and
+    // ignores the caller. With this on, the captured transcript is promoted into an
+    // explicit new USER turn so Nova responds to what the caller actually said.
+    // Set false to revert to "store but don't promote". See NovaSessionManager.onContentEnd.
+    promoteInterruptedTranscript: optionalBool('NOVA_PROMOTE_INTERRUPTED_TRANSCRIPT', true),
+    // Promotion delay (ms). 0 = fire immediately (synchronous, no timer). Any
+    // positive value defers promotion by that many ms so Nova can handle the barge-in
+    // natively (control token or fresh completionStart). If Nova responds within the
+    // window, the pending promotion is cancelled — no double response. Default 0:
+    // proactive barge-in (AudioRouter RMS) never triggers a native Nova response, so
+    // deferring only adds latency. The user hears a response ~1.5s faster.
+    promoteInterruptedDelayMs: optionalInt('NOVA_PROMOTE_INTERRUPTED_DELAY_MS', 0),
+    // How the conversation is primed on connect:
+    //   'none' (default) — send NO cue. Nova stays silent after the greeting and the
+    //       caller's spoken reply (their name) becomes the first real, audio-driven
+    //       turn — exactly like every later turn, which already transcribe correctly.
+    //       This is the fix for the first turn answering a text cue with a literal
+    //       "[caller's name]" placeholder and talking over the caller's name.
+    //   'cue' — a USER text turn (firstTurnCue) whose contentEnd makes Nova respond
+    //       immediately. Use this only if 'none' leaves Nova silent after the greeting
+    //       (i.e. its VAD doesn't drive the first turn on your account).
+    //   'assistant' — inject the greeting as Nova's OWN prior turn. NOTE: Nova Sonic's
+    //       bidirectional API REJECTS an injected ASSISTANT text turn → nova-init-
+    //       failure / dropped call. Do NOT use unless your account accepts it.
+    firstTurnMode: ((m) => (m === 'cue' || m === 'assistant' || m === 'none' ? m : 'none'))(
+      optionalEnv('NOVA_FIRST_TURN_MODE', 'none'),
+    ) as 'none' | 'cue' | 'assistant',
+    // First-turn speech gate: after the greeting, hold caller audio OUT of Nova until
+    // the caller actually starts speaking (energy > VAD threshold), so Nova can't
+    // endpoint on the post-greeting silence and answer the prime turn early — which
+    // is what made it talk over / drop the caller's name. A fallback after this many
+    // ms force-opens the gate so a silent caller still triggers a Nova re-engagement.
+    // Set 0 to disable the gate (revert to feeding audio immediately when the mic opens).
+    firstTurnSpeechGateMs: optionalInt('NOVA_FIRST_TURN_SPEECH_GATE_MS', 1_500),
+    // The exact words the opening greeting WAV speaks. Used by 'assistant' mode only.
+    // Keep this in sync with assets/greeting.wav.
+    greetingText: optionalEnv('NOVA_GREETING_TEXT', 'Hi, I am Arjun calling from Akshay Vista. May I know your name please?'),
+    // USER text cue used in 'cue' mode. Its contentEnd makes Nova respond — a
+    // bracketed directive telling it not to re-greet/re-ask, just answer the name.
+    firstTurnCue: optionalEnv(
+      'NOVA_FIRST_TURN_CUE',
+      '[The call just connected. Your opening line "Hi, I am Arjun calling from Akshay Vista. May I know your name please?" has already been played to the caller — the greeting AND the name request are done. Do NOT greet again and do NOT ask for the name again. Wait for the caller to give their name, then respond to it naturally with a brief acknowledgement and continue.]',
+    ),
   },
 
   audio: {
@@ -191,6 +236,15 @@ export const Env = {
     // measurement (int16 RMS, and sustained-silence window in ms).
     vadRmsThreshold: optionalInt('VAD_RMS_THRESHOLD', 700),
     vadSilenceHangoverMs: optionalInt('VAD_SILENCE_HANGOVER_MS', 120),
+    // Linear gain applied ONLY to the PCM16 audio forwarded to Nova (after Krisp),
+    // so quiet callers (e.g. a softly-spoken "yes") are loud enough for Nova's
+    // ASR/VAD to transcribe — otherwise the agent treats it as silence and loops on
+    // "I may not have heard you. Are you still there?". Applied in NovaAudioStreamer
+    // AFTER the barge-in RMS check and the first-turn speech gate, so neither of those
+    // detectors changes (no new false barge-ins / early gate opens). Samples are
+    // clamped to the int16 range. 1.0 = off. ~2.0 (+6dB) suits quiet telephony;
+    // lower it if loud callers start distorting.
+    inputGain: optionalFloat('AUDIO_INPUT_GAIN', 2.0),
     // Proactive client-side barge-in: immediately interrupt agent playback when the
     // caller's RMS energy (measured on post-Krisp noise-suppressed audio) exceeds
     // vadRmsThreshold, WITHOUT waiting for Nova's own VAD. Running on clean audio

@@ -426,6 +426,20 @@ export class NovaClient extends EventEmitter {
     this.log.debug('User text block queued', { promptName, contentName, contentLength: content.length });
   }
 
+  /**
+   * Send a complete ASSISTANT text content block (contentStart + textInput +
+   * contentEnd). Used to prime the opening greeting as Nova's OWN prior turn so it
+   * does not speak first — it waits for the caller's reply. Unlike a USER text turn
+   * (which Nova answers immediately, talking over the caller), an ASSISTANT turn just
+   * adds context and leaves the floor to the caller.
+   */
+  sendAssistantTextBlock(promptName: string, contentName: string, content: string): void {
+    this.enqueue(this.buildContentStartText(promptName, contentName, 'ASSISTANT'));
+    this.enqueue(this.buildTextInput(promptName, contentName, content));
+    this.enqueue(this.buildContentEnd(promptName, contentName));
+    this.log.debug('Assistant text block queued', { promptName, contentName, contentLength: content.length });
+  }
+
   /** Send a base64 PCM16 audio chunk inside an open audio block. */
   sendAudio(promptName: string, contentName: string, audioBase64: string): void {
     if (this.closed) return;

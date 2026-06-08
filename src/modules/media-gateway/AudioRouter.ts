@@ -169,7 +169,13 @@ export class AudioRouter {
     // Energy VAD (measurement only): timestamp when the caller stops speaking so we
     // can measure Nova's endpointing latency. Does not alter the audio path.
     const speechEndAt = detectSpeechEnd(sessionId, pcm16);
-    if (speechEndAt !== null) latencyRegistry.setSpeechEnd(sessionId, speechEndAt);
+    if (speechEndAt !== null) {
+      latencyRegistry.setSpeechEnd(sessionId, speechEndAt);
+      callTrace.event(callId, sessionId, 'vad.speech.end', {
+        state: this.novaSessionManager.getConversationState(sessionId),
+        seqNum,
+      });
+    }
 
     eventBus.emit(AppEvent.AUDIO_RECEIVED, {
       sessionId,

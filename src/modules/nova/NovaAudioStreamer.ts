@@ -49,6 +49,34 @@ export class NovaAudioStreamer {
   private listening: boolean = false;
   private greetingGateTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * First-turn speech gate. Once the mic opens (listening=true) we still hold caller
+   * audio OUT of Nova until the caller actually starts speaking, so Nova can't
+   * endpoint on the post-greeting silence and answer the prime turn early (talking
+   * over the caller's name). `speechStarted` latches true on the first speech frame
+   * (or the fallback timer) and stays true for the rest of the call — subsequent
+   * turns are unaffected. `preRoll` keeps a short lead-in so the first word isn't
+   * clipped when the gate opens.
+   */
+  private speechStarted: boolean = false;
+  private preRoll: Buffer[] = [];
+  private preRollBytes: number = 0;
+  private speechGateTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Keep ~200ms of pre-roll @ internal rate (16-bit mono). */
+  private readonly preRollMaxBytes: number = Math.floor(0.2 * Env.audio.internalSampleRate) * 2;
+
+  /** RMS energy of a PCM16-LE buffer (for the first-turn speech gate). */
+  private static computeRms(pcm16: Buffer): number {
+    const samples = pcm16.length >> 1;
+    if (samples === 0) return 0;
+    let sumSq = 0;
+    for (let i = 0; i < samples; i++) {
+      const s = pcm16.readInt16LE(i * 2);
+      sumSq += s * s;
+    }
+    return Math.sqrt(sumSq / samples);
+  }
+
   constructor(sessionId: string, callId: string, client: NovaClient) {
     this.client = client;
     this.log = Logger.forSession(sessionId, callId, 'NovaAudioStreamer');
@@ -89,19 +117,34 @@ export class NovaAudioStreamer {
     // promptStart + SYSTEM content block (system prompt is sent once for the call).
     this.currentPromptName = this.client.startPrompt(true);
 
-    // USER text cue — required to prime Nova 2 Sonic's conversational mode.
-    // Per the documented event sequence (NovaClient header / AWS docs), a USER text
-    // block with contentEnd must precede the interactive AUDIO block. Without it,
-    // Nova opens the audio block but never activates its VAD for turn-taking —
-    // resulting in complete silence after the greeting. The static WAV greeting is
-    // played separately; the system prompt tells Nova the greeting was already played,
-    // so Nova does not re-greet in response to this cue.
-    const cueContentName = `cue_${uuidv4().replace(/-/g, '')}`;
-    this.client.sendUserTextBlock(
-      this.currentPromptName,
-      cueContentName,
-      'Hello?',
-    );
+    // Prime the conversation before opening the interactive AUDIO block. A text
+    // content block with contentEnd must precede the audio block, otherwise Nova
+    // opens the block but never activates its VAD for turn-taking (silence after the
+    // greeting). Two modes:
+    //
+    //   'assistant' (default) — inject the greeting as Nova's OWN prior turn. Nova
+    //       then has nothing to answer, so it stays quiet and WAITS for the caller's
+    //       reply (their name). This is the fix for Nova talking over / dropping the
+    //       caller's name. The static WAV speaks the same line to the caller.
+    //   'cue' (legacy) — a USER text turn that makes Nova respond immediately. Falls
+    //       back here if assistant-priming leaves Nova silent on this account.
+    const primeContentName = `prime_${uuidv4().replace(/-/g, '')}`;
+    if (Env.nova.firstTurnMode === 'assistant') {
+      this.client.sendAssistantTextBlock(
+        this.currentPromptName,
+        primeContentName,
+        Env.nova.greetingText,
+      );
+    } else if (Env.nova.firstTurnMode === 'cue') {
+      this.client.sendUserTextBlock(
+        this.currentPromptName,
+        primeContentName,
+        Env.nova.firstTurnCue,
+      );
+    }
+    // 'none': send no cue at all. Nova waits for the caller's audio (their name) to
+    // drive the first turn — the same VAD path that every later turn already uses —
+    // so the name is transcribed instead of Nova answering a cue with a placeholder.
 
     // ONE interactive audio block for the entire call. Nova's VAD drives turn-taking;
     // the caller's first utterance is the first turn.
@@ -118,9 +161,10 @@ export class NovaAudioStreamer {
     this.greetingGateTimer = setTimeout(() => this.startListening('greeting-finished'), gateMs);
     if (typeof this.greetingGateTimer.unref === 'function') this.greetingGateTimer.unref();
 
-    this.log.info('Conversation opened (SYSTEM + USER cue + interactive audio block; static greeting plays separately)', {
+    this.log.info('Conversation opened (SYSTEM + greeting prime + interactive audio block; static greeting plays separately)', {
       promptName: this.currentPromptName,
-      cueContentName,
+      primeMode: Env.nova.firstTurnMode,
+      primeContentName,
       audioContentName: this.audioContentName,
       gateMs,
       interactive: true,
@@ -139,8 +183,39 @@ export class NovaAudioStreamer {
       this.greetingGateTimer = null;
     }
     this.buffer.clear(); // drop anything that arrived during the greeting
-    callTrace.event(this.callId, this.sessionId, 'mic.open', { reason });
-    this.log.info('Greeting done — now listening to caller audio', { reason });
+
+    // Arm the first-turn speech gate: hold audio out of Nova until the caller speaks.
+    // A fallback force-opens it so a silent caller still gets a Nova re-engagement.
+    const gateMs = Env.nova.firstTurnSpeechGateMs;
+    if (gateMs > 0) {
+      this.speechStarted = false;
+      this.preRoll = [];
+      this.preRollBytes = 0;
+      this.speechGateTimer = setTimeout(() => this.openSpeechGate('speech-gate-timeout'), gateMs);
+      if (typeof this.speechGateTimer.unref === 'function') this.speechGateTimer.unref();
+    } else {
+      this.speechStarted = true; // gate disabled — feed audio immediately
+    }
+
+    callTrace.event(this.callId, this.sessionId, 'mic.open', { reason, speechGateMs: gateMs });
+    this.log.info('Greeting done — now listening to caller audio', { reason, speechGateMs: gateMs });
+  }
+
+  /** Open the first-turn speech gate: flush any pre-roll, then feed audio normally. */
+  private openSpeechGate(reason: string): void {
+    if (this.speechStarted) return;
+    this.speechStarted = true;
+    if (this.speechGateTimer) {
+      clearTimeout(this.speechGateTimer);
+      this.speechGateTimer = null;
+    }
+    // Flush the buffered pre-roll so the caller's first word isn't clipped.
+    for (const frame of this.preRoll) this.buffer.push(frame);
+    this.preRoll = [];
+    this.preRollBytes = 0;
+    callTrace.event(this.callId, this.sessionId, 'speech-gate.open', { reason });
+    this.log.info('First-turn speech gate opened — forwarding caller audio to Nova', { reason });
+    this.flush();
   }
 
   /**
@@ -152,6 +227,22 @@ export class NovaAudioStreamer {
     if (!this.conversationOpen || !this.client.isOpen || pcm16.length === 0) return;
     // Ignore caller audio until the greeting has finished playing.
     if (!this.listening) return;
+
+    // First-turn speech gate: before the caller starts speaking, hold audio in a
+    // short rolling pre-roll instead of sending silence to Nova (which would make it
+    // answer the prime turn early and talk over the caller's name).
+    if (!this.speechStarted) {
+      if (NovaAudioStreamer.computeRms(pcm16) < Env.audio.vadRmsThreshold) {
+        this.preRoll.push(pcm16);
+        this.preRollBytes += pcm16.length;
+        while (this.preRollBytes > this.preRollMaxBytes && this.preRoll.length > 1) {
+          this.preRollBytes -= this.preRoll.shift()!.length;
+        }
+        return;
+      }
+      this.openSpeechGate('speech-detected');
+    }
+
     this.buffer.push(pcm16);
     this.flush();
   }
@@ -167,6 +258,10 @@ export class NovaAudioStreamer {
     if (this.greetingGateTimer) {
       clearTimeout(this.greetingGateTimer);
       this.greetingGateTimer = null;
+    }
+    if (this.speechGateTimer) {
+      clearTimeout(this.speechGateTimer);
+      this.speechGateTimer = null;
     }
 
     const remaining = this.buffer.drain();
@@ -200,6 +295,26 @@ export class NovaAudioStreamer {
   }
 
   /**
+   * Promote a caller utterance that was captured DURING an interruption into an
+   * explicit new USER turn, so Nova generates a fresh response to it. Nova sometimes
+   * transcribes barge-in speech but never answers it (it resumes its prior response);
+   * re-injecting the final transcript as a USER text block forces Nova to respond to
+   * the caller's actual words. Mirrors sendSilencePrompt's mechanism.
+   */
+  promoteUserTurn(text: string): void {
+    if (!this.conversationOpen || !this.client.isOpen) return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const cueContentName = `promote_${uuidv4().replace(/-/g, '')}`;
+    this.client.sendUserTextBlock(this.currentPromptName, cueContentName, trimmed);
+    this.log.info('Promoted interrupted caller transcript to a new USER turn', {
+      promptName: this.currentPromptName,
+      cueContentName,
+      preview: trimmed.slice(0, 80),
+    });
+  }
+
+  /**
    * Barge-in: Nova handles turn-taking natively on the interactive audio block, so
    * we keep the block open and simply drop any buffered inbound audio. The outbound
    * (caller-facing) audio is cleared separately by the AudioRouter via Twilio.
@@ -218,7 +333,28 @@ export class NovaAudioStreamer {
   }
 
   private sendChunk(chunk: Buffer): void {
-    this.client.sendAudio(this.currentPromptName, this.audioContentName, toBase64(chunk));
+    const out = NovaAudioStreamer.applyGain(chunk, Env.audio.inputGain);
+    this.client.sendAudio(this.currentPromptName, this.audioContentName, toBase64(out));
+  }
+
+  /**
+   * Apply a linear gain to PCM16-LE samples (clamped to int16) so Nova hears quiet
+   * callers. Returns the input unchanged when gain ≈ 1.0. Operates on a COPY so the
+   * caller's buffer (used elsewhere for RMS/VAD) is never mutated.
+   */
+  private static applyGain(pcm16: Buffer, gain: number): Buffer {
+    if (!gain || Math.abs(gain - 1) < 1e-3) return pcm16;
+    const out = Buffer.allocUnsafe(pcm16.length);
+    const n = pcm16.length >> 1;
+    for (let i = 0; i < n; i++) {
+      let s = Math.round(pcm16.readInt16LE(i * 2) * gain);
+      if (s > 32767) s = 32767;
+      else if (s < -32768) s = -32768;
+      out.writeInt16LE(s, i * 2);
+    }
+    // Handle a trailing odd byte (shouldn't occur for PCM16, but stay safe).
+    if (pcm16.length & 1) out[pcm16.length - 1] = pcm16[pcm16.length - 1];
+    return out;
   }
 
   get isConversationOpen(): boolean {

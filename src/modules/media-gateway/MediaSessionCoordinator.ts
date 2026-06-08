@@ -112,8 +112,10 @@ export class MediaSessionCoordinator {
         .playGreeting(callId, sessionId, cachedGreeting.audioPcm16)
         .then(() => log.info('[GREETING] step5 — playGreeting() resolved', { sessionId, callId, sinceStartMs: nowMs() - t0 }))
         .catch((err) => log.error('[GREETING] step5 — playGreeting() error', err as Error, { sessionId, callId }));
-      // Open the caller's mic ~300ms after the greeting audio finishes playing.
-      greetingOptions = { greetingGateMs: greetingDurationMs + 300 };
+      // Open the caller's mic shortly after the greeting audio finishes playing.
+      // 200ms (was 300ms) trims turn-1 dead air while still clearing the WAV's tail
+      // so its echo can't be mis-captured as the caller's first words.
+      greetingOptions = { greetingGateMs: greetingDurationMs + 200 };
       log.info('▶️  Static greeting playing — Nova session initializing in parallel', {
         sessionId, callId, greetingDurationMs,
       });
