@@ -14,6 +14,8 @@
  *   TwilioController(TwilioService, MediaGatewayService)
  */
 
+import fs from 'fs';
+import path from 'path';
 import express, { Application, Request, Response, NextFunction } from 'express';
 import { Env } from './config';
 import { Logger } from './shared/Logger';
@@ -112,6 +114,31 @@ export function createApp(): { app: Application; services: AppServices } {
   );
 
   // ── Routes ──────────────────────────────────────────────────────────────────
+
+  // Call events log reader — dashboard uses this to fetch per-call JSONL traces
+  app.get('/calls/:callSid/events', (req: Request, res: Response) => {
+    const callSid = String(req.params.callSid);
+    // Sanitize: only allow Twilio/Exotel SID characters
+    if (!/^[A-Za-z0-9_-]{10,64}$/.test(callSid)) {
+      res.status(400).json({ error: 'Invalid callSid' });
+      return;
+    }
+    const filePath = path.join(process.cwd(), 'logs', 'calls', `${callSid}.jsonl`);
+    if (!fs.existsSync(filePath)) {
+      res.json({ events: [] });
+      return;
+    }
+    try {
+      const lines = fs.readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+      const events = lines
+        .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+        .filter(Boolean);
+      res.json({ events });
+    } catch {
+      res.status(500).json({ error: 'Failed to read call events' });
+    }
+  });
+
   // app.use('/', createKnowlarityRouter(knowlarityService, mediaGateway)); // ← commented out
   if (isExotel) {
     app.use('/', createExotelRouter(telephonyProvider as ExotelService, mediaGateway));

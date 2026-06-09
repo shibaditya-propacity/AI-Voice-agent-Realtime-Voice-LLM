@@ -24,9 +24,12 @@ export async function handleGetCampaign(req: AuthRequest, res: Response, next: N
 
 export async function handleCreateCampaign(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   try {
-    const { name, description } = req.body as { name?: string; description?: string };
+    const { name, description, intentionType, systemPrompt, prospectLabel } = req.body as {
+      name?: string; description?: string;
+      intentionType?: string; systemPrompt?: string; prospectLabel?: string;
+    };
     if (!name) { res.status(400).json({ success: false, error: { code: 'BAD_REQUEST', message: 'name is required' } }); return; }
-    const data = await createCampaign({ name, description }, req.user!.id);
+    const data = await createCampaign({ name, description, intentionType, systemPrompt, prospectLabel }, req.user!.id);
     res.status(201).json({ success: true, data } as ApiResponse);
   } catch (err) { next(err); }
 }

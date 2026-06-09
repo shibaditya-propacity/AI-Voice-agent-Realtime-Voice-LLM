@@ -21,7 +21,7 @@ export interface CallLogPayload {
   }>;
 }
 
-export async function postCallLog(payload: CallLogPayload): Promise<void> {
+async function postCallLogOnce(payload: CallLogPayload): Promise<void> {
   const apiUrl = Env.dashboard.apiUrl;
   const secret = Env.dashboard.internalSecret;
 
@@ -56,9 +56,30 @@ export async function postCallLog(payload: CallLogPayload): Promise<void> {
     req.write(body);
     req.end();
   });
+}
 
-  log.info('Call log posted to dashboard API', {
-    callSid: payload.callSid,
-    turns: payload.transcript?.length ?? 0,
-  });
+export async function postCallLog(payload: CallLogPayload): Promise<void> {
+  const maxAttempts = 4;
+  const delays = [2000, 5000, 15000]; // ms between retries
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await postCallLogOnce(payload);
+      log.info('Call log posted to dashboard API', {
+        callSid: payload.callSid,
+        turns: payload.transcript?.length ?? 0,
+        attempt,
+      });
+      return;
+    } catch (err) {
+      const isLast = attempt === maxAttempts;
+      if (isLast) throw err;
+      const delay = delays[attempt - 1] ?? 15000;
+      log.warn(`Dashboard API post failed (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms`, {
+        callSid: payload.callSid,
+        error: (err as Error).message,
+      });
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
 }

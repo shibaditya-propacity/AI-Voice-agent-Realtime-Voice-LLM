@@ -76,7 +76,7 @@ export function useCreateCampaign() {
 export function useUpdateCampaign() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, data }: { id: string; data: { name?: string; description?: string; status?: string } }) =>
+    mutationFn: ({ id, data }: { id: string; data: { name?: string; description?: string; status?: string; intentionType?: string; systemPrompt?: string; prospectLabel?: string } }) =>
       campaignsApi.update(id, data),
     onSuccess: (_d, vars) => {
       qc.invalidateQueries({ queryKey: QUERY_KEYS.CAMPAIGNS.LIST });

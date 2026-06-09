@@ -46,7 +46,7 @@ apiClient.interceptors.response.use(
           const { accessToken, refreshToken: newRefresh } = res.data.data;
           localStorage.setItem(TOKEN_KEYS.ACCESS, accessToken);
           if (newRefresh) localStorage.setItem(TOKEN_KEYS.REFRESH, newRefresh);
-          document.cookie = `${TOKEN_KEYS.ACCESS}=${accessToken}; path=/; max-age=900; SameSite=Lax`;
+          document.cookie = `${TOKEN_KEYS.ACCESS}=${accessToken}; path=/; max-age=604800; SameSite=Lax`;
           return accessToken;
         })().finally(() => { refreshing = null; });
       }

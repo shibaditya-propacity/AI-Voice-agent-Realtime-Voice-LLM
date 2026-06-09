@@ -4,13 +4,23 @@ import { useState } from 'react';
 import Link from 'next/link';
 import {
   Plus, Megaphone, ChevronRight, Play, Trash2,
-  CheckCircle, Clock, AlertCircle, Loader2,
+  CheckCircle, Clock, AlertCircle, Loader2, Users, Mic2, FileText,
 } from 'lucide-react';
 import { ROUTES } from '@saas/config';
 import {
   useCampaigns, useCreateCampaign, useDeleteCampaign, useStartCampaign,
 } from '@/features/call-center/hooks/useCallCenter';
 import type { Campaign } from '@/features/call-center/api/callCenterApi';
+
+const INTENTION_TYPES = [
+  'Real Estate Sales',
+  'Lead Qualification',
+  'Follow-up Call',
+  'Appointment Booking',
+  'Survey',
+  'Customer Support',
+  'Other',
+] as const;
 
 const STATUS_CONFIG: Record<Campaign['status'], { label: string; color: string; icon: React.ElementType }> = {
   DRAFT: { label: 'Draft', color: 'bg-gray-100 text-gray-600', icon: Clock },
@@ -42,18 +52,36 @@ function ProgressBar({ value, max }: { value: number; max: number }) {
   );
 }
 
+function FieldLabel({ children, required }: { children: React.ReactNode; required?: boolean }) {
+  return (
+    <label className="block text-xs font-semibold text-gray-700 mb-1">
+      {children}{required && <span className="text-red-500 ml-0.5">*</span>}
+    </label>
+  );
+}
+
 function CreateCampaignModal({ onClose }: { onClose: () => void }) {
   const { mutateAsync, isPending } = useCreateCampaign();
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [error, setError] = useState('');
+
+  const [name, setName]                   = useState('');
+  const [description, setDescription]     = useState('');
+  const [intentionType, setIntentionType] = useState('');
+  const [systemPrompt, setSystemPrompt]   = useState('');
+  const [prospectLabel, setProspectLabel] = useState('Prospects');
+  const [error, setError]                 = useState('');
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    if (!name.trim()) { setError('Name is required'); return; }
+    if (!name.trim()) { setError('Campaign name is required'); return; }
     try {
-      await mutateAsync({ name: name.trim(), description: description.trim() || undefined });
+      await mutateAsync({
+        name: name.trim(),
+        description: description.trim() || undefined,
+        intentionType: intentionType || undefined,
+        systemPrompt: systemPrompt.trim() || undefined,
+        prospectLabel: prospectLabel.trim() || 'Prospects',
+      });
       onClose();
     } catch (err) {
       setError((err as Error).message);
@@ -61,40 +89,111 @@ function CreateCampaignModal({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-md p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Create Campaign</h2>
-        <form onSubmit={submit} className="space-y-3">
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Campaign Name *</label>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Q3 Follow-up"
-              className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
-            />
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 overflow-y-auto">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl my-auto">
+
+        {/* Header */}
+        <div className="px-6 py-5 border-b border-gray-100">
+          <h2 className="text-lg font-semibold text-gray-900">New Campaign</h2>
+          <p className="text-sm text-gray-500 mt-0.5">Configure the campaign details and AI voice behaviour.</p>
+        </div>
+
+        <form onSubmit={submit}>
+          <div className="px-6 py-5 space-y-5">
+
+            {/* Row 1: Name + Prospect label */}
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <FieldLabel required>Campaign Name</FieldLabel>
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="e.g. June Real Estate Push"
+                  className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400"
+                />
+              </div>
+              <div>
+                <FieldLabel required>
+                  <span className="flex items-center gap-1"><Users className="h-3 w-3" /> Prospects Called</span>
+                </FieldLabel>
+                <input
+                  value={prospectLabel}
+                  onChange={(e) => setProspectLabel(e.target.value)}
+                  placeholder="e.g. Prospects, Leads, Buyers, Clients"
+                  className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400"
+                />
+                <p className="text-[10px] text-gray-400 mt-1">What to call the people in this campaign.</p>
+              </div>
+            </div>
+
+            {/* Row 2: Intention type */}
+            <div>
+              <FieldLabel>
+                <span className="flex items-center gap-1"><Mic2 className="h-3 w-3" /> Call Intention Type</span>
+              </FieldLabel>
+              <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                {INTENTION_TYPES.map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => setIntentionType(intentionType === t ? '' : t)}
+                    className={`px-3 py-2 rounded-lg border text-xs font-medium text-left transition-colors ${
+                      intentionType === t
+                        ? 'bg-indigo-600 border-indigo-600 text-white'
+                        : 'border-gray-200 text-gray-600 hover:border-indigo-300 hover:bg-indigo-50'
+                    }`}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Row 3: Description */}
+            <div>
+              <FieldLabel>Description</FieldLabel>
+              <textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={2}
+                placeholder="Optional — brief notes about this campaign's goal."
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 resize-none"
+              />
+            </div>
+
+            {/* Row 4: System prompt */}
+            <div>
+              <FieldLabel>
+                <span className="flex items-center gap-1"><FileText className="h-3 w-3" /> AI System Prompt</span>
+              </FieldLabel>
+              <textarea
+                value={systemPrompt}
+                onChange={(e) => setSystemPrompt(e.target.value)}
+                rows={6}
+                placeholder="You are Arjun — a calm, confident real estate sales caller for Akshay Vista. Your goal is to book a site visit…"
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 resize-y"
+              />
+              <p className="text-[10px] text-gray-400 mt-1">
+                Define the AI agent's role, tone, and goals for this campaign. Leave blank to use the global agent prompt.
+              </p>
+            </div>
+
           </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Description</label>
-            <textarea
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              rows={3}
-              placeholder="Optional description…"
-              className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none"
-            />
-          </div>
-          {error && <p className="text-sm text-red-600">{error}</p>}
-          <div className="flex justify-end gap-2 pt-1">
-            <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">
+
+          {error && (
+            <div className="mx-6 mb-4 px-3 py-2 bg-red-50 border border-red-100 rounded-lg text-sm text-red-600">{error}</div>
+          )}
+
+          <div className="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">
+            <button type="button" onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:text-gray-800 transition-colors">
               Cancel
             </button>
             <button
               type="submit"
               disabled={isPending}
-              className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+              className="px-5 py-2 text-sm font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors"
             >
-              {isPending ? 'Creating…' : 'Create'}
+              {isPending ? 'Creating…' : 'Create Campaign'}
             </button>
           </div>
         </form>
@@ -148,8 +247,25 @@ function CampaignCard({ campaign }: { campaign: Campaign }) {
         </div>
       </div>
 
+      {/* Meta chips */}
+      <div className="flex flex-wrap gap-1.5 mt-3">
+        {campaign.intentionType && (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-violet-50 text-violet-700 border border-violet-100 text-[10px] font-medium">
+            <Mic2 className="h-2.5 w-2.5" />{campaign.intentionType}
+          </span>
+        )}
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-50 text-gray-500 border border-gray-100 text-[10px] font-medium">
+          <Users className="h-2.5 w-2.5" />{campaign.prospectLabel}
+        </span>
+        {campaign.systemPrompt && (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-50 text-amber-600 border border-amber-100 text-[10px] font-medium">
+            <FileText className="h-2.5 w-2.5" />Custom prompt
+          </span>
+        )}
+      </div>
+
       {/* Progress */}
-      <div className="mt-4">
+      <div className="mt-3">
         <div className="flex items-center justify-between text-xs text-gray-500 mb-1.5">
           <span>{campaign.dialedCount} / {campaign.totalContacts} dialed</span>
           <span>{campaign.answeredCount} answered · {campaign.failedCount} failed</span>

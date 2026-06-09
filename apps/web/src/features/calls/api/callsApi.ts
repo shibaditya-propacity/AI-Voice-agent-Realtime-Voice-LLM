@@ -27,7 +27,22 @@ export interface ConversationTurn {
 }
 
 export interface CallDetail extends CallLog {
+  callSid: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  campaign: { id: string; name: string | null } | null;
+  contact: { id: string; name: string | null; phone: string | null } | null;
   Conversation: ConversationTurn[];
+}
+
+export interface CallEvent {
+  ts: number;
+  delta: number;
+  callId: string;
+  sessionId: string;
+  event: string;
+  state: string;
+  data?: Record<string, unknown>;
 }
 
 export interface CallStats {
@@ -52,4 +67,7 @@ export const callsApi = {
   stats: () => apiRequest<CallStats>('get', API_ROUTES.CALLS.STATS),
 
   detail: (id: string) => apiRequest<CallDetail>('get', API_ROUTES.CALLS.DETAIL(id)),
+
+  events: (id: string) =>
+    apiRequest<{ events: CallEvent[] }>('get', `${API_ROUTES.CALLS.DETAIL(id)}/events`),
 };

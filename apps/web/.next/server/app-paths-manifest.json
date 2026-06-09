@@ -1,8 +1,0 @@
-{
-  "/(dashboard)/dashboard/page": "app/(dashboard)/dashboard/page.js",
-  "/(dashboard)/calls/page": "app/(dashboard)/calls/page.js",
-  "/(auth)/login/page": "app/(auth)/login/page.js",
-  "/(dashboard)/call-center/campaigns/page": "app/(dashboard)/call-center/campaigns/page.js",
-  "/(dashboard)/call-center/contacts/page": "app/(dashboard)/call-center/contacts/page.js",
-  "/(dashboard)/call-center/page": "app/(dashboard)/call-center/page.js"
-}
