@@ -14,6 +14,8 @@
  *   4. Destroy the in-memory session
  */
 
+import https from 'https';
+import http from 'http';
 import { Env } from '../../config';
 import { AppEvent } from '../../events/EventTypes';
 import { callTrace } from '../../shared/CallTraceLogger';
@@ -222,10 +224,16 @@ export class MediaSessionCoordinator {
   }
 
   private async teardown(callId: string, sessionId: string, reason: string): Promise<void> {
-    const startedAt = this.sessionManager.getSession(sessionId)?.startedAt ?? nowMs();
+    const session = this.sessionManager.getSession(sessionId);
+    const startedAt = session?.startedAt ?? nowMs();
     const durationMs = nowMs() - startedAt;
 
     log.info('Tearing down call session', { sessionId, callId, reason, durationMs });
+
+    // Snapshot transcript before destroying session
+    const transcriptHistory = session?.transcriptHistory ?? [];
+    const callerNumber = session?.callerNumber;
+    const direction = session?.callMetadata?.direction ?? 'inbound';
 
     this.callToSession.delete(callId);
 
@@ -260,6 +268,78 @@ export class MediaSessionCoordinator {
       reason: 'hangup',
       durationMs,
     });
+
+    // 5. Persist call log + transcript to dashboard API (fire-and-forget)
+    this.persistCallLog(callId, {
+      callerNumber,
+      direction,
+      durationMs,
+      transcriptHistory,
+    }).catch((err) => {
+      log.warn('Failed to persist call log to dashboard API', { callId, error: (err as Error).message });
+    });
+  }
+
+  private async persistCallLog(
+    callId: string,
+    opts: {
+      callerNumber?: string;
+      direction: string;
+      durationMs: number;
+      transcriptHistory: import('../../types').TranscriptEntry[];
+    },
+  ): Promise<void> {
+    const apiUrl = Env.dashboard.apiUrl;
+    const secret = Env.dashboard.internalSecret;
+
+    const transcript = opts.transcriptHistory
+      .filter((t) => t.isFinal && t.role !== 'system')
+      .map((t) => ({
+        role: t.role.toUpperCase() as 'USER' | 'ASSISTANT',
+        content: t.text,
+        createdAt: new Date(t.timestamp).toISOString(),
+      }));
+
+    const body = JSON.stringify({
+      callSid: callId,
+      from: opts.callerNumber ?? null,
+      direction: opts.direction,
+      duration: Math.round(opts.durationMs / 1000),
+      transcript,
+    });
+
+    const url = new URL('/calls/internal', apiUrl);
+    const isHttps = url.protocol === 'https:';
+    const transport = isHttps ? https : http;
+
+    await new Promise<void>((resolve, reject) => {
+      const req = transport.request(
+        {
+          hostname: url.hostname,
+          port: url.port || (isHttps ? 443 : 80),
+          path: url.pathname,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+            ...(secret ? { 'x-internal-secret': secret } : {}),
+          },
+        },
+        (res) => {
+          res.resume(); // drain response
+          if (res.statusCode && res.statusCode >= 400) {
+            reject(new Error(`Dashboard API returned ${res.statusCode}`));
+          } else {
+            resolve();
+          }
+        },
+      );
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+
+    log.info('Call log persisted to dashboard API', { callId, turns: transcript.length });
   }
 
   // ─── Lookups ───────────────────────────────────────────────────────────────

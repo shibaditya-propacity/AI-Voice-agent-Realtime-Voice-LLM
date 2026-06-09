@@ -2,12 +2,20 @@
   "name": "voice-ai-agent",
   "version": "1.0.0",
   "description": "Production-grade realtime AI voice agent: Knowlarity → Krisp → Nova Sonic",
+  "private": true,
   "main": "dist/index.js",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "start": "node dist/index.js",
     "dev": "ts-node -r dotenv/config src/index.ts",
     "dev:watch": "ts-node-dev --respawn --transpile-only -r dotenv/config src/index.ts",
+    "dev:web": "turbo dev --filter=@saas/web",
+    "dev:api": "turbo dev --filter=@saas/api",
+    "dev:dashboard": "turbo dev --filter=@saas/web --filter=@saas/api",
     "type-check": "tsc --noEmit",
     "lint": "eslint src/**/*.ts",
     "test": "jest --runInBand --forceExit",
@@ -51,9 +59,11 @@
     "ts-jest": "^29.4.11",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
+    "turbo": "^2.0.0",
     "typescript": "^5.6.0"
   },
   "engines": {
     "node": ">=20.0.0"
-  }
+  },
+  "packageManager": "npm@10.0.0"
 }

@@ -24,7 +24,7 @@ import { AudioProcessor } from '../audio/AudioProcessor';
 import { KrispService } from '../krisp/KrispService';
 import { NovaSessionManager } from '../nova/NovaSessionManager';
 // import { KnowlarityService } from '../knowlarity/KnowlarityService'; // ← commented out: replaced by Twilio
-import { TwilioService } from '../twilio/TwilioService';
+import { TelephonyProvider } from '../telephony/TelephonyProvider';
 import { SessionManager } from '../session/SessionManager';
 
 export class AudioRouter {
@@ -32,7 +32,7 @@ export class AudioRouter {
   private readonly krispService: KrispService;
   private readonly novaSessionManager: NovaSessionManager;
   // private readonly knowlarityService: KnowlarityService; // ← commented out
-  private readonly twilioService: TwilioService;
+  private readonly twilioService: TelephonyProvider;
   private readonly sessionManager: SessionManager;
   private readonly log: Logger;
 
@@ -106,7 +106,7 @@ export class AudioRouter {
     krispService: KrispService,
     novaSessionManager: NovaSessionManager,
     // knowlarityService: KnowlarityService, // ← commented out
-    twilioService: TwilioService,
+    twilioService: TelephonyProvider,
     sessionManager: SessionManager,
   ) {
     this.audioProcessor = audioProcessor;

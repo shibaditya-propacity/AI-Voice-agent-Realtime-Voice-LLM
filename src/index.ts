@@ -31,7 +31,7 @@ async function main(): Promise<void> {
   const httpServer = http.createServer(app);
 
   // 3. Attach WebSocket server
-  const wsServer = new WebSocketServer(httpServer, services.twilioService);
+  const wsServer = new WebSocketServer(httpServer, services.telephonyProvider);
 
   // 4. Load the static greeting WAV BEFORE accepting calls so the very first call can
   //    play it the instant it connects (Nova 2 Sonic does not speak first). This is a

@@ -15,6 +15,7 @@
  */
 
 import express, { Application, Request, Response, NextFunction } from 'express';
+import { Env } from './config';
 import { Logger } from './shared/Logger';
 import { CodecConverter } from './modules/audio/CodecConverter';
 import { AudioProcessor } from './modules/audio/AudioProcessor';
@@ -26,6 +27,9 @@ import { NovaSessionManager } from './modules/nova/NovaSessionManager';
 // import { createKnowlarityRouter } from './modules/knowlarity/KnowlarityController'; // ← commented out
 import { TwilioService } from './modules/twilio/TwilioService';
 import { createTwilioRouter } from './modules/twilio/TwilioController';
+import { ExotelService } from './modules/exotel/ExotelService';
+import { createExotelRouter } from './modules/exotel/ExotelController';
+import { TelephonyProvider } from './modules/telephony/TelephonyProvider';
 import { AudioRouter } from './modules/media-gateway/AudioRouter';
 import { MediaSessionCoordinator } from './modules/media-gateway/MediaSessionCoordinator';
 import { MediaGatewayService } from './modules/media-gateway/MediaGatewayService';
@@ -34,7 +38,7 @@ const log = Logger.root('App');
 
 export interface AppServices {
   // knowlarityService: KnowlarityService; // ← commented out
-  twilioService: TwilioService;
+  telephonyProvider: TelephonyProvider;
   mediaGateway: MediaGatewayService;
   sessionManager: SessionManager;
   novaSessionManager: NovaSessionManager;
@@ -65,14 +69,31 @@ export function createApp(): { app: Application; services: AppServices } {
   const novaSessionManager = new NovaSessionManager(sessionManager);
 
   // const knowlarityService = new KnowlarityService(); // ← commented out
-  const twilioService = new TwilioService();
+
+  // ── Telephony provider selection (TELEPHONY_PROVIDER=twilio|exotel) ─────────
+  const isExotel = Env.telephonyProvider === 'exotel';
+
+  if (isExotel) {
+    if (!Env.exotel.apiKey || !Env.exotel.apiToken || !Env.exotel.accountSid) {
+      throw new Error('Exotel provider requires EXOTEL_API_KEY, EXOTEL_API_TOKEN, EXOTEL_ACCOUNT_SID');
+    }
+  } else {
+    if (!Env.twilio.accountSid || !Env.twilio.authToken || !Env.twilio.phoneNumber) {
+      throw new Error('Twilio provider requires TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER');
+    }
+  }
+
+  const telephonyProvider: TelephonyProvider = isExotel
+    ? new ExotelService()
+    : new TwilioService();
+  log.info(`Telephony provider: ${isExotel ? 'exotel' : 'twilio'}`);
 
   const audioRouter = new AudioRouter(
     audioProcessor,
     krispService,
     novaSessionManager,
     // knowlarityService, // ← commented out
-    twilioService,
+    telephonyProvider,
     sessionManager,
   );
 
@@ -85,14 +106,18 @@ export function createApp(): { app: Application; services: AppServices } {
 
   const mediaGateway = new MediaGatewayService(
     // knowlarityService, // ← commented out
-    twilioService,
+    telephonyProvider,
     audioRouter,
     coordinator,
   );
 
   // ── Routes ──────────────────────────────────────────────────────────────────
   // app.use('/', createKnowlarityRouter(knowlarityService, mediaGateway)); // ← commented out
-  app.use('/', createTwilioRouter(twilioService, mediaGateway));
+  if (isExotel) {
+    app.use('/', createExotelRouter(telephonyProvider as ExotelService, mediaGateway));
+  } else {
+    app.use('/', createTwilioRouter(telephonyProvider as TwilioService, mediaGateway));
+  }
 
   app.use((_req: Request, res: Response) => {
     res.status(404).json({ error: 'Not found' });
@@ -107,6 +132,6 @@ export function createApp(): { app: Application; services: AppServices } {
 
   return {
     app,
-    services: { twilioService, mediaGateway, sessionManager, novaSessionManager },
+    services: { telephonyProvider, mediaGateway, sessionManager, novaSessionManager },
   };
 }

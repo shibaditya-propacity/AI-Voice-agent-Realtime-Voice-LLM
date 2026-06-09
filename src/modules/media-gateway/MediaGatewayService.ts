@@ -10,7 +10,7 @@ import { AppEvent } from '../../events/EventTypes';
 import { eventBus } from '../../shared/EventBus';
 // import { KnowlarityService } from '../knowlarity/KnowlarityService'; // ← commented out: replaced by Twilio
 // import { KnowlarityStreamSession } from '../knowlarity/KnowlarityTypes'; // ← commented out
-import { TwilioService } from '../twilio/TwilioService';
+import { TelephonyProvider } from '../telephony/TelephonyProvider';
 import { TwilioStreamSession } from '../twilio/TwilioTypes';
 import { AudioRouter } from './AudioRouter';
 import { MediaSessionCoordinator } from './MediaSessionCoordinator';
@@ -19,14 +19,14 @@ const log = Logger.root('MediaGatewayService');
 
 export class MediaGatewayService {
   // private readonly knowlarityService: KnowlarityService; // ← commented out
-  private readonly twilioService: TwilioService;
+  private readonly twilioService: TelephonyProvider;
   private readonly audioRouter: AudioRouter;
   private readonly coordinator: MediaSessionCoordinator;
   private readonly eventUnsubs: Array<() => void> = [];
 
   constructor(
     // knowlarityService: KnowlarityService, // ← commented out
-    twilioService: TwilioService,
+    twilioService: TelephonyProvider,
     audioRouter: AudioRouter,
     coordinator: MediaSessionCoordinator,
   ) {

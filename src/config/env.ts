@@ -63,12 +63,31 @@ export const Env = {
   //   webhookUrl: optionalEnv('KNOWLARITY_WEBHOOK_URL', ''),
   // },
 
+  // ── Telephony provider selection ─────────────────────────────────────────
+  // Set TELEPHONY_PROVIDER=exotel to activate Exotel; default is twilio.
+  telephonyProvider: optionalEnv('TELEPHONY_PROVIDER', 'twilio') as 'twilio' | 'exotel',
+
   twilio: {
-    accountSid: requireEnv('TWILIO_ACCOUNT_SID'),
-    authToken: requireEnv('TWILIO_AUTH_TOKEN'),
-    phoneNumber: requireEnv('TWILIO_PHONE_NUMBER'),
+    accountSid: optionalEnv('TWILIO_ACCOUNT_SID', ''),
+    authToken: optionalEnv('TWILIO_AUTH_TOKEN', ''),
+    phoneNumber: optionalEnv('TWILIO_PHONE_NUMBER', ''),
     // Public HTTPS URL of this server — Twilio will POST webhooks here
     webhookBaseUrl: optionalEnv('TWILIO_WEBHOOK_BASE_URL', ''),
+  },
+
+  exotel: {
+    // Exotel API credentials (from Exotel dashboard → Settings → API)
+    apiKey: optionalEnv('EXOTEL_API_KEY', ''),
+    apiToken: optionalEnv('EXOTEL_API_TOKEN', ''),
+    // Exotel Account SID (shown in Exotel dashboard, e.g. "propacity2")
+    accountSid: optionalEnv('EXOTEL_ACCOUNT_SID', ''),
+    // Exotel API subdomain — full host used in REST calls, e.g. api.exotel.in
+    // Matches {{SubDomain}} in the Exotel Postman collection.
+    apiSubdomain: optionalEnv('EXOTEL_API_SUBDOMAIN', 'api.exotel.in'),
+    // ExoPhone virtual number in E.164 format, e.g. +918045678901
+    phoneNumber: optionalEnv('EXOTEL_PHONE_NUMBER', ''),
+    // Public HTTPS base URL of this server — Exotel will POST webhooks here
+    webhookBaseUrl: optionalEnv('EXOTEL_WEBHOOK_BASE_URL', ''),
   },
 
   krisp: {
@@ -267,6 +286,13 @@ export const Env = {
   logging: {
     level: optionalEnv('LOG_LEVEL', 'info'),
     pretty: optionalBool('LOG_PRETTY', false),
+  },
+
+  // ── Dashboard API integration ────────────────────────────────────────────
+  // Voice server calls this after each call to persist the CallLog + recording.
+  dashboard: {
+    apiUrl: optionalEnv('DASHBOARD_API_URL', 'http://localhost:3001'),
+    internalSecret: optionalEnv('INTERNAL_API_SECRET', ''),
   },
 } as const;
 
