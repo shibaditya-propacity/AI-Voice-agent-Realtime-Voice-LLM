@@ -42,7 +42,8 @@ export async function saveCallLog(input: SaveCallLogInput) {
     leadId = lead?.id ?? null;
   }
 
-  const log = await prisma.callLog.upsert({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const log = await (prisma.callLog.upsert as any)({
     where: { callSid: input.callSid },
     create: {
       id: uuidv4(),
@@ -62,7 +63,7 @@ export async function saveCallLog(input: SaveCallLogInput) {
       summary: input.summary ?? undefined,
       recordingUrl: input.recordingUrl ?? undefined,
     },
-  });
+  }) as { id: string; callSid: string; [key: string]: unknown };
 
   // Save transcript turns linked to this specific call log (raw SQL — callLogId not in
   // generated client until prisma generate runs on Node 20+)

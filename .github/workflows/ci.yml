@@ -52,4 +52,4 @@ jobs:
         run: npx tsc --noEmit -p apps/web/tsconfig.json
 
       - name: Type check API
-        run: npx tsc --noEmit -p apps/api/tsconfig.json
+        run: npx tsc --noEmit -p apps/api/tsconfig.typecheck.json

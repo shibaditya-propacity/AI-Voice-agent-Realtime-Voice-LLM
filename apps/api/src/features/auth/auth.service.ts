@@ -32,12 +32,11 @@ function dbUserToApiUser(u: {
 }
 
 function generateTokens(user: User): AuthTokens {
-  const accessToken = jwt.sign({ user }, Env.jwt.secret, {
-    expiresIn: Env.jwt.expiresIn as string,
-  });
-  const refreshToken = jwt.sign({ userId: user.id }, Env.jwt.secret, {
-    expiresIn: Env.jwt.refreshExpiresIn as string,
-  });
+  // Cast required: @types/jsonwebtoken ≥9.0.7 uses branded StringValue but our
+  // env values ("15m", "7d") are valid ms strings at runtime.
+  const signOpts = (exp: string): jwt.SignOptions => ({ expiresIn: exp as unknown as jwt.SignOptions['expiresIn'] });
+  const accessToken = jwt.sign({ user }, Env.jwt.secret, signOpts(Env.jwt.expiresIn));
+  const refreshToken = jwt.sign({ userId: user.id }, Env.jwt.secret, signOpts(Env.jwt.refreshExpiresIn));
   return { accessToken, refreshToken };
 }
 
