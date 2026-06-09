@@ -117,7 +117,7 @@ export function createApp(): { app: Application; services: AppServices } {
 
   // Call events log reader — dashboard uses this to fetch per-call JSONL traces
   app.get('/calls/:callSid/events', (req: Request, res: Response) => {
-    const { callSid } = req.params;
+    const callSid = String(req.params.callSid);
     // Sanitize: only allow Twilio/Exotel SID characters
     if (!/^[A-Za-z0-9_-]{10,64}$/.test(callSid)) {
       res.status(400).json({ error: 'Invalid callSid' });
