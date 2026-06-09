@@ -15,11 +15,23 @@ export interface Contact {
   createdAt: string;
 }
 
+export type IntentionType =
+  | 'Real Estate Sales'
+  | 'Lead Qualification'
+  | 'Follow-up Call'
+  | 'Appointment Booking'
+  | 'Survey'
+  | 'Customer Support'
+  | 'Other';
+
 export interface Campaign {
   id: string;
   name: string;
   description: string | null;
   status: 'DRAFT' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'CANCELLED';
+  intentionType: string | null;
+  systemPrompt: string | null;
+  prospectLabel: string;
   totalContacts: number;
   dialedCount: number;
   answeredCount: number;
@@ -104,10 +116,10 @@ export const campaignsApi = {
 
   detail: (id: string) => apiRequest<CampaignDetail>('get', API_ROUTES.CAMPAIGNS.DETAIL(id)),
 
-  create: (data: { name: string; description?: string }) =>
+  create: (data: { name: string; description?: string; intentionType?: string; systemPrompt?: string; prospectLabel?: string }) =>
     apiRequest<Campaign>('post', API_ROUTES.CAMPAIGNS.CREATE, data),
 
-  update: (id: string, data: { name?: string; description?: string; status?: string }) =>
+  update: (id: string, data: { name?: string; description?: string; status?: string; intentionType?: string; systemPrompt?: string; prospectLabel?: string }) =>
     apiRequest<Campaign>('patch', API_ROUTES.CAMPAIGNS.UPDATE(id), data),
 
   delete: (id: string) => apiRequest<void>('delete', API_ROUTES.CAMPAIGNS.DELETE(id)),

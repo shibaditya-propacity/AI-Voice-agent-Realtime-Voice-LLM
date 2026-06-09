@@ -7,8 +7,8 @@ export const Env = {
   nodeEnv: optionalEnv('NODE_ENV', 'development'),
   jwt: {
     secret: optionalEnv('JWT_SECRET', 'dev-secret-change-in-prod'),
-    expiresIn: optionalEnv('JWT_EXPIRES_IN', '15m'),
-    refreshExpiresIn: optionalEnv('JWT_REFRESH_EXPIRES_IN', '7d'),
+    expiresIn: optionalEnv('JWT_EXPIRES_IN', '7d'),
+    refreshExpiresIn: optionalEnv('JWT_REFRESH_EXPIRES_IN', '30d'),
   },
   cors: {
     origin: optionalEnv('CORS_ORIGIN', 'http://localhost:3000'),

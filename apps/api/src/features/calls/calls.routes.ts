@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { requireAuth } from '../../middleware/auth.middleware';
-import { listCalls, callStats, getCall } from './calls.controller';
+import { listCalls, callStats, getCall, getCallEventsHandler } from './calls.controller';
 import { internalSaveCallLog } from './calllog.controller';
 
 export const callsRouter = Router();
@@ -12,3 +12,4 @@ callsRouter.post('/internal', internalSaveCallLog);
 callsRouter.get('/', requireAuth, listCalls);
 callsRouter.get('/stats', requireAuth, callStats);
 callsRouter.get('/:id', requireAuth, getCall);
+callsRouter.get('/:id/events', requireAuth, getCallEventsHandler);

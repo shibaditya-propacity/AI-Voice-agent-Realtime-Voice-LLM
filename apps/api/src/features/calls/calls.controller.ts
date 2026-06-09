@@ -1,7 +1,7 @@
 import { Response, NextFunction } from 'express';
 import type { AuthRequest } from '../../middleware/auth.middleware';
 import type { ApiResponse } from '@saas/types';
-import { getCallLogs, getCallStats, getCallDetail } from './calls.service';
+import { getCallLogs, getCallStats, getCallDetail, getCallEvents } from './calls.service';
 
 export async function listCalls(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   try {
@@ -34,6 +34,21 @@ export async function getCall(req: AuthRequest, res: Response, next: NextFunctio
     }
     const response: ApiResponse = { success: true, data };
     res.json(response);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getCallEventsHandler(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    // id here is the CallLog.id — we need the callSid first
+    const detail = await getCallDetail(String(req.params.id));
+    if (!detail) {
+      res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
+      return;
+    }
+    const events = await getCallEvents(detail.callSid);
+    res.json({ success: true, data: { events } });
   } catch (err) {
     next(err);
   }

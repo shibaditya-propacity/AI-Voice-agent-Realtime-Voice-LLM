@@ -3,6 +3,7 @@ import { prisma } from '../../../lib/prisma';
 
 interface CampaignRow {
   id: string; name: string; description: string | null; status: string;
+  intentionType: string | null; systemPrompt: string | null; prospectLabel: string;
   totalContacts: number; dialedCount: number; answeredCount: number; failedCount: number;
   scheduledAt: Date | null; completedAt: Date | null; createdAt: Date; updatedAt: Date;
   createdById: string;
@@ -34,6 +35,8 @@ export async function listCampaigns(page = 1, limit = 20) {
 
   const campaigns = rows.map((r) => ({
     id: r.id, name: r.name, description: r.description, status: r.status,
+    intentionType: r.intentionType, systemPrompt: r.systemPrompt,
+    prospectLabel: r.prospectLabel ?? 'Prospects',
     totalContacts: r.totalContacts, dialedCount: r.dialedCount,
     answeredCount: r.answeredCount, failedCount: r.failedCount,
     scheduledAt: r.scheduledAt, completedAt: r.completedAt,
@@ -71,6 +74,8 @@ export async function getCampaign(id: string) {
 
   return {
     id: c.id, name: c.name, description: c.description, status: c.status,
+    intentionType: c.intentionType, systemPrompt: c.systemPrompt,
+    prospectLabel: c.prospectLabel ?? 'Prospects',
     totalContacts: c.totalContacts, dialedCount: c.dialedCount,
     answeredCount: c.answeredCount, failedCount: c.failedCount,
     scheduledAt: c.scheduledAt, completedAt: c.completedAt,
@@ -88,36 +93,43 @@ export async function getCampaign(id: string) {
   };
 }
 
-export async function createCampaign(input: { name: string; description?: string }, userId: string) {
+export async function createCampaign(
+  input: { name: string; description?: string; intentionType?: string; systemPrompt?: string; prospectLabel?: string },
+  userId: string,
+) {
   const id = uuidv4();
   const now = new Date();
+  const label = input.prospectLabel?.trim() || 'Prospects';
   await prisma.$executeRaw`
-    INSERT INTO "Campaign" ("id", "name", "description", "createdById", "createdAt", "updatedAt")
-    VALUES (${id}, ${input.name.trim()}, ${input.description?.trim() || null}, ${userId}, ${now}, ${now})
+    INSERT INTO "Campaign" ("id", "name", "description", "intentionType", "systemPrompt", "prospectLabel", "createdById", "createdAt", "updatedAt")
+    VALUES (${id}, ${input.name.trim()}, ${input.description?.trim() || null}, ${input.intentionType?.trim() || null}, ${input.systemPrompt?.trim() || null}, ${label}, ${userId}, ${now}, ${now})
   `;
   const rows = await prisma.$queryRaw<CampaignRow[]>`SELECT * FROM "Campaign" WHERE "id" = ${id}`;
   return rows[0];
 }
 
-export async function updateCampaign(id: string, input: { name?: string; description?: string; status?: string }) {
+export async function updateCampaign(
+  id: string,
+  input: { name?: string; description?: string; status?: string; intentionType?: string; systemPrompt?: string; prospectLabel?: string },
+) {
   const now = new Date();
   if (input.name !== undefined) {
-    await prisma.$executeRawUnsafe(
-      `UPDATE "Campaign" SET "name" = $1, "updatedAt" = $2 WHERE "id" = $3`,
-      input.name.trim(), now, id,
-    );
+    await prisma.$executeRawUnsafe(`UPDATE "Campaign" SET "name" = $1, "updatedAt" = $2 WHERE "id" = $3`, input.name.trim(), now, id);
   }
   if (input.description !== undefined) {
-    await prisma.$executeRawUnsafe(
-      `UPDATE "Campaign" SET "description" = $1, "updatedAt" = $2 WHERE "id" = $3`,
-      input.description?.trim() || null, now, id,
-    );
+    await prisma.$executeRawUnsafe(`UPDATE "Campaign" SET "description" = $1, "updatedAt" = $2 WHERE "id" = $3`, input.description?.trim() || null, now, id);
   }
   if (input.status !== undefined) {
-    await prisma.$executeRawUnsafe(
-      `UPDATE "Campaign" SET "status" = $1::"CampaignStatus", "updatedAt" = $2 WHERE "id" = $3`,
-      input.status, now, id,
-    );
+    await prisma.$executeRawUnsafe(`UPDATE "Campaign" SET "status" = $1::"CampaignStatus", "updatedAt" = $2 WHERE "id" = $3`, input.status, now, id);
+  }
+  if (input.intentionType !== undefined) {
+    await prisma.$executeRawUnsafe(`UPDATE "Campaign" SET "intentionType" = $1, "updatedAt" = $2 WHERE "id" = $3`, input.intentionType?.trim() || null, now, id);
+  }
+  if (input.systemPrompt !== undefined) {
+    await prisma.$executeRawUnsafe(`UPDATE "Campaign" SET "systemPrompt" = $1, "updatedAt" = $2 WHERE "id" = $3`, input.systemPrompt?.trim() || null, now, id);
+  }
+  if (input.prospectLabel !== undefined) {
+    await prisma.$executeRawUnsafe(`UPDATE "Campaign" SET "prospectLabel" = $1, "updatedAt" = $2 WHERE "id" = $3`, input.prospectLabel?.trim() || 'Prospects', now, id);
   }
   const rows = await prisma.$queryRaw<CampaignRow[]>`SELECT * FROM "Campaign" WHERE "id" = ${id}`;
   return rows[0];

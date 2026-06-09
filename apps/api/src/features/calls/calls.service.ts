@@ -1,4 +1,7 @@
+import https from 'https';
+import http from 'http';
 import { prisma } from '../../lib/prisma';
+import { Env } from '../../config/env';
 
 interface CallLogRow {
   id: string;
@@ -35,7 +38,7 @@ function shapeLog(row: CallLogRow) {
 }
 
 export async function getCallDetail(id: string) {
-  const [rows, conversations] = await Promise.all([
+  const [rows, conversations, jobRows] = await Promise.all([
     prisma.$queryRaw<CallLogRow[]>`
       SELECT cl.id, cl."callSid", cl."leadId", cl."from", cl."to", cl.direction,
              cl.duration, cl.language, cl.summary, cl."recordingUrl",
@@ -53,10 +56,70 @@ export async function getCallDetail(id: string) {
       WHERE "callLogId" = ${id}
       ORDER BY "createdAt" ASC
     `,
+    // Fetch linked CallJob + Campaign for the call's callSid
+    prisma.$queryRaw<Array<{
+      jobId: string; jobStatus: string; startedAt: Date | null; endedAt: Date | null;
+      campaignId: string | null; campaignName: string | null;
+      contactId: string | null; contactName: string | null; contactPhone: string | null;
+    }>>`
+      SELECT cj.id AS "jobId", cj.status AS "jobStatus",
+             cj."startedAt", cj."endedAt",
+             cj."campaignId", camp.name AS "campaignName",
+             cj."contactId", ct.name AS "contactName", ct.phone AS "contactPhone"
+      FROM "CallLog" cl
+      LEFT JOIN "CallJob" cj ON cj."callSid" = cl."callSid"
+      LEFT JOIN "Campaign" camp ON camp.id = cj."campaignId"
+      LEFT JOIN "Contact" ct ON ct.id = cj."contactId"
+      WHERE cl.id = ${id}
+      LIMIT 1
+    `,
   ]);
 
   if (!rows[0]) return null;
-  return { ...shapeLog(rows[0]), Conversation: conversations };
+
+  const job = jobRows[0] ?? null;
+  const shaped = shapeLog(rows[0]);
+
+  return {
+    ...shaped,
+    callSid: rows[0].callSid,
+    startedAt: job?.startedAt ? (job.startedAt instanceof Date ? job.startedAt.toISOString() : String(job.startedAt)) : shaped.createdAt,
+    endedAt: job?.endedAt ? (job.endedAt instanceof Date ? job.endedAt.toISOString() : String(job.endedAt)) : null,
+    campaign: job?.campaignId ? { id: job.campaignId, name: job.campaignName } : null,
+    contact: job?.contactId ? { id: job.contactId, name: job.contactName, phone: job.contactPhone } : null,
+    Conversation: conversations,
+  };
+}
+
+export async function getCallEvents(callSid: string): Promise<unknown[]> {
+  const url = new URL(`/calls/${encodeURIComponent(callSid)}/events`, Env.voiceServer.url);
+  const isHttps = url.protocol === 'https:';
+  const transport = isHttps ? https : http;
+
+  return new Promise((resolve) => {
+    const req = transport.request(
+      {
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname,
+        method: 'GET',
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data) as { events?: unknown[] };
+            resolve(parsed.events ?? []);
+          } catch {
+            resolve([]);
+          }
+        });
+      },
+    );
+    req.on('error', () => resolve([]));
+    req.end();
+  });
 }
 
 export async function getCallLogs(page = 1, limit = 20) {

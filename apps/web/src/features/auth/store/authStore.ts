@@ -17,7 +17,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       localStorage.setItem(TOKEN_KEYS.ACCESS, tokens.accessToken);
       localStorage.setItem(TOKEN_KEYS.REFRESH, tokens.refreshToken);
       // Set cookie so Next.js middleware can read auth state server-side
-      document.cookie = `${TOKEN_KEYS.ACCESS}=${tokens.accessToken}; path=/; max-age=900; SameSite=Lax`;
+      document.cookie = `${TOKEN_KEYS.ACCESS}=${tokens.accessToken}; path=/; max-age=604800; SameSite=Lax`;
     }
     set({ user, isAuthenticated: true });
   },

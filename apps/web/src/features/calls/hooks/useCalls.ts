@@ -6,7 +6,7 @@ export function useCallsList(page = 1) {
   return useQuery({
     queryKey: [...QUERY_KEYS.CALLS.LIST, page],
     queryFn: () => callsApi.list(page),
-    refetchInterval: 5000, // poll every 5s so in-progress calls appear live
+    refetchInterval: 5000,
   });
 }
 
@@ -23,6 +23,15 @@ export function useCallDetail(id: string | null) {
     queryKey: QUERY_KEYS.CALLS.DETAIL(id ?? ''),
     queryFn: () => callsApi.detail(id!),
     enabled: !!id,
-    refetchInterval: 5000, // refresh open transcript panels too
+    refetchInterval: 5000,
+  });
+}
+
+export function useCallEvents(id: string | null) {
+  return useQuery({
+    queryKey: [...QUERY_KEYS.CALLS.DETAIL(id ?? ''), 'events'],
+    queryFn: () => callsApi.events(id!),
+    enabled: !!id,
+    staleTime: 30000, // events don't change after call ends — cache for 30s
   });
 }
