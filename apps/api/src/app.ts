@@ -8,6 +8,9 @@ import { dashboardRouter } from './features/dashboard/dashboard.routes';
 import { callsRouter } from './features/calls/calls.routes';
 import { analyticsRouter } from './features/analytics/analytics.routes';
 import { teamRouter } from './features/team/team.routes';
+import { contactsRouter } from './features/call-center/contacts/contacts.routes';
+import { campaignsRouter } from './features/call-center/campaigns/campaigns.routes';
+import { callJobsRouter, callCenterDashboardRouter } from './features/call-center/call-jobs/call-jobs.routes';
 import { errorMiddleware } from './middleware/error.middleware';
 
 export function createApp() {
@@ -24,6 +27,10 @@ export function createApp() {
   app.use('/calls', callsRouter);
   app.use('/analytics', analyticsRouter);
   app.use('/team', teamRouter);
+  app.use('/call-center/contacts', contactsRouter);
+  app.use('/call-center/campaigns', campaignsRouter);
+  app.use('/call-center/jobs', callJobsRouter);
+  app.use('/call-center/stats', callCenterDashboardRouter);
 
   app.use(errorMiddleware);
 

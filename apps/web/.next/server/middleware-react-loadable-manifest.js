@@ -1,1 +1,1 @@
-self.__REACT_LOADABLE_MANIFEST="{}"
+self.__REACT_LOADABLE_MANIFEST="{\"app/(dashboard)/call-center/contacts/page.tsx -> xlsx\":{\"id\":\"app/(dashboard)/call-center/contacts/page.tsx -> xlsx\",\"files\":[\"static/chunks/_app-pages-browser_node_modules_xlsx_xlsx_mjs.js\"]}}"

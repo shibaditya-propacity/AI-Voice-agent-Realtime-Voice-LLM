@@ -1,6 +1,8 @@
 import { apiRequest } from '@/lib/api';
 import { API_ROUTES } from '@saas/config';
 
+export type CallStatus = 'DIALING' | 'COMPLETED' | 'FAILED' | 'NO_ANSWER';
+
 export interface CallLog {
   id: string;
   callSid: string;
@@ -8,6 +10,7 @@ export interface CallLog {
   language: string;
   summary: string | null;
   direction: string;
+  status: CallStatus;
   from: string | null;
   to: string | null;
   recordingUrl: string | null;

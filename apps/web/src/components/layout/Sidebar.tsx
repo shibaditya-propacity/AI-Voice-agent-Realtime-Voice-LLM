@@ -9,6 +9,7 @@ import {
   Settings,
   Users,
   Brain,
+  PhoneCall,
   X,
 } from 'lucide-react';
 import { ROUTES } from '@saas/config';
@@ -19,6 +20,7 @@ const navItems = [
   { label: 'Analytics', href: ROUTES.ANALYTICS, icon: BarChart3 },
   { label: 'Team', href: '/team', icon: Users },
   { label: 'AI Agents', href: '/agents', icon: Brain },
+  { label: 'Call Center', href: ROUTES.CALL_CENTER, icon: PhoneCall },
 ];
 
 const bottomItems = [
