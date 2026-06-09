@@ -13,18 +13,17 @@ import { URL } from 'url';
 import { Logger } from '../shared/Logger';
 // import { KnowlarityService } from '../modules/knowlarity/KnowlarityService'; // ← commented out
 // import { handleKnowlarityStreamUpgrade } from '../modules/knowlarity/KnowlarityController'; // ← commented out
-import { TwilioService } from '../modules/twilio/TwilioService';
-import { handleTwilioStreamUpgrade } from '../modules/twilio/TwilioController';
+import { TelephonyProvider } from '../modules/telephony/TelephonyProvider';
 
 const log = Logger.root('WebSocketServer');
 
 export class WebSocketServer {
   private readonly wss: WsServer;
   // private readonly knowlarityService: KnowlarityService; // ← commented out
-  private readonly twilioService: TwilioService;
+  private readonly telephonyProvider: TelephonyProvider;
 
-  constructor(server: http.Server, twilioService: TwilioService) {
-    this.twilioService = twilioService;
+  constructor(server: http.Server, telephonyProvider: TelephonyProvider) {
+    this.telephonyProvider = telephonyProvider;
     this.wss = new WsServer({ noServer: true });
 
     server.on('upgrade', (req, socket, head) => this.handleUpgrade(req, socket as never, head));
@@ -43,11 +42,11 @@ export class WebSocketServer {
     if (pathname === '/stream') {
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         const remoteAddress = req.socket.remoteAddress ?? 'unknown';
-        log.info('Twilio media stream connected', { remoteAddress });
+        log.info('Telephony media stream connected', { remoteAddress });
 
         this.wss.emit('connection', ws, req);
         // handleKnowlarityStreamUpgrade(ws, remoteAddress, this.knowlarityService); // ← commented out
-        handleTwilioStreamUpgrade(ws, remoteAddress, this.twilioService);
+        this.telephonyProvider.acceptStream(ws, remoteAddress);
       });
     } else {
       log.warn('WebSocket upgrade rejected — unknown path', { pathname });

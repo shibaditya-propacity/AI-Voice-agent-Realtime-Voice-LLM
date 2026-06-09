@@ -20,6 +20,7 @@ import { callTrace } from '../../shared/CallTraceLogger';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
 import { latencyRegistry } from '../../shared/LatencyRegistry';
+import { postCallLog } from '../../shared/DashboardClient';
 import { nowMs } from '../../utils/helpers';
 import { KrispService } from '../krisp/KrispService';
 import { NovaSessionManager } from '../nova/NovaSessionManager';
@@ -222,10 +223,16 @@ export class MediaSessionCoordinator {
   }
 
   private async teardown(callId: string, sessionId: string, reason: string): Promise<void> {
-    const startedAt = this.sessionManager.getSession(sessionId)?.startedAt ?? nowMs();
+    const session = this.sessionManager.getSession(sessionId);
+    const startedAt = session?.startedAt ?? nowMs();
     const durationMs = nowMs() - startedAt;
 
     log.info('Tearing down call session', { sessionId, callId, reason, durationMs });
+
+    // Snapshot transcript before destroying session
+    const transcriptHistory = session?.transcriptHistory ?? [];
+    const callerNumber = session?.callerNumber;
+    const direction = session?.callMetadata?.direction ?? 'inbound';
 
     this.callToSession.delete(callId);
 
@@ -259,6 +266,42 @@ export class MediaSessionCoordinator {
       timestamp: nowMs(),
       reason: 'hangup',
       durationMs,
+    });
+
+    // 5. Persist call log + transcript to dashboard API (fire-and-forget)
+    this.persistCallLog(callId, {
+      callerNumber,
+      direction,
+      durationMs,
+      transcriptHistory,
+    }).catch((err) => {
+      log.warn('Failed to persist call log to dashboard API', { callId, error: (err as Error).message });
+    });
+  }
+
+  private async persistCallLog(
+    callId: string,
+    opts: {
+      callerNumber?: string;
+      direction: string;
+      durationMs: number;
+      transcriptHistory: import('../../types').TranscriptEntry[];
+    },
+  ): Promise<void> {
+    const transcript = opts.transcriptHistory
+      .filter((t) => t.isFinal && t.role !== 'system')
+      .map((t) => ({
+        role: t.role.toUpperCase() as 'USER' | 'ASSISTANT',
+        content: t.text,
+        createdAt: new Date(t.timestamp).toISOString(),
+      }));
+
+    await postCallLog({
+      callSid: callId,
+      from: opts.callerNumber ?? null,
+      direction: opts.direction,
+      duration: Math.round(opts.durationMs / 1000),
+      transcript,
     });
   }
 
