@@ -19,6 +19,7 @@ import { Request, Response, Router } from 'express';
 import WebSocket from 'ws';
 import { Env } from '../../config';
 import { Logger } from '../../shared/Logger';
+import { postCallLog } from '../../shared/DashboardClient';
 import { ExotelService } from './ExotelService';
 import { ExotelOutboundCallRequest } from './ExotelTypes';
 import { MediaGatewayService } from '../media-gateway/MediaGatewayService';
@@ -104,16 +105,16 @@ export function createExotelRouter(
         log.error('Error handling call end from status callback', err as Error);
       });
 
-      // Persist CallLog to SaaS API (fire-and-forget)
-      persistCallLog({
+      // Persist CallLog to dashboard API (fire-and-forget)
+      postCallLog({
         callSid,
         from,
         to,
         direction,
         duration,
         recordingUrl: recordingUrl || undefined,
-      }).catch((err) => {
-        log.error('Failed to persist CallLog to dashboard API', err as Error, { callSid });
+      }).catch((err: Error) => {
+        log.error('Failed to persist CallLog to dashboard API', err, { callSid });
       });
     }
   });

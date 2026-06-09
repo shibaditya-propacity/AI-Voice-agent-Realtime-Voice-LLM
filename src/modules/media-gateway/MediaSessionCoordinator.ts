@@ -14,14 +14,13 @@
  *   4. Destroy the in-memory session
  */
 
-import https from 'https';
-import http from 'http';
 import { Env } from '../../config';
 import { AppEvent } from '../../events/EventTypes';
 import { callTrace } from '../../shared/CallTraceLogger';
 import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
 import { latencyRegistry } from '../../shared/LatencyRegistry';
+import { postCallLog } from '../../shared/DashboardClient';
 import { nowMs } from '../../utils/helpers';
 import { KrispService } from '../krisp/KrispService';
 import { NovaSessionManager } from '../nova/NovaSessionManager';
@@ -289,9 +288,6 @@ export class MediaSessionCoordinator {
       transcriptHistory: import('../../types').TranscriptEntry[];
     },
   ): Promise<void> {
-    const apiUrl = Env.dashboard.apiUrl;
-    const secret = Env.dashboard.internalSecret;
-
     const transcript = opts.transcriptHistory
       .filter((t) => t.isFinal && t.role !== 'system')
       .map((t) => ({
@@ -300,46 +296,13 @@ export class MediaSessionCoordinator {
         createdAt: new Date(t.timestamp).toISOString(),
       }));
 
-    const body = JSON.stringify({
+    await postCallLog({
       callSid: callId,
       from: opts.callerNumber ?? null,
       direction: opts.direction,
       duration: Math.round(opts.durationMs / 1000),
       transcript,
     });
-
-    const url = new URL('/calls/internal', apiUrl);
-    const isHttps = url.protocol === 'https:';
-    const transport = isHttps ? https : http;
-
-    await new Promise<void>((resolve, reject) => {
-      const req = transport.request(
-        {
-          hostname: url.hostname,
-          port: url.port || (isHttps ? 443 : 80),
-          path: url.pathname,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(body),
-            ...(secret ? { 'x-internal-secret': secret } : {}),
-          },
-        },
-        (res) => {
-          res.resume(); // drain response
-          if (res.statusCode && res.statusCode >= 400) {
-            reject(new Error(`Dashboard API returned ${res.statusCode}`));
-          } else {
-            resolve();
-          }
-        },
-      );
-      req.on('error', reject);
-      req.write(body);
-      req.end();
-    });
-
-    log.info('Call log persisted to dashboard API', { callId, turns: transcript.length });
   }
 
   // ─── Lookups ───────────────────────────────────────────────────────────────
