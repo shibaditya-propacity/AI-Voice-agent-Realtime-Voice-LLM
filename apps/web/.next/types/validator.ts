@@ -81,6 +81,42 @@ type LayoutConfig<Route extends LayoutRoutes = LayoutRoutes> = {
   type __Unused = __Check
 }
 
+// Validate ../../src/app/(dashboard)/call-center/campaigns/[id]/page.tsx
+{
+  type __IsExpected<Specific extends AppPageConfig<"/call-center/campaigns/[id]">> = Specific
+  const handler = {} as typeof import("../../src/app/(dashboard)/call-center/campaigns/[id]/page.js")
+  type __Check = __IsExpected<typeof handler>
+  // @ts-ignore
+  type __Unused = __Check
+}
+
+// Validate ../../src/app/(dashboard)/call-center/campaigns/page.tsx
+{
+  type __IsExpected<Specific extends AppPageConfig<"/call-center/campaigns">> = Specific
+  const handler = {} as typeof import("../../src/app/(dashboard)/call-center/campaigns/page.js")
+  type __Check = __IsExpected<typeof handler>
+  // @ts-ignore
+  type __Unused = __Check
+}
+
+// Validate ../../src/app/(dashboard)/call-center/contacts/page.tsx
+{
+  type __IsExpected<Specific extends AppPageConfig<"/call-center/contacts">> = Specific
+  const handler = {} as typeof import("../../src/app/(dashboard)/call-center/contacts/page.js")
+  type __Check = __IsExpected<typeof handler>
+  // @ts-ignore
+  type __Unused = __Check
+}
+
+// Validate ../../src/app/(dashboard)/call-center/page.tsx
+{
+  type __IsExpected<Specific extends AppPageConfig<"/call-center">> = Specific
+  const handler = {} as typeof import("../../src/app/(dashboard)/call-center/page.js")
+  type __Check = __IsExpected<typeof handler>
+  // @ts-ignore
+  type __Unused = __Check
+}
+
 // Validate ../../src/app/(dashboard)/calls/page.tsx
 {
   type __IsExpected<Specific extends AppPageConfig<"/calls">> = Specific

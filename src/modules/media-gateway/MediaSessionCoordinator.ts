@@ -21,6 +21,7 @@ import { eventBus } from '../../shared/EventBus';
 import { Logger } from '../../shared/Logger';
 import { latencyRegistry } from '../../shared/LatencyRegistry';
 import { postCallLog } from '../../shared/DashboardClient';
+import { analyzeCallTranscript } from '../../shared/CallAnalyzer';
 import { nowMs } from '../../utils/helpers';
 import { KrispService } from '../krisp/KrispService';
 import { NovaSessionManager } from '../nova/NovaSessionManager';
@@ -296,11 +297,36 @@ export class MediaSessionCoordinator {
         createdAt: new Date(t.timestamp).toISOString(),
       }));
 
+    // Run AI analysis in parallel with the post — only block on it if it's fast
+    const analysisPromise = analyzeCallTranscript(transcript);
+
+    let summary: string | undefined;
+    let language: string | undefined;
+    try {
+      const analysis = await Promise.race([
+        analysisPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
+      ]);
+      if (analysis) {
+        summary = [
+          analysis.summary,
+          analysis.keyTopics.length ? `Topics: ${analysis.keyTopics.join(', ')}.` : '',
+          analysis.actionItems.length ? `Action items: ${analysis.actionItems.join('; ')}.` : '',
+          `Sentiment: ${analysis.sentiment}.`,
+        ].filter(Boolean).join(' ');
+        language = analysis.language;
+      }
+    } catch {
+      // analysis timeout or error — proceed without summary
+    }
+
     await postCallLog({
       callSid: callId,
       from: opts.callerNumber ?? null,
       direction: opts.direction,
       duration: Math.round(opts.durationMs / 1000),
+      summary,
+      language,
       transcript,
     });
   }

@@ -1,6 +1,6 @@
 import { Response, NextFunction } from 'express';
 import { loginSchema, registerSchema } from '@saas/shared';
-import { loginUser, registerUser, getUserById } from './auth.service';
+import { loginUser, registerUser, getUserById, refreshTokens } from './auth.service';
 import type { AuthRequest } from '../../middleware/auth.middleware';
 import type { ApiResponse, AuthSession } from '@saas/types';
 
@@ -43,4 +43,18 @@ export async function getMe(req: AuthRequest, res: Response, next: NextFunction)
 export function logout(_req: AuthRequest, res: Response): void {
   const response: ApiResponse = { success: true, data: { message: 'Logged out successfully' } };
   res.json(response);
+}
+
+export async function refresh(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const { refreshToken } = req.body as { refreshToken?: string };
+    if (!refreshToken) {
+      res.status(400).json({ success: false, error: { code: 'BAD_REQUEST', message: 'refreshToken is required' } });
+      return;
+    }
+    const tokens = await refreshTokens(refreshToken);
+    res.json({ success: true, data: tokens } as ApiResponse);
+  } catch (err) {
+    next(err);
+  }
 }

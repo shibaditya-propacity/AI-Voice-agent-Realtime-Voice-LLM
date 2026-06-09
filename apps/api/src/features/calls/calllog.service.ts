@@ -1,5 +1,6 @@
 import { prisma } from '../../lib/prisma';
 import { v4 as uuidv4 } from 'uuid';
+import { updateJobByCallSid } from '../call-center/call-jobs/call-jobs.service';
 
 export interface TranscriptTurn {
   role: 'USER' | 'ASSISTANT' | 'SYSTEM';
@@ -33,7 +34,6 @@ export async function saveCallLog(input: SaveCallLogInput) {
     const lead = await prisma.lead.findFirst({
       where: {
         phone: {
-          // Normalize: strip spaces/dashes, match suffix to handle +91 vs 91 vs 0 prefixes
           endsWith: phone.replace(/[\s\-\(\)]/g, '').slice(-10),
         },
       },
@@ -56,30 +56,39 @@ export async function saveCallLog(input: SaveCallLogInput) {
       language: input.language ?? 'en',
       summary: input.summary ?? null,
       recordingUrl: input.recordingUrl ?? null,
+      status: 'COMPLETED',
     },
     update: {
       leadId: leadId ?? undefined,
       duration: input.duration ?? undefined,
       summary: input.summary ?? undefined,
       recordingUrl: input.recordingUrl ?? undefined,
+      status: 'COMPLETED',
     },
   }) as { id: string; callSid: string; [key: string]: unknown };
 
-  // Save transcript turns linked to this specific call log (raw SQL — callLogId not in
-  // generated client until prisma generate runs on Node 20+)
-  if (input.transcript && input.transcript.length > 0 && leadId) {
+  // Save transcript turns — always, regardless of whether a Lead matched
+  if (input.transcript && input.transcript.length > 0) {
     await prisma.$executeRaw`DELETE FROM "Conversation" WHERE "callLogId" = ${log.id}`;
 
     for (const turn of input.transcript) {
+      if (turn.role === 'SYSTEM') continue;
       const turnId = uuidv4();
       const lang = turn.language ?? input.language ?? 'en';
       const ts = turn.createdAt ? new Date(turn.createdAt) : new Date();
+      // leadId is nullable — insert NULL when no matching Lead
       await prisma.$executeRaw`
         INSERT INTO "Conversation" (id, "leadId", "callLogId", role, content, language, "createdAt")
         VALUES (${turnId}, ${leadId}, ${log.id}, ${turn.role}::"ConversationRole", ${turn.content}, ${lang}, ${ts})
       `;
     }
   }
+
+  // Update any matching CallJob (outbound call center calls)
+  await updateJobByCallSid(input.callSid, {
+    status: 'COMPLETED',
+    endedAt: new Date(),
+  }).catch(() => { /* job may not exist for inbound calls */ });
 
   return log;
 }

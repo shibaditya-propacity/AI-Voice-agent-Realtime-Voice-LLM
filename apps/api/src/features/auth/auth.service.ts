@@ -91,3 +91,17 @@ export async function getUserById(id: string): Promise<User | null> {
   if (!dbUser) return null;
   return dbUserToApiUser(dbUser);
 }
+
+export async function refreshTokens(refreshToken: string): Promise<AuthTokens> {
+  let payload: { userId: string };
+  try {
+    payload = jwt.verify(refreshToken, Env.jwt.secret) as { userId: string };
+  } catch {
+    throw new AppError(401, 'INVALID_TOKEN', 'Invalid or expired refresh token');
+  }
+
+  const dbUser = await prisma.user.findUnique({ where: { id: payload.userId } });
+  if (!dbUser) throw new AppError(401, 'INVALID_TOKEN', 'User not found');
+
+  return generateTokens(dbUserToApiUser(dbUser));
+}

@@ -13,10 +13,14 @@ import {
   Volume2,
   MessageSquare,
   Globe,
+  PhoneCall,
+  CheckCircle2,
+  XCircle,
+  PhoneMissed,
 } from 'lucide-react';
 import { useCallsList, useCallStats, useCallDetail } from '@/features/calls/hooks/useCalls';
 import { useState, useRef } from 'react';
-import type { CallLog } from '@/features/calls/api/callsApi';
+import type { CallLog, CallStatus } from '@/features/calls/api/callsApi';
 
 function formatDuration(seconds: number): string {
   if (!seconds) return '—';
@@ -52,6 +56,24 @@ function LanguageBadge({ lang }: { lang: string }) {
     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 text-xs font-medium">
       <Globe className="h-3 w-3" />
       {label}
+    </span>
+  );
+}
+
+const STATUS_CONFIG: Record<CallStatus, { label: string; color: string; Icon: React.ElementType; pulse?: boolean }> = {
+  DIALING:   { label: 'Calling',   color: 'bg-blue-50 text-blue-600 border-blue-100',   Icon: PhoneCall,     pulse: true },
+  COMPLETED: { label: 'Completed', color: 'bg-green-50 text-green-700 border-green-100', Icon: CheckCircle2 },
+  FAILED:    { label: 'Failed',    color: 'bg-red-50 text-red-600 border-red-100',       Icon: XCircle },
+  NO_ANSWER: { label: 'No Answer', color: 'bg-gray-50 text-gray-500 border-gray-100',    Icon: PhoneMissed },
+};
+
+function StatusBadge({ status }: { status: CallStatus }) {
+  const cfg = STATUS_CONFIG[status] ?? STATUS_CONFIG.COMPLETED;
+  const { Icon } = cfg;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-xs font-medium ${cfg.color}`}>
+      <Icon className={`h-3 w-3 ${cfg.pulse ? 'animate-pulse' : ''}`} />
+      {cfg.label}
     </span>
   );
 }
@@ -166,20 +188,24 @@ function TranscriptPanel({ callId }: { callId: string }) {
 
 function CallRow({ log, expanded, onToggle }: { log: CallLog; expanded: boolean; onToggle: () => void }) {
   const caller = log.Lead?.name ?? log.from ?? '—';
+  const isActive = log.status === 'DIALING';
   return (
-    <div className="border-b border-gray-50 last:border-0">
+    <div className={`border-b border-gray-50 last:border-0 ${isActive ? 'bg-blue-50/30' : ''}`}>
       <button
         onClick={onToggle}
-        className="w-full text-left grid grid-cols-6 gap-4 px-6 py-3.5 hover:bg-gray-50/70 transition-colors items-start"
+        className="w-full text-left grid grid-cols-7 gap-3 px-6 py-3.5 hover:bg-gray-50/70 transition-colors items-start"
       >
         <div className="col-span-2 min-w-0">
           <p className="text-sm font-medium text-gray-900 truncate">{caller}</p>
           <p className="text-xs text-gray-400 mt-0.5 truncate">{log.from ?? '—'}</p>
         </div>
-        <span className="text-sm text-gray-600">{formatDate(log.createdAt)}</span>
-        <span className="text-sm text-gray-600">{formatDuration(log.duration)}</span>
         <div>
-          <LanguageBadge lang={log.language} />
+          <StatusBadge status={log.status ?? 'COMPLETED'} />
+        </div>
+        <span className="text-sm text-gray-600">{formatDate(log.createdAt)}</span>
+        <span className="text-sm text-gray-600">{isActive ? '—' : formatDuration(log.duration)}</span>
+        <div>
+          {!isActive && <LanguageBadge lang={log.language} />}
         </div>
         <div className="flex items-center justify-between gap-2">
           <p className="text-sm text-gray-500 truncate flex-1">{log.summary ?? '—'}</p>
@@ -307,8 +333,9 @@ export default function CallsPage() {
         </div>
 
         {/* Table header */}
-        <div className="hidden sm:grid grid-cols-6 gap-4 px-6 py-3 bg-gray-50 border-b border-gray-100 text-xs font-medium text-gray-500 uppercase tracking-wide">
+        <div className="hidden sm:grid grid-cols-7 gap-3 px-6 py-3 bg-gray-50 border-b border-gray-100 text-xs font-medium text-gray-500 uppercase tracking-wide">
           <span className="col-span-2">Caller</span>
+          <span>Status</span>
           <span>Date &amp; Time</span>
           <span>Duration</span>
           <span>Language</span>

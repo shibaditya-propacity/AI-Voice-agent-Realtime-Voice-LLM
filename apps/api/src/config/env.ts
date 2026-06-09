@@ -13,4 +13,8 @@ export const Env = {
   cors: {
     origin: optionalEnv('CORS_ORIGIN', 'http://localhost:3000'),
   },
+  voiceServer: {
+    url: optionalEnv('VOICE_SERVER_URL', 'http://localhost:8080'),
+    internalSecret: optionalEnv('INTERNAL_API_SECRET', ''),
+  },
 } as const;
