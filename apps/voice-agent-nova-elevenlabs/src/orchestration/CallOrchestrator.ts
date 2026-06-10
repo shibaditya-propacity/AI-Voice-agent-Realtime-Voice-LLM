@@ -17,7 +17,7 @@
  *
  * Barge-in flow:
  *   1. Deepgram VAD fires `SpeechStarted` while state === SPEAKING
- *   2. BargeInDetector confirms (or RMS backup triggers)
+ *   2. BargeInDetector confirms via VAD path (RMS path disabled — PSTN echo)
  *   3. ElevenLabs stream aborted, generation AbortController signalled
  *   4. Twilio `clear` sent (flushes Twilio's jitter buffer)
  *   5. Partial assistant message discarded from history
@@ -149,10 +149,11 @@ export class CallOrchestrator {
 
     const pcmu = Buffer.from(audioBase64, 'base64');
 
-    // Check for energy-based barge-in (backup path)
-    if (this.state === 'SPEAKING' || this.state === 'GENERATING') {
-      this.bargeIn.processAudio(pcmu);
-    }
+    // RMS energy barge-in path intentionally disabled.
+    // On PSTN calls the speaker echo of Arjun's TTS sustains at RMS ~31000-32000
+    // for the entire TTS playback duration, indistinguishable from real speech.
+    // No grace period value eliminates this — it just shifts when the false trigger
+    // fires. Deepgram VAD (handleSpeechStarted) is the sole barge-in path.
 
     // Forward raw PCMU to Deepgram — no codec conversion needed.
     this.stt.sendAudio(pcmu);
@@ -330,7 +331,15 @@ export class CallOrchestrator {
 
     let fullText = '';
     let firstToken = true;
-    let firstTextToTTS = true;
+
+    // Buffer initial LLM text until chunk_length_schedule[0]=50 chars so that
+    // ElevenLabs immediately begins audio generation on the first send rather
+    // than waiting for enough text to accumulate token-by-token. Without this,
+    // TTS latency scales with response length (227ms→529ms→781ms) because
+    // ElevenLabs holds audio until it has enough text for a prosody unit.
+    let ttsTextBuffer = '';
+    let initialBufferFlushed = false;
+    const TTS_INITIAL_BUFFER_CHARS = 50;
 
     try {
       const stream = this.llm.stream(this.conversation.toMessages(), signal);
@@ -349,13 +358,24 @@ export class CallOrchestrator {
             this.log.info('LLM first token received');
           }
 
-          if (firstTextToTTS) {
-            firstTextToTTS = false;
-            this.latency.mark('tts_first_text');
+          if (!initialBufferFlushed) {
+            ttsTextBuffer += text;
+            if (ttsTextBuffer.length >= TTS_INITIAL_BUFFER_CHARS) {
+              initialBufferFlushed = true;
+              this.latency.mark('tts_first_text');
+              tts.streamText(ttsTextBuffer);
+              ttsTextBuffer = '';
+            }
+          } else {
+            tts.streamText(text);
           }
-
-          tts.streamText(text);
         }
+      }
+
+      // Short response: buffer never hit threshold — flush now so TTS gets the text
+      if (!initialBufferFlushed && ttsTextBuffer) {
+        this.latency.mark('tts_first_text');
+        tts.streamText(ttsTextBuffer);
       }
     } catch (err) {
       const e = err as Error;

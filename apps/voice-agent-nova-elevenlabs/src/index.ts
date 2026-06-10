@@ -8,6 +8,7 @@ import 'dotenv/config';
 import { Env } from './config/env';
 import { rootLogger } from './shared/logger';
 import { createApp } from './app';
+import { warmUpBedrock } from './llm/BedrockLLM';
 
 const log = rootLogger;
 
@@ -29,6 +30,10 @@ async function main(): Promise<void> {
     log.info(`Health check: http://localhost:${Env.server.port}/health`);
     log.info(`Twilio webhook: POST /webhooks/twilio/voice`);
     log.info(`WebSocket stream: ws://localhost:${Env.server.port}/stream`);
+
+    // Fire-and-forget: establish HTTP keep-alive + seed Bedrock prompt cache.
+    // First real call will hit cache instead of cold-starting.
+    void warmUpBedrock();
   });
 
   // ─── Graceful Shutdown ─────────────────────────────────────────────────────
