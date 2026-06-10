@@ -34,10 +34,12 @@ export class BargeInDetector {
   /**
    * Timestamp when arm() was last called.
    * Barge-in is suppressed for ARM_GRACE_MS after arming to avoid
-   * false positives from call-connect noise and ring-down artifacts.
+   * false positives from PSTN echo and call-connect noise.
+   * Default 1500ms: PSTN echo of TTS audio (RMS ~32512) can sustain for
+   * 600ms+ — a 600ms grace was too short and caused false barge-ins.
    */
   private armedAt = 0;
-  private readonly ARM_GRACE_MS = 600;
+  private readonly ARM_GRACE_MS: number;
 
   private onBargeIn?: BargeInCallback;
   private active = false;
@@ -47,6 +49,7 @@ export class BargeInDetector {
     this.rmsThreshold  = Env.bargeIn.rmsThreshold;
     this.confirmMs     = Env.bargeIn.confirmMs;
     this.cooldownMs    = Env.bargeIn.cooldownMs;
+    this.ARM_GRACE_MS  = Env.bargeIn.graceMs;
   }
 
   onInterruption(cb: BargeInCallback): this { this.onBargeIn = cb; return this; }

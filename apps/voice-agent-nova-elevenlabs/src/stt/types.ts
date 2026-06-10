@@ -14,6 +14,10 @@ export interface DeepgramResult {
   from_finalize: boolean;
   start: number;
   duration: number;
+  /** Populated when detect_language=true — shows which language Deepgram chose. */
+  channel_index?: number[];
+  detected_language?: string;
+  language_confidence?: number;
 }
 
 export interface DeepgramSpeechStarted {

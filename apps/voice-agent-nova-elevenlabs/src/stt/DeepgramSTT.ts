@@ -63,22 +63,35 @@ export class DeepgramSTT {
   connect(): void {
     if (this.closed) return;
 
+    // When multilingual=true, use language=hi — Nova-3's Hindi model.
+    // Reasons for 'hi' over 'multi':
+    //   - 'multi' causes excessive SpeechStarted events for background noise,
+    //     resetting the UtteranceEnd timer repeatedly → 7+ second transcript delays
+    //   - 'hi' is trained on Indian speech (Hindi + English loanwords), handles
+    //     Hinglish naturally, fires speech_final reliably on 200ms silence
+    //   - 'detect_language' returns HTTP 400 on the streaming WebSocket endpoint
+    const effectiveLanguage = Env.deepgram.multilingual ? 'hi' : Env.deepgram.language;
+
     const params = new URLSearchParams({
-      model:              Env.deepgram.model,
-      language:           Env.deepgram.language,
-      encoding:           'mulaw',
-      sample_rate:        '8000',
-      channels:           '1',
-      interim_results:    'true',
-      smart_format:       'true',
-      vad_events:         'true',
-      endpointing:        String(Env.deepgram.endpointingMs),
-      utterance_end_ms:   String(Env.deepgram.utteranceEndMs),
+      model:            Env.deepgram.model,
+      language:         effectiveLanguage,
+      encoding:         'mulaw',
+      sample_rate:      '8000',
+      channels:         '1',
+      interim_results:  'true',
+      smart_format:     'true',
+      vad_events:       'true',
+      endpointing:      String(Env.deepgram.endpointingMs),
+      utterance_end_ms: String(Env.deepgram.utteranceEndMs),
     });
 
     const url = `${DEEPGRAM_WS_URL}?${params.toString()}`;
 
-    this.log.info('Connecting to Deepgram', { model: Env.deepgram.model, language: Env.deepgram.language });
+    this.log.info('Connecting to Deepgram', {
+      model:        Env.deepgram.model,
+      language:     effectiveLanguage,
+      multilingual: Env.deepgram.multilingual,
+    });
 
     const ws = new WebSocket(url, {
       headers: { Authorization: `Token ${Env.deepgram.apiKey}` },
@@ -181,7 +194,25 @@ export class DeepgramSTT {
 
     const { transcript, confidence } = alt;
 
-    if (!transcript.trim()) return;
+    // Log all interim (partial) results for visibility — these show Deepgram
+    // is actively recognizing audio. Absence of these in logs = recognition failure.
+    if (!msg.is_final && !msg.speech_final) {
+      if (transcript.trim()) {
+        this.log.debug('Deepgram: interim transcript', { transcript, confidence });
+      }
+      return;
+    }
+
+    // Empty is_final/speech_final = Deepgram heard audio but couldn't decode it.
+    // Common cause: language mismatch (e.g. Hindi audio with language=en-IN).
+    if (!transcript.trim()) {
+      this.log.warn('Deepgram: empty transcript on finalization', {
+        is_final: msg.is_final,
+        speech_final: msg.speech_final,
+        bufferedSegments: this.isFinalBuffer.length,
+      });
+      return;
+    }
 
     if (msg.speech_final) {
       // speech_final: Deepgram's endpointing fired — emit immediately,
@@ -189,13 +220,23 @@ export class DeepgramSTT {
       const full = [...this.isFinalBuffer, transcript.trim()].join(' ').trim();
       this.isFinalBuffer = [];
       this.isFinalConfidence = 0;
-      this.log.info('Deepgram: speech_final transcript', { transcript: full, confidence });
+      this.log.info('Deepgram: speech_final transcript', {
+        transcript: full,
+        confidence,
+        detectedLanguage: msg.detected_language,
+        languageConfidence: msg.language_confidence,
+      });
       this.onFinalTranscript?.(full, confidence);
     } else if (msg.is_final) {
       // is_final without speech_final: accumulate — UtteranceEnd will flush.
       this.isFinalBuffer.push(transcript.trim());
       this.isFinalConfidence = confidence;
-      this.log.info('Deepgram: is_final (buffered, awaiting UtteranceEnd)', { transcript, segments: this.isFinalBuffer.length });
+      this.log.info('Deepgram: is_final (buffered, awaiting UtteranceEnd)', {
+        transcript,
+        segments: this.isFinalBuffer.length,
+        detectedLanguage: msg.detected_language,
+        languageConfidence: msg.language_confidence,
+      });
     }
   }
 
@@ -204,7 +245,10 @@ export class DeepgramSTT {
    * Called on UtteranceEnd (silence-based) or manually on call finalize.
    */
   private flushIsFinalBuffer(trigger: string): void {
-    if (this.isFinalBuffer.length === 0) return;
+    if (this.isFinalBuffer.length === 0) {
+      this.log.debug('Deepgram: UtteranceEnd with empty buffer (no recognized speech)', { trigger });
+      return;
+    }
     const full = this.isFinalBuffer.join(' ').trim();
     const conf = this.isFinalConfidence;
     this.isFinalBuffer = [];
