@@ -90,6 +90,47 @@ export class CallOrchestrator {
    */
   private suppressBargeInArm = false;
 
+  // ─── Noise / False VAD Suppression ──────────────────────────────────────
+
+  /** Timestamp when TTS last finished playing — used to suppress PSTN echo VAD. */
+  private lastTTSCompleteAt = 0;
+
+  /** Ignore VAD events for this long after TTS ends (PSTN echo dies down).
+   *  1500ms: PSTN echo of TTS audio sustains at ~1-1.3s on most calls. */
+  private readonly POST_TTS_VAD_SUPPRESS_MS = 1500;
+
+  /**
+   * Tracks how many consecutive SpeechStarted events had no real transcript.
+   * Incremented when a new SpeechStarted fires and the previous one never
+   * produced a transcript. Reset to 0 when a real transcript arrives.
+   */
+  private consecutiveEmptyVADs = 0;
+
+  /** Suppress TTS pre-warming after this many consecutive empty VAD cycles. */
+  private readonly MAX_EMPTY_VADS_FOR_PREWARM = 2;
+
+  /** Timestamp of the last SpeechStarted event. */
+  private lastVADAt = 0;
+
+  /** Timestamp of the last real transcript received. */
+  private lastTranscriptAt = 0;
+
+  // ─── Playback Duration Tracking ──────────────────────────────────────
+  // ElevenLabs generates all audio in ~200ms but Twilio plays it over 3-5s.
+  // We must keep barge-in armed and state=SPEAKING for the full playback.
+
+  /** Total raw audio bytes sent to Twilio in the current generation. */
+  private ttsAudioBytesSent = 0;
+
+  /** Timestamp when first TTS audio chunk was sent to Twilio. */
+  private firstTTSAudioSentAt = 0;
+
+  /** Timer that transitions SPEAKING→LISTENING after estimated playback completes. */
+  private playbackCompleteTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Whether TTS generation is done (all chunks received from ElevenLabs). */
+  private ttsGenerationDone = false;
+
   constructor(callSid: string, twilioService: TwilioService) {
     this.callSid        = callSid;
     this.twilioService  = twilioService;
@@ -155,6 +196,7 @@ export class CallOrchestrator {
     setTimeout(() => {
       if (this.state === 'SPEAKING' || this.state === 'IDLE') {
         this.state = 'LISTENING';
+        this.lastTTSCompleteAt = Date.now();
         this.log.info('Greeting playback complete, now LISTENING', { playbackMs });
       }
     }, playbackMs);
@@ -199,6 +241,12 @@ export class CallOrchestrator {
     this.latency.mark('call_end');
 
     this.bargeIn.disarm();
+
+    // Cancel playback timer
+    if (this.playbackCompleteTimer) {
+      clearTimeout(this.playbackCompleteTimer);
+      this.playbackCompleteTimer = null;
+    }
 
     // Abort any active generation
     this.abortController?.abort();
@@ -260,18 +308,58 @@ export class CallOrchestrator {
   // ─── VAD / Speech Events ──────────────────────────────────────────────────
 
   private handleSpeechStarted(): void {
+    const now = Date.now();
+
+    // ── Track consecutive empty VADs ─────────────────────────────────────
+    // If the previous SpeechStarted never produced a transcript, it was noise.
+    if (this.lastVADAt > 0 && this.lastVADAt > this.lastTranscriptAt) {
+      this.consecutiveEmptyVADs++;
+    }
+    this.lastVADAt = now;
+
+    // ── SPEAKING/GENERATING: log VAD but do NOT fire barge-in ───────────
+    // On PSTN, background noise and echo produce VAD events that are
+    // indistinguishable from real speech. Firing barge-in on a single VAD
+    // causes false interruptions — the agent stops mid-sentence for noise.
+    //
+    // Instead, barge-in during SPEAKING is TRANSCRIPT-GATED:
+    //   - VAD fires here → logged only (no bargeIn.handleSpeechStarted)
+    //   - If it was real speech → Deepgram produces a transcript in ~300-500ms
+    //   - handleFinalTranscript() detects state=SPEAKING and calls
+    //     handleInterruption() — this is the actual barge-in path.
+    //   - If it was noise → no transcript → no interruption.
+    //
+    // Trade-off: ~300-500ms more overlap where both user and agent are
+    // audible. This is natural conversational turn-taking behaviour and
+    // far preferable to false interruptions from background noise.
+    if (this.state === 'SPEAKING' || this.state === 'GENERATING') {
+      this.log.debug('VAD during agent speech (transcript-gated, not firing barge-in)', {
+        state: this.state,
+        consecutiveEmptyVADs: this.consecutiveEmptyVADs,
+      });
+      return;
+    }
+
+    // ── LISTENING: noise suppression for TTS pre-warming ────────────────
+    // Post-TTS echo suppression (1.5s after TTS ends)
+    const msSinceTTS = now - this.lastTTSCompleteAt;
+    if (this.lastTTSCompleteAt > 0 && msSinceTTS < this.POST_TTS_VAD_SUPPRESS_MS) {
+      this.log.debug('VAD ignored (post-TTS echo)', { msSinceTTS });
+      return;
+    }
+
+    // Suppress persistent ambient noise (2+ consecutive empty VADs)
+    if (this.consecutiveEmptyVADs >= this.MAX_EMPTY_VADS_FOR_PREWARM) {
+      this.log.debug('VAD ignored (noise — consecutive empty VADs)', {
+        count: this.consecutiveEmptyVADs,
+      });
+      return;
+    }
+
+    // ── Valid speech in LISTENING state ──────────────────────────────────
     this.latency.mark('speech_started');
     this.log.info('Speech started (VAD)', { state: this.state });
-
-    if (this.state === 'LISTENING') {
-      // Start pre-warming TTS during user's speech window to hide connect latency
-      this.prewarmTTS();
-    }
-
-    // Primary barge-in path: Deepgram VAD detected voice during AI speech
-    if (this.state === 'SPEAKING' || this.state === 'GENERATING') {
-      this.bargeIn.handleSpeechStarted();
-    }
+    this.prewarmTTS();
   }
 
   // ─── Final Transcript ─────────────────────────────────────────────────────
@@ -279,6 +367,10 @@ export class CallOrchestrator {
   private handleFinalTranscript(text: string, confidence: number): void {
     if (this.state === 'ENDED') return;
     if (!text.trim()) return;
+
+    // ── Reset noise tracking — real speech confirmed ────────────────────
+    this.consecutiveEmptyVADs = 0;
+    this.lastTranscriptAt = Date.now();
 
     const transcriptAt = Date.now();
     this.latency.mark('speech_final', transcriptAt);
@@ -289,10 +381,14 @@ export class CallOrchestrator {
       speechFinalToNowMs: 0, // this IS the speech_final event
     });
 
-    // If we're still generating/speaking, the barge-in should have fired first.
-    // If it somehow didn't, treat arriving transcript as an interrupt.
+    // Transcript-gated barge-in: if the agent is still speaking, a real
+    // transcript (not just VAD) is the authoritative signal to interrupt.
+    // This avoids false barge-ins from background noise on PSTN.
     if (this.state === 'SPEAKING' || this.state === 'GENERATING') {
-      this.log.warn('Transcript arrived while AI active — forcing interruption');
+      this.log.info('Transcript-gated barge-in: real speech confirmed during agent speech', {
+        text,
+        state: this.state,
+      });
       this.handleInterruption();
     }
 
@@ -316,6 +412,15 @@ export class CallOrchestrator {
   private async generateAndSpeak(opts: { suppressBargeIn?: boolean } = {}): Promise<void> {
     const myGenId = ++this.generationId;
     this.activeResponseText = '';
+
+    // Reset playback tracking for this generation
+    this.ttsAudioBytesSent = 0;
+    this.firstTTSAudioSentAt = 0;
+    this.ttsGenerationDone = false;
+    if (this.playbackCompleteTimer) {
+      clearTimeout(this.playbackCompleteTimer);
+      this.playbackCompleteTimer = null;
+    }
 
     this.abortController = new AbortController();
     const { signal } = this.abortController;
@@ -364,16 +469,11 @@ export class CallOrchestrator {
     let fullText = '';
     let firstToken = true;
 
-    // Buffer initial LLM text until chunk_length_schedule[0]=50 chars so that
-    // ElevenLabs immediately begins audio generation on the first send rather
-    // than waiting for enough text to accumulate token-by-token. Without this,
-    // TTS latency scales with response length (227ms→529ms→781ms) because
-    // ElevenLabs holds audio until it has enough text for a prosody unit.
-    let ttsTextBuffer = '';
-    let initialBufferFlushed = false;
-    // Must match ElevenLabs chunk_length_schedule[0] minimum (50).
-    // try_trigger_generation=true on first send bypasses the schedule anyway.
-    const TTS_INITIAL_BUFFER_CHARS = 50;
+    // ZERO BUFFERING: stream every token directly to TTS the instant it arrives.
+    // The first streamText() call uses try_trigger_generation=true (set in
+    // ElevenLabsTTS.streamText) which forces ElevenLabs to start synthesizing
+    // immediately without waiting for chunk_length_schedule. This eliminates
+    // the ~300-450ms buffer delay from the previous 50-char buffering approach.
 
     try {
       const stream = this.llm.stream(this.conversation.toMessages(), signal);
@@ -389,27 +489,13 @@ export class CallOrchestrator {
           if (firstToken) {
             firstToken = false;
             this.latency.mark('llm_first_token');
-            this.log.info('LLM first token received');
+            this.latency.mark('tts_first_text');
+            this.log.info('LLM first token received — streaming to TTS immediately');
           }
 
-          if (!initialBufferFlushed) {
-            ttsTextBuffer += text;
-            if (ttsTextBuffer.length >= TTS_INITIAL_BUFFER_CHARS) {
-              initialBufferFlushed = true;
-              this.latency.mark('tts_first_text');
-              tts.streamText(ttsTextBuffer);
-              ttsTextBuffer = '';
-            }
-          } else {
-            tts.streamText(text);
-          }
+          // Stream every token directly to TTS — no buffering
+          tts.streamText(text);
         }
-      }
-
-      // Short response: buffer never hit threshold — flush now so TTS gets the text
-      if (!initialBufferFlushed && ttsTextBuffer) {
-        this.latency.mark('tts_first_text');
-        tts.streamText(ttsTextBuffer);
       }
     } catch (err) {
       const e = err as Error;
@@ -454,6 +540,7 @@ export class CallOrchestrator {
 
     if (!this.latency.hasMarked('tts_first_audio')) {
       this.latency.mark('tts_first_audio');
+      this.firstTTSAudioSentAt = Date.now();
       this.log.info('TTS first audio chunk received');
 
       // Arm barge-in HERE — not at generation start — so that trailing audio
@@ -464,6 +551,10 @@ export class CallOrchestrator {
         this.bargeIn.arm();
       }
     }
+
+    // Track raw audio bytes for playback duration estimation.
+    // Base64 encodes 3 bytes into 4 chars → raw bytes = base64.length * 0.75
+    this.ttsAudioBytesSent += Math.floor(audioBase64.length * 0.75);
 
     // ElevenLabs ulaw_8000 base64 → send directly to Twilio (same format, zero conversion)
     this.twilioService.sendAudio(this.callSid, audioBase64);
@@ -477,14 +568,53 @@ export class CallOrchestrator {
     if (genId !== this.generationId) return;
 
     this.latency.mark('tts_complete');
-    this.log.info('TTS complete');
+    this.tts = null;
+    this.ttsGenerationDone = true;
+
+    // Calculate remaining playback time on Twilio.
+    // ulaw_8000 = 8000 bytes/sec → totalBytes / 8000 = duration in seconds.
+    const totalPlaybackMs = (this.ttsAudioBytesSent / 8000) * 1000;
+    const elapsedMs = Date.now() - this.firstTTSAudioSentAt;
+    const remainingMs = Math.max(0, totalPlaybackMs - elapsedMs);
+
+    this.log.info('TTS generation complete — waiting for Twilio playback', {
+      totalPlaybackMs: Math.round(totalPlaybackMs),
+      elapsedMs: Math.round(elapsedMs),
+      remainingMs: Math.round(remainingMs),
+      audioBytes: this.ttsAudioBytesSent,
+    });
+
     this.latency.logTurnSummary(this.conversation.currentTurn);
 
-    this.tts = null;
+    if (remainingMs <= 0) {
+      // Playback already finished (very short response)
+      this.transitionToListeningAfterPlayback(genId);
+      return;
+    }
+
+    // Keep SPEAKING + barge-in armed until playback completes.
+    // If user interrupts during this window, handleInterruption() cancels the timer.
+    this.playbackCompleteTimer = setTimeout(() => {
+      this.playbackCompleteTimer = null;
+      if (genId === this.generationId) {
+        this.transitionToListeningAfterPlayback(genId);
+      }
+    }, remainingMs);
+  }
+
+  /**
+   * Transition from SPEAKING → LISTENING after Twilio finishes playing audio.
+   * Called either immediately (short responses) or after the playback timer fires.
+   */
+  private transitionToListeningAfterPlayback(genId: number): void {
+    if (genId !== this.generationId) return;
+
     this.bargeIn.disarm();
+    this.lastTTSCompleteAt = Date.now();
 
     if (this.state !== 'ENDED') {
       this.state = 'LISTENING';
+      this.log.info('Playback complete — now LISTENING');
     }
   }
 
@@ -493,8 +623,18 @@ export class CallOrchestrator {
   private handleInterruption(): void {
     if (this.state !== 'SPEAKING' && this.state !== 'GENERATING') return;
 
-    this.log.info('Barge-in: interrupting AI response', { state: this.state });
+    this.log.info('Barge-in: interrupting AI response', {
+      state: this.state,
+      ttsGenerationDone: this.ttsGenerationDone,
+      audioBytesSent: this.ttsAudioBytesSent,
+    });
     this.latency.mark('barge_in');
+
+    // Cancel playback-complete timer (barge-in supersedes it)
+    if (this.playbackCompleteTimer) {
+      clearTimeout(this.playbackCompleteTimer);
+      this.playbackCompleteTimer = null;
+    }
 
     // Bump generation ID — marks all in-flight audio/text as stale
     this.generationId++;
