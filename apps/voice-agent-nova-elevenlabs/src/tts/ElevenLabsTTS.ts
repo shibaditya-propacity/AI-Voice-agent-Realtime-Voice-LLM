@@ -105,6 +105,8 @@ export class ElevenLabsTTS {
         generation_config: {
           // Start streaming audio after this many characters have accumulated.
           // Lower = lower latency, higher = better prosody.
+          // ElevenLabs minimum is 50. With try_trigger_generation=true on first
+          // send, audio generation starts immediately regardless of schedule.
           chunk_length_schedule: [50, 120, 200],
         },
         xi_api_key: Env.elevenlabs.apiKey,

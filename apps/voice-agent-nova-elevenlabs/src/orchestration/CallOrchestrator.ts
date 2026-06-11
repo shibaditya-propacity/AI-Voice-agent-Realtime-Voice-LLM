@@ -28,6 +28,7 @@
 import { DeepgramSTT } from '../stt/DeepgramSTT';
 import { BedrockLLM }  from '../llm/BedrockLLM';
 import { ElevenLabsTTS } from '../tts/ElevenLabsTTS';
+import { hasGreetingAudio, getGreetingChunks } from '../tts/GreetingCache';
 import { BargeInDetector } from '../interruption/BargeInDetector';
 import { ConversationManager } from '../llm/ConversationManager';
 import { LatencyTracker } from '../metrics/LatencyTracker';
@@ -119,23 +120,54 @@ export class CallOrchestrator {
     this.stt.connect();
     this.log.info('Call orchestrator ready', { state: this.state });
 
-    // Send greeting immediately — agent speaks first so caller isn't met with silence
-    void this.sendGreeting();
+    // Send greeting immediately — agent speaks first so caller isn't met with silence.
+    // Pre-recorded greeting plays instantly; LLM+TTS warmup happens in parallel.
+    if (hasGreetingAudio()) {
+      this.sendCachedGreeting();
+    } else {
+      void this.sendLLMGreeting();
+    }
   }
 
   /**
-   * Generates and speaks an opening greeting via LLM + TTS.
-   * Uses a synthetic prompt so no real user turn is added to history.
+   * Stream pre-recorded greeting audio directly to Twilio — zero LLM/TTS latency.
+   * While audio plays (~3s), pre-warm ElevenLabs so the first real response is fast.
    */
-  private async sendGreeting(): Promise<void> {
-    this.log.info('Sending greeting');
+  private sendCachedGreeting(): void {
+    const chunks = getGreetingChunks();
+    this.log.info('Playing pre-recorded greeting', { chunks: chunks.length });
+    this.latency.mark('greeting_start');
+    this.state = 'SPEAKING';
+    this.suppressBargeInArm = true; // No barge-in during greeting
+
+    // Stream all chunks to Twilio immediately — Twilio buffers and plays in order
+    for (const chunk of chunks) {
+      this.twilioService.sendAudio(this.callSid, chunk);
+    }
+    this.log.info('Pre-recorded greeting sent to Twilio');
+
+    // Pre-warm TTS connection while greeting plays — hides ~300-500ms
+    this.prewarmTTS();
+
+    // Greeting is ~3-4s of audio. Estimate playback duration and transition to LISTENING.
+    // 160 bytes per chunk at 8kHz = 20ms per chunk.
+    const playbackMs = chunks.length * 20;
+    setTimeout(() => {
+      if (this.state === 'SPEAKING' || this.state === 'IDLE') {
+        this.state = 'LISTENING';
+        this.log.info('Greeting playback complete, now LISTENING', { playbackMs });
+      }
+    }, playbackMs);
+  }
+
+  /**
+   * Fallback: generate greeting via LLM + TTS when no pre-recorded audio exists.
+   */
+  private async sendLLMGreeting(): Promise<void> {
+    this.log.info('Sending LLM-generated greeting (no cached audio)');
     this.conversation.addUserMessage(Env.llm.greetingPrompt);
     this.state = 'GENERATING';
-    // suppressBargeIn=true: greeting must play to completion — barge-in during
-    // greeting would just be Twilio connection noise, not a real user utterance.
     await this.generateAndSpeak({ suppressBargeIn: true });
-    // After greeting, remove the synthetic prompt from history so it
-    // doesn't pollute the real conversation context
     this.conversation.discardGreetingTurn();
   }
 
@@ -339,6 +371,8 @@ export class CallOrchestrator {
     // ElevenLabs holds audio until it has enough text for a prosody unit.
     let ttsTextBuffer = '';
     let initialBufferFlushed = false;
+    // Must match ElevenLabs chunk_length_schedule[0] minimum (50).
+    // try_trigger_generation=true on first send bypasses the schedule anyway.
     const TTS_INITIAL_BUFFER_CHARS = 50;
 
     try {

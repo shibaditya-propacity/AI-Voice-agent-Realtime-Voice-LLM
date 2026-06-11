@@ -4,6 +4,7 @@
  */
 
 import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources/messages/messages';
+import { Env } from '../config/env';
 import { Logger } from '../shared/logger';
 
 export class ConversationManager {
@@ -80,9 +81,28 @@ export class ConversationManager {
 
   // ─── Query ────────────────────────────────────────────────────────────────
 
-  /** Returns messages ready to pass to BedrockLLM.stream(). */
+  /**
+   * Returns messages ready to pass to BedrockLLM.stream().
+   * Applies a sliding window to cap context size on long calls.
+   * Prevents TTFT degradation as conversation grows.
+   */
   toMessages(): MessageParam[] {
-    return this.history;
+    const window = Env.llm.historyWindow;
+    if (this.history.length <= window) return this.history;
+
+    // Take last N messages, ensuring we start with a user message
+    // (Anthropic API requires messages to start with user role)
+    let start = this.history.length - window;
+    while (start < this.history.length && this.history[start]?.role !== 'user') {
+      start++;
+    }
+    const windowed = this.history.slice(start);
+    this.log.debug('History windowed', {
+      total: this.history.length,
+      sent: windowed.length,
+      window,
+    });
+    return windowed;
   }
 
   get messageCount(): number { return this.history.length; }
