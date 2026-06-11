@@ -9,6 +9,7 @@ import { Env } from './config/env';
 import { rootLogger } from './shared/logger';
 import { createApp } from './app';
 import { warmUpBedrock } from './llm/BedrockLLM';
+import { loadGreetingAudio } from './tts/GreetingCache';
 
 const log = rootLogger;
 
@@ -22,6 +23,9 @@ async function main(): Promise<void> {
     voiceId:   Env.elevenlabs.voiceId,
     language:  Env.deepgram.language,
   });
+
+  // Load pre-recorded greeting audio (raw ulaw 8kHz mono)
+  loadGreetingAudio('./assets/greet.raw');
 
   const { httpServer, shutdown } = createApp();
 
