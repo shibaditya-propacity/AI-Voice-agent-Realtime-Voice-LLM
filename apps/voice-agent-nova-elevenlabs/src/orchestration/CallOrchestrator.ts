@@ -72,14 +72,12 @@ export class CallOrchestrator {
   /** AbortController for the active LLM + TTS generation. */
   private abortController: AbortController | null = null;
 
-  /** Active ElevenLabs TTS stream (null when not speaking). */
-  private tts: ElevenLabsTTS | null = null;
-
   /**
-   * Pre-opened ElevenLabs WS — started during user speech to hide
-   * connection latency. Consumed by the next generateAndSpeak() call.
+   * Persistent ElevenLabs multi-context WS — opened once at call start and
+   * reused for every turn. Each generation is a context; barge-in closes
+   * the context, never the socket.
    */
-  private prewarmedTTS: ElevenLabsTTS | null = null;
+  private readonly tts: ElevenLabsTTS;
 
   /** Tracks the full text accumulated so far in the active generation. */
   private activeResponseText = '';
@@ -115,6 +113,19 @@ export class CallOrchestrator {
   /** Timestamp of the last real transcript received. */
   private lastTranscriptAt = 0;
 
+  // ─── No-Speech Recovery (dead-air prevention) ───────────────────────────
+  // When Deepgram repeatedly fails to decode the caller's speech (VAD fires,
+  // utterance ends, zero words), re-prompt instead of sitting silent.
+
+  /** Consecutive empty speech_final events while LISTENING. */
+  private emptyFinalStreak = 0;
+  private lastRepromptAt = 0;
+  private repromptCount = 0;
+  private readonly EMPTY_FINALS_BEFORE_REPROMPT = 2;
+  private readonly REPROMPT_MIN_GAP_MS = 8000;
+  private readonly MAX_REPROMPTS_PER_CALL = 3;
+  private readonly REPROMPT_TEXT = "Sorry, I didn't catch that. Could you say that again?";
+
   // ─── Playback Duration Tracking ──────────────────────────────────────
   // ElevenLabs generates all audio in ~200ms but Twilio plays it over 3-5s.
   // We must keep barge-in armed and state=SPEAKING for the full playback.
@@ -135,6 +146,7 @@ export class CallOrchestrator {
     this.callSid        = callSid;
     this.twilioService  = twilioService;
     this.stt            = new DeepgramSTT(callSid);
+    this.tts            = new ElevenLabsTTS(callSid);
     this.llm            = new BedrockLLM(callSid, globalToolRegistry);
     this.conversation   = new ConversationManager(callSid);
     this.latency        = new LatencyTracker(callSid);
@@ -152,13 +164,23 @@ export class CallOrchestrator {
     // Wire STT events
     this.stt
       .onSpeech(()               => this.handleSpeechStarted())
+      .onInterim((text)          => this.handleInterimTranscript(text))
       .onTranscript((text, conf) => this.handleFinalTranscript(text, conf))
+      .onNoSpeech(()             => this.handleNoSpeech())
       .onErr((err)               => this.log.error('STT error', err));
 
     // Wire barge-in detector
     this.bargeIn.onInterruption(() => this.handleInterruption());
 
+    // Wire the persistent TTS once — context ids encode the generation id
+    // ("g{n}"), so stale-context audio is dropped by the genId guard.
+    this.tts
+      .onAudio((audio, ctxId) => this.handleTTSAudio(audio, this.genIdFromContext(ctxId)))
+      .onDone((ctxId)         => this.handleTTSDone(this.genIdFromContext(ctxId)))
+      .onError((err)          => this.log.error('TTS error', err));
+
     this.stt.connect();
+    void this.tts.open().catch(() => { /* logged inside ElevenLabsTTS */ });
     this.log.info('Call orchestrator ready', { state: this.state });
 
     // Send greeting immediately — agent speaks first so caller isn't met with silence.
@@ -251,15 +273,8 @@ export class CallOrchestrator {
     // Abort any active generation
     this.abortController?.abort();
 
-    // Close TTS and any pre-warmed connection
-    if (this.tts) {
-      this.tts.abort();
-      this.tts = null;
-    }
-    if (this.prewarmedTTS) {
-      this.prewarmedTTS.abort();
-      this.prewarmedTTS = null;
-    }
+    // Close the persistent TTS socket for good
+    this.tts.destroy();
 
     // Finalize STT (flushes any pending transcript) then close immediately
     this.stt.finalize();
@@ -275,33 +290,18 @@ export class CallOrchestrator {
   // ─── TTS Prewarming ───────────────────────────────────────────────────────
 
   /**
-   * Open an ElevenLabs WebSocket during the user's speech window so it's
-   * already connected when generateAndSpeak() needs it. Hides ~300-500ms
-   * of TTS connection overhead from the critical path.
+   * Ensure the persistent ElevenLabs socket is connected. With the
+   * multi-context WS this is a no-op when already open; after an
+   * unexpected close it kicks off the background reconnect.
    */
   private prewarmTTS(): void {
-    // If existing prewarm is still active, don't replace it
-    if (this.prewarmedTTS?.isActive) return;
-
-    // Discard stale prewarm (ElevenLabs idle-timeout closes WS after ~10s)
-    if (this.prewarmedTTS) {
-      this.log.debug('Discarding stale pre-warmed TTS, re-prewarming');
-      this.prewarmedTTS.abort();
-      this.prewarmedTTS = null;
-    }
-
+    if (this.tts.isActive) return;
     this.latency.mark('tts_prewarm_start');
-    this.log.debug('Pre-warming ElevenLabs connection');
-
-    const tts = new ElevenLabsTTS(this.callSid);
-    this.prewarmedTTS = tts;
-
-    tts.open().then(() => {
+    this.tts.open().then(() => {
       this.latency.mark('tts_open');
-      this.log.info('ElevenLabs pre-warm ready');
+      this.log.info('ElevenLabs reconnected (was closed)');
     }).catch((err: Error) => {
-      this.log.warn('ElevenLabs pre-warm failed', { error: err.message });
-      if (this.prewarmedTTS === tts) this.prewarmedTTS = null;
+      this.log.warn('ElevenLabs reconnect failed', { error: err.message });
     });
   }
 
@@ -310,14 +310,11 @@ export class CallOrchestrator {
   private handleSpeechStarted(): void {
     const now = Date.now();
 
-    // ── Track consecutive empty VADs ─────────────────────────────────────
-    // If the previous SpeechStarted never produced a transcript, it was noise.
-    if (this.lastVADAt > 0 && this.lastVADAt > this.lastTranscriptAt) {
-      this.consecutiveEmptyVADs++;
-    }
-    this.lastVADAt = now;
-
     // ── SPEAKING/GENERATING: log VAD but do NOT fire barge-in ───────────
+    // NOTE: We intentionally do NOT update consecutiveEmptyVADs or lastVADAt
+    // during SPEAKING — those VADs are PSTN echo of our own TTS audio, not
+    // ambient noise. Counting them inflates the noise counter and blocks
+    // TTS pre-warming when the user speaks next in LISTENING state.
     // On PSTN, background noise and echo produce VAD events that are
     // indistinguishable from real speech. Firing barge-in on a single VAD
     // causes false interruptions — the agent stops mid-sentence for noise.
@@ -339,6 +336,13 @@ export class CallOrchestrator {
       });
       return;
     }
+
+    // ── LISTENING: track consecutive empty VADs for noise suppression ───
+    // Only count VADs in LISTENING state — SPEAKING-state VADs are PSTN echo.
+    if (this.lastVADAt > 0 && this.lastVADAt > this.lastTranscriptAt) {
+      this.consecutiveEmptyVADs++;
+    }
+    this.lastVADAt = now;
 
     // ── LISTENING: noise suppression for TTS pre-warming ────────────────
     // Post-TTS echo suppression (1.5s after TTS ends)
@@ -362,6 +366,77 @@ export class CallOrchestrator {
     this.prewarmTTS();
   }
 
+  // ─── No-Speech Recovery ───────────────────────────────────────────────────
+
+  /**
+   * Deepgram ended an utterance with zero decoded words. If this keeps
+   * happening while we're LISTENING, the caller is talking but recognition
+   * is failing — re-prompt instead of leaving the call dead.
+   */
+  private handleNoSpeech(): void {
+    if (this.state !== 'LISTENING') return;
+
+    // Ignore TTS echo tail — those empty finals are our own voice.
+    if (this.lastTTSCompleteAt > 0 &&
+        Date.now() - this.lastTTSCompleteAt < this.POST_TTS_VAD_SUPPRESS_MS) return;
+
+    this.emptyFinalStreak++;
+    if (this.emptyFinalStreak < this.EMPTY_FINALS_BEFORE_REPROMPT) return;
+    if (Date.now() - this.lastRepromptAt < this.REPROMPT_MIN_GAP_MS) return;
+    if (this.repromptCount >= this.MAX_REPROMPTS_PER_CALL) return;
+
+    this.emptyFinalStreak = 0;
+    this.lastRepromptAt = Date.now();
+    this.repromptCount++;
+
+    this.log.warn('No-speech recovery: re-prompting caller', {
+      repromptCount: this.repromptCount,
+    });
+    this.speakCanned(this.REPROMPT_TEXT);
+  }
+
+  /** Speak a fixed phrase through the persistent TTS — no LLM involved. */
+  private speakCanned(text: string): void {
+    const myGenId = ++this.generationId;
+    this.activeResponseText = text;
+
+    // Same playback-tracking reset as generateAndSpeak()
+    this.ttsAudioBytesSent = 0;
+    this.firstTTSAudioSentAt = 0;
+    this.ttsGenerationDone = false;
+    if (this.playbackCompleteTimer) {
+      clearTimeout(this.playbackCompleteTimer);
+      this.playbackCompleteTimer = null;
+    }
+
+    this.state = 'SPEAKING';
+    this.suppressBargeInArm = false;
+
+    this.tts.startTurn(`g${myGenId}`);
+    this.tts.streamText(text);
+    this.tts.flush();
+  }
+
+  // ─── Interim Transcript: instant word-gated barge-in ─────────────────────
+
+  /**
+   * Non-empty interim transcript = Deepgram decoded actual WORDS from the
+   * caller. PSTN echo of our own TTS only ever produces empty finalizations
+   * (verified in call logs), so words are a safe, instant interrupt signal —
+   * ~300ms after speech onset instead of waiting ~1s+ for speech_final.
+   */
+  private handleInterimTranscript(text: string): void {
+    // SPEAKING only — during GENERATING, trailing interims from the user's
+    // own just-finished utterance would cancel the generation they triggered.
+    // The final-transcript path still replaces the turn in that window.
+    if (this.state !== 'SPEAKING') return;
+    if (this.suppressBargeInArm) return; // greeting — no barge-in
+    if (!text.trim()) return;
+
+    this.log.info('BargeInDetected (interim words during agent speech)', { text });
+    this.handleInterruption();
+  }
+
   // ─── Final Transcript ─────────────────────────────────────────────────────
 
   private handleFinalTranscript(text: string, confidence: number): void {
@@ -370,6 +445,7 @@ export class CallOrchestrator {
 
     // ── Reset noise tracking — real speech confirmed ────────────────────
     this.consecutiveEmptyVADs = 0;
+    this.emptyFinalStreak = 0;
     this.lastTranscriptAt = Date.now();
 
     const transcriptAt = Date.now();
@@ -433,22 +509,11 @@ export class CallOrchestrator {
     });
     this.latency.mark('llm_start');
 
-    // Consume pre-warmed TTS if still alive, otherwise create a fresh one.
-    // Prewarm may have gone stale if ElevenLabs timed out the idle WS (~10s).
-    const prewarmed = this.prewarmedTTS;
-    this.prewarmedTTS = null;
-    if (prewarmed && !prewarmed.isActive) {
-      this.log.warn('Pre-warmed TTS went stale — using fresh connection');
-      prewarmed.abort();
-    }
-    const tts = (prewarmed?.isActive) ? prewarmed : new ElevenLabsTTS(this.callSid);
+    // Start a new context on the persistent ElevenLabs socket.
+    // No connection is opened here — the socket has been alive since call start.
+    const tts = this.tts;
+    tts.startTurn(`g${myGenId}`);
 
-    tts
-      .onAudio((audio) => this.handleTTSAudio(audio, myGenId))
-      .onDone(()       => this.handleTTSDone(myGenId))
-      .onError((err)   => this.log.error('TTS error', err));
-
-    this.tts = tts;
     this.state = 'SPEAKING';
     // Record whether barge-in should be armed for this generation.
     // We do NOT arm here — arm() is deferred to the first TTS audio chunk
@@ -457,9 +522,9 @@ export class CallOrchestrator {
     // a false barge-in and abort the LLM before it has sent a single token.
     this.suppressBargeInArm = opts.suppressBargeIn ?? false;
 
-    // Start LLM streaming immediately — do NOT await tts.open() first.
-    // streamText() buffers in textQueue while TTS is still connecting;
-    // open() resolves in parallel and drains the queue automatically.
+    // Socket should already be open (persistent); open() is an idempotent
+    // safety net after an unexpected close. streamText() queues while
+    // reconnecting and drains automatically.
     const ttsOpenPromise = tts.open().then(() => {
       if (!this.latency.hasMarked('tts_open')) this.latency.mark('tts_open');
     }).catch((err: Error) => {
@@ -469,11 +534,10 @@ export class CallOrchestrator {
     let fullText = '';
     let firstToken = true;
 
-    // ZERO BUFFERING: stream every token directly to TTS the instant it arrives.
-    // The first streamText() call uses try_trigger_generation=true (set in
-    // ElevenLabsTTS.streamText) which forces ElevenLabs to start synthesizing
-    // immediately without waiting for chunk_length_schedule. This eliminates
-    // the ~300-450ms buffer delay from the previous 50-char buffering approach.
+    // ZERO BUFFERING: stream every token directly to TTS the instant it
+    // arrives. Audio starts once 50 chars accumulate (chunk_length_schedule)
+    // or at flush() right after the LLM finishes — whichever comes first.
+    // Replies are capped at ~12 words so flush lands ~100ms after first token.
 
     try {
       const stream = this.llm.stream(this.conversation.toMessages(), signal);
@@ -510,10 +574,11 @@ export class CallOrchestrator {
     this.latency.mark('llm_complete');
 
     if (myGenId !== this.generationId || signal.aborted) {
-      // Interrupted — don't add partial response to history
+      // Interrupted — don't add partial response to history.
+      // handleInterruption() already closed the TTS context; this is a no-op
+      // unless the abort came from somewhere else (e.g. call end).
       this.log.info('Generation interrupted, discarding partial response', { partialLength: fullText.length });
       tts.abort();
-      this.tts = null;
       return;
     }
 
@@ -568,7 +633,6 @@ export class CallOrchestrator {
     if (genId !== this.generationId) return;
 
     this.latency.mark('tts_complete');
-    this.tts = null;
     this.ttsGenerationDone = true;
 
     // Calculate remaining playback time on Twilio.
@@ -615,6 +679,11 @@ export class CallOrchestrator {
     if (this.state !== 'ENDED') {
       this.state = 'LISTENING';
       this.log.info('Playback complete — now LISTENING');
+
+      // Pre-warm TTS now — the user usually replies within seconds, and the
+      // VAD-triggered prewarm path is suppressed for POST_TTS_VAD_SUPPRESS_MS
+      // after TTS ends, so without this the next turn pays the WS connect cost.
+      this.prewarmTTS();
     }
   }
 
@@ -641,16 +710,15 @@ export class CallOrchestrator {
 
     // Abort the LLM stream
     if (this.abortController) {
-      this.log.info('Aborting LLM AbortController', { generationId: this.generationId });
       this.abortController.abort();
       this.abortController = null;
+      this.latency.mark('llm_cancelled');
     }
 
-    // Abort TTS and clear Twilio's jitter buffer
-    if (this.tts) {
-      this.tts.abort();
-      this.tts = null;
-    }
+    // Close the active TTS context (socket stays open) and clear Twilio's
+    // jitter buffer so queued audio stops playing immediately.
+    this.tts.abort();
+    this.latency.mark('tts_cancelled');
 
     this.twilioService.clearAudio(this.callSid);
     this.bargeIn.disarm();
@@ -667,6 +735,12 @@ export class CallOrchestrator {
   }
 
   // ─── Accessors ────────────────────────────────────────────────────────────
+
+  /** Context ids are "g{generationId}" — recover the genId for staleness checks. */
+  private genIdFromContext(ctxId: string): number {
+    const n = parseInt(ctxId.slice(1), 10);
+    return Number.isNaN(n) ? -1 : n;
+  }
 
   get currentState(): CallState { return this.state; }
 }

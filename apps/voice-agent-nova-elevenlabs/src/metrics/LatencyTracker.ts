@@ -15,7 +15,22 @@ export type LatencyEvent =
   | 'tts_complete'
   | 'greeting_start'
   | 'barge_in'
+  | 'llm_cancelled'
+  | 'tts_cancelled'
   | 'call_end';
+
+/** Human-readable event names logged on every mark (one line per event). */
+const EVENT_LABELS: Partial<Record<LatencyEvent, string>> = {
+  speech_final:          'FinalTranscript',
+  llm_start:             'LLMRequestStart',
+  llm_first_token:       'FirstToken',
+  tts_first_text:        'TTSStart',
+  tts_first_audio:       'FirstAudio',
+  twilio_playback_start: 'PlaybackStart',
+  barge_in:              'BargeInDetected',
+  llm_cancelled:         'LLMCancelled',
+  tts_cancelled:         'TTSCancelled',
+};
 
 const TURN_RESET_EVENTS: LatencyEvent[] = [
   'speech_started', 'tts_prewarm_start', 'tts_open',
@@ -35,9 +50,11 @@ export class LatencyTracker {
   }
 
   mark(event: LatencyEvent, at = Date.now()): void {
+    const label = EVENT_LABELS[event];
+    if (label) this.log.info(label, { at });
+
     if (event === 'barge_in') {
       this.bargeInEvents.push(at);
-      this.log.info('barge_in', { count: this.bargeInEvents.length });
       return;
     }
     this.marks.set(event, at);
@@ -101,7 +118,7 @@ export class LatencyTracker {
     // Log a concise one-line pipeline breakdown for quick scanning
     this.log.info('PIPELINE BREAKDOWN', {
       turn: turnIndex,
-      pipeline: `STT:${speechStartToFinal ?? '?'}ms → Handoff:${speechToLlm ?? '?'}ms → TTFT:${llmFirstToken ?? '?'}ms → Buffer:${llmFirstToText ?? '?'}ms → TTS:${textToAudio ?? '?'}ms → Twilio:${firstAudioToTwilio ?? '?'}ms = E2E:${e2eTwilio ?? '?'}ms`,
+      pipeline: `SpeechStart→FinalTranscript:${speechStartToFinal ?? '?'}ms → LLMStart:${speechToLlm ?? '?'}ms → FirstToken:${llmFirstToken ?? '?'}ms → TTSStart:${llmFirstToText ?? '?'}ms → FirstAudio:${textToAudio ?? '?'}ms → Twilio:${firstAudioToTwilio ?? '?'}ms = E2E:${e2eTwilio ?? '?'}ms`,
     });
 
     for (const event of TURN_RESET_EVENTS) this.marks.delete(event);

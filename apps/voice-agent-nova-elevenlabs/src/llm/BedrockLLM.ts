@@ -12,6 +12,7 @@
  */
 
 import Groq from 'groq-sdk';
+import { Agent } from 'undici';
 import type { MessageParam as AnthropicMessageParam } from '@anthropic-ai/sdk/resources/messages/messages';
 import { Env } from '../config/env';
 import { Logger } from '../shared/logger';
@@ -28,7 +29,25 @@ let _groqClient: Groq | null = null;
 
 function getClient(): Groq {
   if (_groqClient) return _groqClient;
-  _groqClient = new Groq({ apiKey: Env.llm.groqApiKey });
+  _groqClient = new Groq({
+    apiKey: Env.llm.groqApiKey,
+    // No retries — a retried request adds seconds of silence on a live call.
+    // Better to fail fast and let the turn error than to stall the caller.
+    maxRetries: 0,
+    timeout: 10_000,
+    // Node's default fetch dispatcher closes idle sockets after 4s, so every
+    // turn (10-15s apart) paid a fresh DNS+TCP+TLS handshake — the source of
+    // TTFT spikes. Keep sockets alive for 2 minutes; the 30s keep-warm ping
+    // below guarantees they never go idle long enough to be reaped.
+    fetchOptions: {
+      dispatcher: new Agent({
+        keepAliveTimeout: 120_000,
+        keepAliveMaxTimeout: 120_000,
+        connections: 8,
+        pipelining: 1,
+      }),
+    },
+  });
   return _groqClient;
 }
 
@@ -69,24 +88,44 @@ function toOpenAIMessages(
 
 /**
  * Warm up: establish HTTP connection pool + test Groq reachability.
+ * Then re-pings every KEEP_WARM_INTERVAL_MS so the TLS connection and
+ * Groq routing stay hot between calls — cold connections were measured
+ * adding ~800ms to TTFT (1047ms vs the usual ~250ms).
  */
+const KEEP_WARM_INTERVAL_MS = 30_000;
+let _keepWarmTimer: ReturnType<typeof setInterval> | null = null;
+
+async function pingGroq(log: Logger): Promise<void> {
+  const t = Date.now();
+  await getClient().chat.completions.create({
+    model: Env.llm.modelId,
+    max_completion_tokens: 1,
+    messages: [
+      { role: 'system', content: 'hi' },
+      { role: 'user', content: 'hi' },
+    ],
+  });
+  log.debug('LLM keep-warm ping', { ms: Date.now() - t });
+}
+
 export async function warmUpBedrock(): Promise<void> {
   const log = Logger.root('LLM');
-  const client = getClient();
   try {
     log.info(`Warming up LLM (Groq, ${Env.llm.modelId})...`);
     const t = Date.now();
-    await client.chat.completions.create({
-      model: Env.llm.modelId,
-      max_completion_tokens: 1,
-      messages: [
-        { role: 'system', content: 'hi' },
-        { role: 'user', content: 'hi' },
-      ],
-    });
+    await pingGroq(log);
     log.info('LLM warm-up complete (Groq)', { ms: Date.now() - t });
   } catch (err) {
     log.warn('LLM warm-up failed (Groq, non-fatal)', { error: (err as Error).message });
+  }
+
+  if (!_keepWarmTimer) {
+    _keepWarmTimer = setInterval(() => {
+      pingGroq(log).catch((err: Error) => {
+        log.warn('LLM keep-warm ping failed (non-fatal)', { error: err.message });
+      });
+    }, KEEP_WARM_INTERVAL_MS);
+    _keepWarmTimer.unref(); // don't block process shutdown
   }
 }
 

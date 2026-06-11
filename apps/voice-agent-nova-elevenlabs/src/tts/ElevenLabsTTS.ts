@@ -1,56 +1,57 @@
 /**
- * ElevenLabsTTS: per-response streaming TTS via ElevenLabs WebSocket API.
+ * ElevenLabsTTS: per-CALL persistent TTS via the ElevenLabs multi-context
+ * WebSocket API (/multi-stream-input).
  *
- * Audio output format: ulaw_8000 — raw μ-law bytes at 8 kHz.
- * This is directly compatible with Twilio's media stream format.
- * No codec conversion is required; the base64 from ElevenLabs can be
- * forwarded as-is to Twilio's `media` event payload.
+ * One WebSocket is opened when the call starts and reused for every turn.
+ * Each LLM response is an independent "context" on that socket:
  *
- * Lifecycle per LLM response:
- *   1. open()        — connect to ElevenLabs WebSocket
- *   2. streamText()  — feed text chunks as they arrive from LLM
- *   3. flush()       — signal end of text input
- *   4. wait for onComplete callback
- *   5. close() / abort()
+ *   startTurn(ctxId)  — initialise a context (voice settings, chunk schedule)
+ *   streamText(text)  — feed LLM tokens into the active context
+ *   flush()           — end of LLM response; forces remaining audio
+ *   server → { audio, contextId }  then  { isFinal: true, contextId }
+ *   abort()           — barge-in: close_context (instant, socket stays open)
+ *   destroy()         — call ended: close_socket + WS close
+ *
+ * Audio output format: ulaw_8000 — forwarded as-is to Twilio.
+ *
+ * If the socket drops mid-call (inactivity, network), it reconnects
+ * immediately in the background so the next turn never pays connect cost.
  */
 
 import WebSocket from 'ws';
 import { Env } from '../config/env';
 import { Logger } from '../shared/logger';
-import type {
-  ElevenLabsInitMessage,
-  ElevenLabsAudioResponse,
-  OnAudioChunk,
-  OnTTSComplete,
-  OnTTSError,
-} from './types';
+import type { OnTTSError } from './types';
 
 const ELEVENLABS_WS_BASE = 'wss://api.elevenlabs.io/v1/text-to-speech';
 
-export type TTSState = 'idle' | 'connecting' | 'open' | 'flushed' | 'done' | 'aborted' | 'error';
+export type TTSState = 'idle' | 'connecting' | 'open' | 'closed';
+
+export type OnContextAudio = (audioBase64: string, contextId: string) => void;
+export type OnContextDone  = (contextId: string) => void;
 
 export class ElevenLabsTTS {
   private ws: WebSocket | null = null;
   private state: TTSState = 'idle';
   private readonly log: Logger;
 
-  private onAudioChunk?: OnAudioChunk;
-  private onComplete?: OnTTSComplete;
+  private onAudioChunk?: OnContextAudio;
+  private onComplete?: OnContextDone;
   private onErr?: OnTTSError;
 
-  /** Text chunks buffered while WS is still connecting */
+  /** Context id of the turn currently being synthesized (null between turns). */
+  private activeContextId: string | null = null;
+  /** True once the init message for the active context has been sent. */
+  private contextInitialized = false;
+
+  /** Text chunks buffered while WS is still connecting/reconnecting. */
   private readonly textQueue: string[] = [];
-  /** True if flush() was called while still connecting — send it once open */
+  /** True if flush() was called while still connecting — send once open. */
   private pendingFlush = false;
-  /**
-   * True once the first text chunk has been sent.
-   * The first chunk always includes try_trigger_generation:true so ElevenLabs
-   * starts audio generation immediately without waiting for chunk_length_schedule.
-   */
-  private firstTextSent = false;
+
   private openPromise: Promise<void> | null = null;
-  private openResolve: (() => void) | null = null;
-  private openReject: ((err: Error) => void) | null = null;
+  /** Set when destroy() is called — stops auto-reconnect. */
+  private destroyed = false;
 
   constructor(callSid: string) {
     this.log = Logger.forCall(callSid, 'ElevenLabsTTS');
@@ -58,196 +59,232 @@ export class ElevenLabsTTS {
 
   // ─── Callback Registration ────────────────────────────────────────────────
 
-  onAudio(cb: OnAudioChunk): this    { this.onAudioChunk = cb; return this; }
-  onDone(cb: OnTTSComplete): this    { this.onComplete = cb;   return this; }
-  onError(cb: OnTTSError): this      { this.onErr = cb;        return this; }
+  onAudio(cb: OnContextAudio): this { this.onAudioChunk = cb; return this; }
+  onDone(cb: OnContextDone): this   { this.onComplete = cb;   return this; }
+  onError(cb: OnTTSError): this     { this.onErr = cb;        return this; }
 
-  // ─── Connection ───────────────────────────────────────────────────────────
+  // ─── Connection (once per call, auto-reconnect) ──────────────────────────
 
   open(): Promise<void> {
+    if (this.destroyed) return Promise.resolve();
     if (this.openPromise) return this.openPromise;
 
     this.state = 'connecting';
-    this.openPromise = new Promise<void>((resolve, reject) => {
-      this.openResolve = resolve;
-      this.openReject  = reject;
-    });
 
     const params = new URLSearchParams({
-      model_id:                  Env.elevenlabs.modelId,
-      output_format:             'ulaw_8000',
-      optimize_streaming_latency: String(Env.elevenlabs.optimizeLatency),
+      model_id:           Env.elevenlabs.modelId,
+      output_format:      'ulaw_8000',
+      // Max allowed — keeps the socket open across long gaps between turns.
+      inactivity_timeout: '180',
     });
 
-    const url = `${ELEVENLABS_WS_BASE}/${Env.elevenlabs.voiceId}/stream-input?${params.toString()}`;
+    const url = `${ELEVENLABS_WS_BASE}/${Env.elevenlabs.voiceId}/multi-stream-input?${params.toString()}`;
 
-    this.log.info('Connecting to ElevenLabs', {
-      model:     Env.elevenlabs.modelId,
-      voiceId:   Env.elevenlabs.voiceId,
-      latencyOpt: Env.elevenlabs.optimizeLatency,
+    this.log.info('Connecting to ElevenLabs (multi-context, persistent)', {
+      model:   Env.elevenlabs.modelId,
+      voiceId: Env.elevenlabs.voiceId,
     });
 
-    const ws = new WebSocket(url);
-    this.ws = ws;
+    this.openPromise = new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(url, {
+        headers: { 'xi-api-key': Env.elevenlabs.apiKey },
+      });
+      this.ws = ws;
 
-    ws.on('open', () => {
-      this.state = 'open';
-      this.log.debug('ElevenLabs connected');
+      ws.on('open', () => {
+        this.state = 'open';
+        this.log.info('ElevenLabs connected (persistent WS)');
 
-      // Send initialisation message with voice settings
-      const init: ElevenLabsInitMessage = {
-        text: ' ',
-        voice_settings: {
-          stability:       Env.elevenlabs.stability,
-          similarity_boost: Env.elevenlabs.similarityBoost,
-          speed:           Env.elevenlabs.speed,
-        },
-        generation_config: {
-          // Start streaming audio after this many characters have accumulated.
-          // Lower = lower latency, higher = better prosody.
-          // ElevenLabs minimum is 50. With try_trigger_generation=true on first
-          // send, audio generation starts immediately regardless of schedule.
-          chunk_length_schedule: [50, 120, 200],
-        },
-        xi_api_key: Env.elevenlabs.apiKey,
-      };
-
-      this.send(init);
-
-      // Flush any text that arrived while we were connecting.
-      // Mark the first chunk with try_trigger_generation so ElevenLabs begins
-      // synthesising immediately rather than waiting for chunk_length_schedule.
-      for (let i = 0; i < this.textQueue.length; i++) {
-        const payload = (!this.firstTextSent)
-          ? { text: this.textQueue[i], try_trigger_generation: true }
-          : { text: this.textQueue[i] };
-        this.firstTextSent = true;
-        this.send(payload);
-      }
-      this.textQueue.length = 0;
-
-      // If flush() was called during connecting, send it now
-      if (this.pendingFlush) {
-        this.pendingFlush = false;
-        this.state = 'flushed';
-        this.send({ text: '' });
-        this.log.debug('ElevenLabs deferred flush sent');
-      }
-
-      this.openResolve?.();
-      this.openResolve = null;
-      this.openReject  = null;
-    });
-
-    ws.on('message', (raw: WebSocket.RawData) => {
-      if (this.state === 'aborted') return;
-      try {
-        const data = JSON.parse(raw.toString()) as ElevenLabsAudioResponse | { message?: string };
-        this.handleMessage(data);
-      } catch (err) {
-        this.log.warn('Unparseable ElevenLabs message', { raw: raw.toString().slice(0, 200) });
-      }
-    });
-
-    ws.on('error', (err: Error) => {
-      this.state = 'error';
-      this.log.error('ElevenLabs WS error', err);
-      this.openReject?.(err);
-      this.openResolve = null;
-      this.openReject  = null;
-      this.onErr?.(err);
-    });
-
-    ws.on('close', (code: number, reason: Buffer) => {
-      if (this.state !== 'aborted') {
-        this.log.info('ElevenLabs WS closed', { code, reason: reason.toString() });
-        if (this.state !== 'done') {
-          // Unexpected close before we got isFinal — treat as complete
-          this.state = 'done';
-          this.onComplete?.();
+        // A turn may have started while we were connecting — initialise its
+        // context and drain any queued text now.
+        if (this.activeContextId && !this.contextInitialized) {
+          this.sendContextInit(this.activeContextId);
         }
-      }
+        for (const text of this.textQueue) {
+          this.send({ text, context_id: this.activeContextId });
+        }
+        this.textQueue.length = 0;
+
+        if (this.pendingFlush && this.activeContextId) {
+          this.pendingFlush = false;
+          this.send({ context_id: this.activeContextId, flush: true });
+          this.log.debug('ElevenLabs deferred flush sent');
+        }
+
+        resolve();
+      });
+
+      ws.on('message', (raw: WebSocket.RawData) => {
+        try {
+          this.handleMessage(JSON.parse(raw.toString()));
+        } catch {
+          this.log.warn('Unparseable ElevenLabs message', { raw: raw.toString().slice(0, 200) });
+        }
+      });
+
+      ws.on('error', (err: Error) => {
+        this.log.error('ElevenLabs WS error', err);
+        this.onErr?.(err);
+        reject(err);
+      });
+
+      ws.on('close', (code: number, reason: Buffer) => {
+        const wasOpen = this.state === 'open';
+        this.state = 'closed';
+        this.ws = null;
+        this.openPromise = null;
+        this.contextInitialized = false;
+
+        if (this.destroyed) return;
+        this.log.warn('ElevenLabs WS closed unexpectedly — reconnecting', {
+          code, reason: reason.toString(), midTurn: this.activeContextId !== null,
+        });
+        // A close mid-turn means remaining audio is lost — finish the turn.
+        if (this.activeContextId) {
+          const ctx = this.activeContextId;
+          this.activeContextId = null;
+          this.onComplete?.(ctx);
+        }
+        // Reconnect in the background so the next turn starts on a warm socket.
+        if (wasOpen) void this.open().catch(() => { /* logged in error handler */ });
+      });
     });
 
     return this.openPromise;
   }
 
-  // ─── Audio Input ──────────────────────────────────────────────────────────
+  // ─── Turn Lifecycle ───────────────────────────────────────────────────────
 
-  /** Feed a text chunk to ElevenLabs. Safe to call before open() resolves. */
+  /** Begin a new turn. Each turn is an independent context on the shared WS. */
+  startTurn(contextId: string): void {
+    if (this.destroyed) return;
+
+    // Defensive: kill any context left over from a previous turn.
+    if (this.activeContextId && this.activeContextId !== contextId) {
+      this.send({ context_id: this.activeContextId, close_context: true });
+    }
+
+    this.activeContextId = contextId;
+    this.contextInitialized = false;
+    this.textQueue.length = 0;
+    this.pendingFlush = false;
+
+    if (this.state === 'open') {
+      this.sendContextInit(contextId);
+    } else {
+      // Init will be sent from the 'open' handler; make sure we're connecting.
+      void this.open().catch(() => { /* logged in error handler */ });
+    }
+  }
+
+  /** Feed a text chunk to the active context. Safe before WS is open. */
   streamText(text: string): void {
-    if (this.state === 'aborted' || this.state === 'done' || this.state === 'flushed') return;
+    if (this.destroyed || !this.activeContextId) return;
 
-    if (this.state === 'connecting') {
+    if (this.state !== 'open') {
       this.textQueue.push(text);
       return;
     }
-
-    // First chunk: tell ElevenLabs to start generating audio immediately
-    // rather than waiting for chunk_length_schedule threshold.
-    const payload = !this.firstTextSent
-      ? { text, try_trigger_generation: true }
-      : { text };
-    this.firstTextSent = true;
-    this.send(payload);
+    this.send({ text, context_id: this.activeContextId });
   }
 
-  /** Signal end of text input. ElevenLabs will flush remaining audio. */
+  /** End of LLM text — force generation of all remaining audio. */
   flush(): void {
-    if (this.state === 'connecting') {
-      // WS not open yet — defer flush until open handler fires
+    if (this.destroyed || !this.activeContextId) return;
+
+    if (this.state !== 'open') {
       this.pendingFlush = true;
       this.log.debug('ElevenLabs flush deferred (still connecting)');
       return;
     }
-    if (this.state !== 'open') return;
-    this.state = 'flushed';
-    this.send({ text: '' });
+    this.send({ context_id: this.activeContextId, flush: true });
     this.log.debug('ElevenLabs flush sent');
   }
 
-  /** Cancel streaming immediately — discards all pending audio. */
+  /**
+   * Barge-in: instantly close the active context. The server stops generating
+   * and discards buffered audio. The socket stays open for the next turn.
+   */
   abort(): void {
-    if (this.state === 'aborted') return;
-    this.state = 'aborted';
     this.textQueue.length = 0;
     this.pendingFlush = false;
-    this.firstTextSent = false;
-    this.log.info('ElevenLabs TTS aborted');
+
+    if (!this.activeContextId) return;
+    const ctx = this.activeContextId;
+    this.activeContextId = null;
+    this.contextInitialized = false;
+
+    this.send({ context_id: ctx, close_context: true });
+    this.log.info('TTSCancelled', { contextId: ctx });
+  }
+
+  /** Call ended — close the socket for good. */
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.activeContextId = null;
+    this.textQueue.length = 0;
 
     if (this.ws) {
       try {
-        if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
-          this.ws.close(1000, 'Barge-in');
+        if (this.ws.readyState === WebSocket.OPEN) {
+          this.send({ close_socket: true });
+          this.ws.close(1000, 'Call ended');
+        } else if (this.ws.readyState === WebSocket.CONNECTING) {
+          this.ws.close(1000, 'Call ended');
         }
       } catch { /* ignore */ }
       this.ws = null;
     }
+    this.state = 'closed';
+    this.log.info('ElevenLabs persistent WS destroyed (call end)');
   }
 
   // ─── Message Handling ─────────────────────────────────────────────────────
 
-  private handleMessage(data: ElevenLabsAudioResponse | { message?: string }): void {
-    if ('message' in data && data.message) {
-      this.log.warn('ElevenLabs API message', { message: data.message });
+  private sendContextInit(contextId: string): void {
+    this.send({
+      text: ' ',
+      voice_settings: {
+        stability:        Env.elevenlabs.stability,
+        similarity_boost: Env.elevenlabs.similarityBoost,
+        speed:            Env.elevenlabs.speed,
+      },
+      generation_config: {
+        // Start streaming audio after this many chars accumulate; flush()
+        // at end of LLM response forces whatever remains.
+        chunk_length_schedule: [50, 120, 200],
+      },
+      context_id: contextId,
+    });
+    this.contextInitialized = true;
+  }
+
+  private handleMessage(data: {
+    audio?: string;
+    isFinal?: boolean;
+    contextId?: string;
+    message?: string;
+    error?: string;
+  }): void {
+    if (data.error || data.message) {
+      this.log.warn('ElevenLabs API message', { message: data.message, error: data.error });
       return;
     }
 
-    const audioData = data as ElevenLabsAudioResponse;
+    // Audio/done from a cancelled or stale context — drop silently.
+    const ctx = data.contextId;
+    if (!ctx || ctx !== this.activeContextId) return;
 
-    if (audioData.audio) {
-      this.onAudioChunk?.(audioData.audio);
+    if (data.audio) {
+      this.onAudioChunk?.(data.audio, ctx);
     }
 
-    if (audioData.isFinal) {
-      this.state = 'done';
-      this.log.debug('ElevenLabs generation complete');
-      this.onComplete?.();
-
-      if (this.ws) {
-        try { this.ws.close(1000, 'Done'); } catch { /* ignore */ }
-        this.ws = null;
-      }
+    if (data.isFinal) {
+      this.activeContextId = null;
+      this.contextInitialized = false;
+      this.log.debug('ElevenLabs context complete', { contextId: ctx });
+      this.onComplete?.(ctx);
     }
   }
 
@@ -264,5 +301,5 @@ export class ElevenLabsTTS {
   }
 
   get currentState(): TTSState { return this.state; }
-  get isActive(): boolean { return this.state === 'open' || this.state === 'connecting' || this.state === 'flushed'; }
+  get isActive(): boolean { return !this.destroyed && (this.state === 'open' || this.state === 'connecting'); }
 }
