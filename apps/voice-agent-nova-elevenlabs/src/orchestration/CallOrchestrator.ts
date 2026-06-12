@@ -129,7 +129,7 @@ export class CallOrchestrator {
   // ─── Silence Timer (dead-air after agent finishes speaking) ────────────
   /** Timer that fires if caller is silent for SILENCE_TIMEOUT_MS after agent speaks. */
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly SILENCE_TIMEOUT_MS = 4000;
+  private readonly SILENCE_TIMEOUT_MS = 7000;
 
   // ─── Playback Duration Tracking ──────────────────────────────────────
   // ElevenLabs generates all audio in ~200ms but Twilio plays it over 3-5s.
@@ -191,7 +191,7 @@ export class CallOrchestrator {
     this.log.info('Call orchestrator ready', { state: this.state });
 
     // Fixed greeting via TTS — no LLM needed. Reliable and fast.
-    this.speakCanned('Hello, मैं Arjun बोल रहा हूँ, मैं एक real estate sales consultant हूँ, आपका नाम बता सकते हैं?');
+    this.speakCanned('Hi, मैं Arjun बोल रहा हूँ Akshay Vista से। क्या मैं आपका नाम जान सकता हूँ?');
   }
 
   /**
@@ -366,36 +366,26 @@ export class CallOrchestrator {
     // ── Valid speech in LISTENING state ──────────────────────────────────
     this.latency.mark('speech_started');
     this.log.info('Speech started (VAD)', { state: this.state });
+
+    // User is speaking — reset silence timer so we don't reprompt mid-speech.
+    this.clearSilenceTimer();
+
     this.prewarmTTS();
   }
 
   // ─── No-Speech Recovery ───────────────────────────────────────────────────
 
   /**
-   * Deepgram ended an utterance with zero decoded words. If this keeps
-   * happening while we're LISTENING, the caller is talking but recognition
-   * is failing — re-prompt instead of leaving the call dead.
+   * Deepgram ended an utterance with zero decoded words. Just log it.
+   * Reprompting is handled solely by the silence timer (SILENCE_TIMEOUT_MS)
+   * to avoid false triggers from empty transcripts and PSTN echo.
    */
   private handleNoSpeech(): void {
     if (this.state !== 'LISTENING') return;
-
-    // Ignore TTS echo tail — those empty finals are our own voice.
-    if (this.lastTTSCompleteAt > 0 &&
-        Date.now() - this.lastTTSCompleteAt < this.POST_TTS_VAD_SUPPRESS_MS) return;
-
     this.emptyFinalStreak++;
-    if (this.emptyFinalStreak < this.EMPTY_FINALS_BEFORE_REPROMPT) return;
-    if (Date.now() - this.lastRepromptAt < this.REPROMPT_MIN_GAP_MS) return;
-    if (this.repromptCount >= this.MAX_REPROMPTS_PER_CALL) return;
-
-    this.emptyFinalStreak = 0;
-    this.lastRepromptAt = Date.now();
-    this.repromptCount++;
-
-    this.log.warn('No-speech recovery: re-prompting caller', {
-      repromptCount: this.repromptCount,
+    this.log.debug('Empty speech event (no reprompt — silence timer handles this)', {
+      emptyFinalStreak: this.emptyFinalStreak,
     });
-    this.speakCanned(this.REPROMPT_TEXT);
   }
 
   /** Speak a fixed phrase through the persistent TTS — no LLM involved. */
@@ -435,12 +425,20 @@ export class CallOrchestrator {
   private static readonly ECHO_FILLER_PATTERN = /^(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh)(\s+(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh))*$/i;
 
   private handleInterimTranscript(text: string): void {
+    if (!text.trim()) return;
+
+    // Any real interim words in LISTENING = user is actively speaking.
+    // Reset silence timer to avoid reprompting mid-utterance.
+    if (this.state === 'LISTENING') {
+      this.clearSilenceTimer();
+      return;
+    }
+
     // SPEAKING only — during GENERATING, trailing interims from the user's
     // own just-finished utterance would cancel the generation they triggered.
     // The final-transcript path still replaces the turn in that window.
     if (this.state !== 'SPEAKING') return;
     if (this.suppressBargeInArm) return; // greeting — no barge-in
-    if (!text.trim()) return;
 
     // Filter out filler/echo words — PSTN echo of agent TTS is often
     // transcribed as "Mhmm mhmm mhmm" by Deepgram. Not real speech.
@@ -715,6 +713,19 @@ export class CallOrchestrator {
       if (this.state !== 'LISTENING') return;
       if (Date.now() - this.lastRepromptAt < this.REPROMPT_MIN_GAP_MS) return;
       if (this.repromptCount >= this.MAX_REPROMPTS_PER_CALL) return;
+
+      // Don't reprompt if user recently spoke (VAD/transcript within last 2s)
+      // — they may be mid-utterance or Deepgram is still processing.
+      const now = Date.now();
+      const recentActivity = Math.max(this.lastVADAt, this.lastTranscriptAt);
+      if (recentActivity > 0 && now - recentActivity < 2000) {
+        this.log.debug('Silence timer deferred (recent user activity)', {
+          msSinceActivity: now - recentActivity,
+        });
+        // Restart timer for another check
+        this.startSilenceTimer();
+        return;
+      }
 
       this.lastRepromptAt = Date.now();
       this.repromptCount++;
