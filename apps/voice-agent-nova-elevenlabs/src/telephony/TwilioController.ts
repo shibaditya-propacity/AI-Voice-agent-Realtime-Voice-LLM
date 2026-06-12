@@ -99,7 +99,7 @@ export function buildTwilioRouter(
     res.json({
       status: 'ok',
       provider: 'twilio',
-      pipeline: 'deepgram-nova3 → bedrock-claude → elevenlabs-flash-v2.5',
+      pipeline: `deepgram-nova3 → groq-${Env.llm.modelId} → ${Env.ttsProvider}`,
       activeCalls: twilioService.activeStreamCount,
       activeSessions: sessionManager.activeCount,
       uptime: Math.floor(process.uptime()),
