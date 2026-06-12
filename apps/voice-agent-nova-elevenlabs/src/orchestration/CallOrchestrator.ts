@@ -28,6 +28,7 @@
 import { DeepgramSTT } from '../stt/DeepgramSTT';
 import { BedrockLLM }  from '../llm/BedrockLLM';
 import { ElevenLabsTTS } from '../tts/ElevenLabsTTS';
+import { SarvamTTS } from '../tts/SarvamTTS';
 import { hasGreetingAudio, getGreetingChunks } from '../tts/GreetingCache';
 import { BargeInDetector } from '../interruption/BargeInDetector';
 import { ConversationManager } from '../llm/ConversationManager';
@@ -73,11 +74,10 @@ export class CallOrchestrator {
   private abortController: AbortController | null = null;
 
   /**
-   * Persistent ElevenLabs multi-context WS — opened once at call start and
-   * reused for every turn. Each generation is a context; barge-in closes
-   * the context, never the socket.
+   * Persistent TTS WS — opened once at call start and reused for every turn.
+   * Provider selected by TTS_PROVIDER env var (elevenlabs | sarvam).
    */
-  private readonly tts: ElevenLabsTTS;
+  private readonly tts: ElevenLabsTTS | SarvamTTS;
 
   /** Tracks the full text accumulated so far in the active generation. */
   private activeResponseText = '';
@@ -124,7 +124,12 @@ export class CallOrchestrator {
   private readonly EMPTY_FINALS_BEFORE_REPROMPT = 2;
   private readonly REPROMPT_MIN_GAP_MS = 8000;
   private readonly MAX_REPROMPTS_PER_CALL = 3;
-  private readonly REPROMPT_TEXT = "Sorry, I didn't catch that. Could you say that again?";
+  private readonly REPROMPT_TEXT = "Hello? आपकी आवाज़ नहीं आ रही, क्या आप सुन रहे हैं?";
+
+  // ─── Silence Timer (dead-air after agent finishes speaking) ────────────
+  /** Timer that fires if caller is silent for SILENCE_TIMEOUT_MS after agent speaks. */
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly SILENCE_TIMEOUT_MS = 4000;
 
   // ─── Playback Duration Tracking ──────────────────────────────────────
   // ElevenLabs generates all audio in ~200ms but Twilio plays it over 3-5s.
@@ -146,7 +151,9 @@ export class CallOrchestrator {
     this.callSid        = callSid;
     this.twilioService  = twilioService;
     this.stt            = new DeepgramSTT(callSid);
-    this.tts            = new ElevenLabsTTS(callSid);
+    this.tts            = Env.ttsProvider === 'sarvam'
+                            ? new SarvamTTS(callSid)
+                            : new ElevenLabsTTS(callSid);
     this.llm            = new BedrockLLM(callSid, globalToolRegistry);
     this.conversation   = new ConversationManager(callSid);
     this.latency        = new LatencyTracker(callSid);
@@ -180,16 +187,11 @@ export class CallOrchestrator {
       .onError((err)          => this.log.error('TTS error', err));
 
     this.stt.connect();
-    void this.tts.open().catch(() => { /* logged inside ElevenLabsTTS */ });
+    void this.tts.open().catch(() => { /* logged inside TTS provider */ });
     this.log.info('Call orchestrator ready', { state: this.state });
 
-    // Send greeting immediately — agent speaks first so caller isn't met with silence.
-    // Pre-recorded greeting plays instantly; LLM+TTS warmup happens in parallel.
-    if (hasGreetingAudio()) {
-      this.sendCachedGreeting();
-    } else {
-      void this.sendLLMGreeting();
-    }
+    // Fixed greeting via TTS — no LLM needed. Reliable and fast.
+    this.speakCanned('Hello, मैं Arjun बोल रहा हूँ, मैं एक real estate sales consultant हूँ, आपका नाम बता सकते हैं?');
   }
 
   /**
@@ -264,11 +266,12 @@ export class CallOrchestrator {
 
     this.bargeIn.disarm();
 
-    // Cancel playback timer
+    // Cancel timers
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
     }
+    this.clearSilenceTimer();
 
     // Abort any active generation
     this.abortController?.abort();
@@ -299,9 +302,9 @@ export class CallOrchestrator {
     this.latency.mark('tts_prewarm_start');
     this.tts.open().then(() => {
       this.latency.mark('tts_open');
-      this.log.info('ElevenLabs reconnected (was closed)');
+      this.log.info('TTS reconnected (was closed)');
     }).catch((err: Error) => {
-      this.log.warn('ElevenLabs reconnect failed', { error: err.message });
+      this.log.warn('TTS reconnect failed', { error: err.message });
     });
   }
 
@@ -425,6 +428,12 @@ export class CallOrchestrator {
    * (verified in call logs), so words are a safe, instant interrupt signal —
    * ~300ms after speech onset instead of waiting ~1s+ for speech_final.
    */
+  /**
+   * Filler/echo words that Deepgram produces from PSTN echo of the agent's
+   * own TTS audio. These must NOT trigger interim barge-in.
+   */
+  private static readonly ECHO_FILLER_PATTERN = /^(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh)(\s+(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh))*$/i;
+
   private handleInterimTranscript(text: string): void {
     // SPEAKING only — during GENERATING, trailing interims from the user's
     // own just-finished utterance would cancel the generation they triggered.
@@ -432,6 +441,13 @@ export class CallOrchestrator {
     if (this.state !== 'SPEAKING') return;
     if (this.suppressBargeInArm) return; // greeting — no barge-in
     if (!text.trim()) return;
+
+    // Filter out filler/echo words — PSTN echo of agent TTS is often
+    // transcribed as "Mhmm mhmm mhmm" by Deepgram. Not real speech.
+    if (CallOrchestrator.ECHO_FILLER_PATTERN.test(text.trim())) {
+      this.log.debug('Interim ignored (echo/filler pattern)', { text });
+      return;
+    }
 
     this.log.info('BargeInDetected (interim words during agent speech)', { text });
     this.handleInterruption();
@@ -447,6 +463,7 @@ export class CallOrchestrator {
     this.consecutiveEmptyVADs = 0;
     this.emptyFinalStreak = 0;
     this.lastTranscriptAt = Date.now();
+    this.clearSilenceTimer();
 
     const transcriptAt = Date.now();
     this.latency.mark('speech_final', transcriptAt);
@@ -684,6 +701,35 @@ export class CallOrchestrator {
       // VAD-triggered prewarm path is suppressed for POST_TTS_VAD_SUPPRESS_MS
       // after TTS ends, so without this the next turn pays the WS connect cost.
       this.prewarmTTS();
+
+      // Start silence timer — if caller doesn't speak within SILENCE_TIMEOUT_MS, reprompt.
+      this.startSilenceTimer();
+    }
+  }
+
+  /** Start a timer that reprompts if caller is silent for SILENCE_TIMEOUT_MS. */
+  private startSilenceTimer(): void {
+    this.clearSilenceTimer();
+    this.silenceTimer = setTimeout(() => {
+      this.silenceTimer = null;
+      if (this.state !== 'LISTENING') return;
+      if (Date.now() - this.lastRepromptAt < this.REPROMPT_MIN_GAP_MS) return;
+      if (this.repromptCount >= this.MAX_REPROMPTS_PER_CALL) return;
+
+      this.lastRepromptAt = Date.now();
+      this.repromptCount++;
+      this.log.warn('Silence timer: reprompting caller', {
+        repromptCount: this.repromptCount,
+        silenceMs: this.SILENCE_TIMEOUT_MS,
+      });
+      this.speakCanned(this.REPROMPT_TEXT);
+    }, this.SILENCE_TIMEOUT_MS);
+  }
+
+  private clearSilenceTimer(): void {
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
     }
   }
 
