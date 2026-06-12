@@ -35,6 +35,7 @@ import { ConversationManager } from '../llm/ConversationManager';
 import { LatencyTracker } from '../metrics/LatencyTracker';
 import { TwilioService } from '../telephony/TwilioService';
 import { globalToolRegistry } from '../tools/ToolRegistry';
+import { humanizeResponse, maybeGetOpener } from '../shared/humanize';
 import { Env } from '../config/env';
 import { Logger, closeCallLogger } from '../shared/logger';
 import type { StreamEvent } from '../llm/types';
@@ -81,6 +82,13 @@ export class CallOrchestrator {
 
   /** Tracks the full text accumulated so far in the active generation. */
   private activeResponseText = '';
+
+  /**
+   * Terminal state: once a site visit is confirmed (day + time acknowledged),
+   * no further LLM generations or reprompts are allowed. The call ends
+   * cleanly after the final acknowledgement plays.
+   */
+  private conversationComplete = false;
 
   /**
    * When true, the active generation should NOT arm the barge-in detector
@@ -376,20 +384,25 @@ export class CallOrchestrator {
   // ─── No-Speech Recovery ───────────────────────────────────────────────────
 
   /**
-   * Deepgram ended an utterance with zero decoded words. Just log it.
-   * Reprompting is handled solely by the silence timer (SILENCE_TIMEOUT_MS)
-   * to avoid false triggers from empty transcripts and PSTN echo.
+   * Deepgram ended an utterance with zero decoded words.
+   * Restart the silence timer so the agent eventually reprompts — without this,
+   * if handleSpeechStarted() cleared the timer and then recognition fails,
+   * the agent goes permanently silent (no transcript, no timer, no recovery).
    */
   private handleNoSpeech(): void {
     if (this.state !== 'LISTENING') return;
     this.emptyFinalStreak++;
-    this.log.debug('Empty speech event (no reprompt — silence timer handles this)', {
+    this.log.debug('Empty speech event — restarting silence timer', {
       emptyFinalStreak: this.emptyFinalStreak,
     });
+    // Restart silence timer so we reprompt if caller remains silent after
+    // a failed recognition attempt.
+    this.startSilenceTimer();
   }
 
   /** Speak a fixed phrase through the persistent TTS — no LLM involved. */
   private speakCanned(text: string): void {
+    if (this.conversationComplete) return; // No more speech after scheduling confirmed
     const myGenId = ++this.generationId;
     this.activeResponseText = text;
 
@@ -486,6 +499,12 @@ export class CallOrchestrator {
     // handleInterruption or end() may have changed state
     if ((this.state as string) === 'ENDED') return;
 
+    // Terminal state — no further generations after site visit confirmed.
+    if (this.conversationComplete) {
+      this.log.info('Ignoring transcript — conversation already complete', { text });
+      return;
+    }
+
     this.conversation.addUserMessage(text);
     this.state = 'GENERATING';
 
@@ -537,17 +556,21 @@ export class CallOrchestrator {
     // a false barge-in and abort the LLM before it has sent a single token.
     this.suppressBargeInArm = opts.suppressBargeIn ?? false;
 
-    // Socket should already be open (persistent); open() is an idempotent
-    // safety net after an unexpected close. streamText() queues while
-    // reconnecting and drains automatically.
-    const ttsOpenPromise = tts.open().then(() => {
-      if (!this.latency.hasMarked('tts_open')) this.latency.mark('tts_open');
-    }).catch((err: Error) => {
-      this.log.error('ElevenLabs failed to open', err);
-    });
+    // Socket should already be open (persistent from call start).
+    // If it dropped unexpectedly, streamText() queues and startTurn() reconnects.
+    // No need to await — fire-and-forget safety net only.
+    if (!this.tts.isActive) {
+      tts.open().then(() => {
+        if (!this.latency.hasMarked('tts_open')) this.latency.mark('tts_open');
+      }).catch((err: Error) => {
+        this.log.error('TTS failed to open', err);
+      });
+    }
 
     let fullText = '';
     let firstToken = true;
+    // Decide upfront whether this turn gets a humanization opener (~7% chance).
+    const humanPrefix = Env.humanization.enabled ? maybeGetOpener() : '';
 
     // ZERO BUFFERING: stream every token directly to TTS the instant it
     // arrives. Audio starts once 50 chars accumulate (chunk_length_schedule)
@@ -570,6 +593,10 @@ export class CallOrchestrator {
             this.latency.mark('llm_first_token');
             this.latency.mark('tts_first_text');
             this.log.info('LLM first token received — streaming to TTS immediately');
+            // Prepend humanization opener before first token (if selected)
+            if (humanPrefix) {
+              tts.streamText(humanPrefix);
+            }
           }
 
           // Stream every token directly to TTS — no buffering
@@ -602,13 +629,16 @@ export class CallOrchestrator {
     if (fullText.trim()) {
       this.conversation.addAssistantText(fullText);
       this.log.info('LLM generation complete', { responseLength: fullText.length });
+
+      // Detect scheduling confirmation — terminal state.
+      if (this.isSchedulingConfirmation(fullText)) {
+        this.conversationComplete = true;
+        this.log.info('Conversation complete — site visit scheduled, will end call after playback');
+      }
     }
 
     tts.flush();
     this.abortController = null;
-
-    // Ensure ttsOpenPromise doesn't become an unhandled rejection
-    await ttsOpenPromise;
   }
 
   // ─── TTS Output ───────────────────────────────────────────────────────────
@@ -691,18 +721,26 @@ export class CallOrchestrator {
     this.bargeIn.disarm();
     this.lastTTSCompleteAt = Date.now();
 
-    if (this.state !== 'ENDED') {
-      this.state = 'LISTENING';
-      this.log.info('Playback complete — now LISTENING');
+    if (this.state === 'ENDED') return;
 
-      // Pre-warm TTS now — the user usually replies within seconds, and the
-      // VAD-triggered prewarm path is suppressed for POST_TTS_VAD_SUPPRESS_MS
-      // after TTS ends, so without this the next turn pays the WS connect cost.
-      this.prewarmTTS();
-
-      // Start silence timer — if caller doesn't speak within SILENCE_TIMEOUT_MS, reprompt.
-      this.startSilenceTimer();
+    // Terminal state: conversation is complete (site visit scheduled).
+    // End the call cleanly after the final acknowledgement played.
+    if (this.conversationComplete) {
+      this.log.info('Playback complete — conversation complete, ending call');
+      void this.end();
+      return;
     }
+
+    this.state = 'LISTENING';
+    this.log.info('Playback complete — now LISTENING');
+
+    // Pre-warm TTS now — the user usually replies within seconds, and the
+    // VAD-triggered prewarm path is suppressed for POST_TTS_VAD_SUPPRESS_MS
+    // after TTS ends, so without this the next turn pays the WS connect cost.
+    this.prewarmTTS();
+
+    // Start silence timer — if caller doesn't speak within SILENCE_TIMEOUT_MS, reprompt.
+    this.startSilenceTimer();
   }
 
   /** Start a timer that reprompts if caller is silent for SILENCE_TIMEOUT_MS. */
@@ -797,6 +835,29 @@ export class CallOrchestrator {
   private genIdFromContext(ctxId: string): number {
     const n = parseInt(ctxId.slice(1), 10);
     return Number.isNaN(n) ? -1 : n;
+  }
+
+  // ─── Scheduling Completion Detection ────────────────────────────────────
+
+  /**
+   * Detect if the LLM response is a site visit scheduling confirmation.
+   * Matches patterns like: "noted Saturday 11 AM", "scheduled", "booked",
+   * "visit is confirmed" combined with day/time references.
+   * Synchronous, <1ms, no LLM call.
+   */
+  private static readonly SCHEDULE_CONFIRM_PATTERN =
+    /\b(noted|booked|scheduled|confirm|confirmed|book\b.*(?:for|on)|visit.*(?:book|confirm|noted|schedule))/i;
+  private static readonly DAY_TIME_PATTERN =
+    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend|weekday|tomorrow|आज|कल|\d{1,2}\s*(?:AM|PM|am|pm|बजे))/i;
+  private static readonly THANK_CLOSE_PATTERN =
+    /\b(thank\s*you|धन्यवाद|शुक्रिया)\b/i;
+
+  private isSchedulingConfirmation(text: string): boolean {
+    // Must have a scheduling action word
+    if (!CallOrchestrator.SCHEDULE_CONFIRM_PATTERN.test(text)) return false;
+    // Must also reference a day/time OR be a thank-you closing
+    return CallOrchestrator.DAY_TIME_PATTERN.test(text) ||
+           CallOrchestrator.THANK_CLOSE_PATTERN.test(text);
   }
 
   get currentState(): CallState { return this.state; }

@@ -21,8 +21,9 @@ export type LatencyEvent =
 
 /** Human-readable event names logged on every mark (one line per event). */
 const EVENT_LABELS: Partial<Record<LatencyEvent, string>> = {
+  speech_started:        'SpeechEnd',
   speech_final:          'FinalTranscript',
-  llm_start:             'LLMRequestStart',
+  llm_start:             'LLMStart',
   llm_first_token:       'FirstToken',
   tts_first_text:        'TTSStart',
   tts_first_audio:       'FirstAudio',

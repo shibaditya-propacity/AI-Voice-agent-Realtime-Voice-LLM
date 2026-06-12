@@ -271,8 +271,12 @@ export class SarvamTTS {
       model: Env.sarvam.modelId,
       pace: Env.sarvam.pace,
       enable_preprocessing: true,
+      // Lowest possible — start generating audio as early as possible.
+      // Sarvam minimum is 30 chars. Short responses (12 words) are ~60 chars
+      // total, so first audio fires after ~50% of text arrives.
       min_buffer_size: 30,
-      max_chunk_length: 150,
+      // Keep short for faster incremental chunks on longer responses
+      max_chunk_length: 100,
       ...(Env.sarvam.temperature !== undefined && { temperature: Env.sarvam.temperature }),
     };
     this.log.info('Sarvam config sent', { target_language_code: config.target_language_code, speaker: config.speaker });
