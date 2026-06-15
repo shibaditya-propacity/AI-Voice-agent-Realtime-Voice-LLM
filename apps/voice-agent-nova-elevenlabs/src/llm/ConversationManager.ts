@@ -51,6 +51,17 @@ export class ConversationManager {
   }
 
   /**
+   * Discard the last user message — used when speculative generation
+   * from a stable interim is invalidated by a different speech_final.
+   */
+  discardLastUserMessage(): void {
+    if (this.history.length > 0 && this.history[this.history.length - 1]?.role === 'user') {
+      this.history.pop();
+      this.log.debug('Discarded speculative user message');
+    }
+  }
+
+  /**
    * Discard the last assistant message on barge-in so the model
    * doesn't see an incomplete assistant turn in context.
    */

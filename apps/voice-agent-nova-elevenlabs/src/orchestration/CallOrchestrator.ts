@@ -28,12 +28,14 @@
 import { DeepgramSTT } from '../stt/DeepgramSTT';
 import { BedrockLLM }  from '../llm/BedrockLLM';
 import { ElevenLabsTTS } from '../tts/ElevenLabsTTS';
+import { SarvamTTS } from '../tts/SarvamTTS';
 import { hasGreetingAudio, getGreetingChunks } from '../tts/GreetingCache';
 import { BargeInDetector } from '../interruption/BargeInDetector';
 import { ConversationManager } from '../llm/ConversationManager';
 import { LatencyTracker } from '../metrics/LatencyTracker';
 import { TwilioService } from '../telephony/TwilioService';
 import { globalToolRegistry } from '../tools/ToolRegistry';
+import { humanizeResponse, maybeGetOpener } from '../shared/humanize';
 import { Env } from '../config/env';
 import { Logger, closeCallLogger } from '../shared/logger';
 import type { StreamEvent } from '../llm/types';
@@ -73,14 +75,27 @@ export class CallOrchestrator {
   private abortController: AbortController | null = null;
 
   /**
-   * Persistent ElevenLabs multi-context WS — opened once at call start and
-   * reused for every turn. Each generation is a context; barge-in closes
-   * the context, never the socket.
+   * Persistent TTS WS — opened once at call start and reused for every turn.
+   * Provider selected by TTS_PROVIDER env var (elevenlabs | sarvam).
    */
-  private readonly tts: ElevenLabsTTS;
+  private readonly tts: ElevenLabsTTS | SarvamTTS;
 
   /** Tracks the full text accumulated so far in the active generation. */
   private activeResponseText = '';
+
+  /**
+   * Speculative generation: when a stable interim fires, we start LLM+TTS
+   * speculatively. If speech_final confirms the same text, we keep going
+   * (saving ~150-300ms). If text differs, we abort and restart with the real text.
+   */
+  private speculativeText: string | null = null;
+
+  /**
+   * Terminal state: once a site visit is confirmed (day + time acknowledged),
+   * no further LLM generations or reprompts are allowed. The call ends
+   * cleanly after the final acknowledgement plays.
+   */
+  private conversationComplete = false;
 
   /**
    * When true, the active generation should NOT arm the barge-in detector
@@ -124,7 +139,12 @@ export class CallOrchestrator {
   private readonly EMPTY_FINALS_BEFORE_REPROMPT = 2;
   private readonly REPROMPT_MIN_GAP_MS = 8000;
   private readonly MAX_REPROMPTS_PER_CALL = 3;
-  private readonly REPROMPT_TEXT = "Sorry, I didn't catch that. Could you say that again?";
+  private readonly REPROMPT_TEXT = "Hello? आपकी आवाज़ नहीं आ रही, क्या आप सुन रहे हैं?";
+
+  // ─── Silence Timer (dead-air after agent finishes speaking) ────────────
+  /** Timer that fires if caller is silent for SILENCE_TIMEOUT_MS after agent speaks. */
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly SILENCE_TIMEOUT_MS = 7000;
 
   // ─── Playback Duration Tracking ──────────────────────────────────────
   // ElevenLabs generates all audio in ~200ms but Twilio plays it over 3-5s.
@@ -139,6 +159,9 @@ export class CallOrchestrator {
   /** Timer that transitions SPEAKING→LISTENING after estimated playback completes. */
   private playbackCompleteTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Timer that unmutes STT after barge-in grace period (echo suppression). */
+  private sttUnmuteTimer: ReturnType<typeof setTimeout> | null = null;
+
   /** Whether TTS generation is done (all chunks received from ElevenLabs). */
   private ttsGenerationDone = false;
 
@@ -146,7 +169,9 @@ export class CallOrchestrator {
     this.callSid        = callSid;
     this.twilioService  = twilioService;
     this.stt            = new DeepgramSTT(callSid);
-    this.tts            = new ElevenLabsTTS(callSid);
+    this.tts            = Env.ttsProvider === 'sarvam'
+                            ? new SarvamTTS(callSid)
+                            : new ElevenLabsTTS(callSid);
     this.llm            = new BedrockLLM(callSid, globalToolRegistry);
     this.conversation   = new ConversationManager(callSid);
     this.latency        = new LatencyTracker(callSid);
@@ -165,6 +190,7 @@ export class CallOrchestrator {
     this.stt
       .onSpeech(()               => this.handleSpeechStarted())
       .onInterim((text)          => this.handleInterimTranscript(text))
+      .onStableInterim((text, conf) => this.handleStableInterim(text, conf))
       .onTranscript((text, conf) => this.handleFinalTranscript(text, conf))
       .onNoSpeech(()             => this.handleNoSpeech())
       .onErr((err)               => this.log.error('STT error', err));
@@ -180,16 +206,11 @@ export class CallOrchestrator {
       .onError((err)          => this.log.error('TTS error', err));
 
     this.stt.connect();
-    void this.tts.open().catch(() => { /* logged inside ElevenLabsTTS */ });
+    void this.tts.open().catch(() => { /* logged inside TTS provider */ });
     this.log.info('Call orchestrator ready', { state: this.state });
 
-    // Send greeting immediately — agent speaks first so caller isn't met with silence.
-    // Pre-recorded greeting plays instantly; LLM+TTS warmup happens in parallel.
-    if (hasGreetingAudio()) {
-      this.sendCachedGreeting();
-    } else {
-      void this.sendLLMGreeting();
-    }
+    // Fixed greeting via TTS — no LLM needed. Reliable and fast.
+    this.speakCanned('Hi, मैं Arjun बोल रहा हूँ Akshay Vista से। क्या मैं आपका नाम जान सकता हूँ?');
   }
 
   /**
@@ -264,11 +285,16 @@ export class CallOrchestrator {
 
     this.bargeIn.disarm();
 
-    // Cancel playback timer
+    // Cancel timers
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
     }
+    if (this.sttUnmuteTimer) {
+      clearTimeout(this.sttUnmuteTimer);
+      this.sttUnmuteTimer = null;
+    }
+    this.clearSilenceTimer();
 
     // Abort any active generation
     this.abortController?.abort();
@@ -299,10 +325,35 @@ export class CallOrchestrator {
     this.latency.mark('tts_prewarm_start');
     this.tts.open().then(() => {
       this.latency.mark('tts_open');
-      this.log.info('ElevenLabs reconnected (was closed)');
+      this.log.info('TTS reconnected (was closed)');
     }).catch((err: Error) => {
-      this.log.warn('ElevenLabs reconnect failed', { error: err.message });
+      this.log.warn('TTS reconnect failed', { error: err.message });
     });
+  }
+
+  // ─── STT Echo Gating ──────────────────────────────────────────────────────
+  // Mute audio to Deepgram during the PSTN echo burst window (first ~1.5s of
+  // agent speech). After the grace period, unmute so transcript-gated barge-in
+  // works. This eliminates ~90% of empty transcript spam from echo.
+
+  private muteSTTForEchoBurst(): void {
+    this.stt.mute();
+    if (this.sttUnmuteTimer) clearTimeout(this.sttUnmuteTimer);
+    this.sttUnmuteTimer = setTimeout(() => {
+      this.sttUnmuteTimer = null;
+      if (this.state === 'SPEAKING' || this.state === 'GENERATING') {
+        this.stt.unmute();
+        this.log.debug('STT unmuted after echo grace period');
+      }
+    }, Env.bargeIn.graceMs);
+  }
+
+  private ensureSTTUnmuted(): void {
+    if (this.sttUnmuteTimer) {
+      clearTimeout(this.sttUnmuteTimer);
+      this.sttUnmuteTimer = null;
+    }
+    this.stt.unmute();
   }
 
   // ─── VAD / Speech Events ──────────────────────────────────────────────────
@@ -363,40 +414,35 @@ export class CallOrchestrator {
     // ── Valid speech in LISTENING state ──────────────────────────────────
     this.latency.mark('speech_started');
     this.log.info('Speech started (VAD)', { state: this.state });
+
+    // User is speaking — reset silence timer so we don't reprompt mid-speech.
+    this.clearSilenceTimer();
+
     this.prewarmTTS();
   }
 
   // ─── No-Speech Recovery ───────────────────────────────────────────────────
 
   /**
-   * Deepgram ended an utterance with zero decoded words. If this keeps
-   * happening while we're LISTENING, the caller is talking but recognition
-   * is failing — re-prompt instead of leaving the call dead.
+   * Deepgram ended an utterance with zero decoded words.
+   * Restart the silence timer so the agent eventually reprompts — without this,
+   * if handleSpeechStarted() cleared the timer and then recognition fails,
+   * the agent goes permanently silent (no transcript, no timer, no recovery).
    */
   private handleNoSpeech(): void {
     if (this.state !== 'LISTENING') return;
-
-    // Ignore TTS echo tail — those empty finals are our own voice.
-    if (this.lastTTSCompleteAt > 0 &&
-        Date.now() - this.lastTTSCompleteAt < this.POST_TTS_VAD_SUPPRESS_MS) return;
-
     this.emptyFinalStreak++;
-    if (this.emptyFinalStreak < this.EMPTY_FINALS_BEFORE_REPROMPT) return;
-    if (Date.now() - this.lastRepromptAt < this.REPROMPT_MIN_GAP_MS) return;
-    if (this.repromptCount >= this.MAX_REPROMPTS_PER_CALL) return;
-
-    this.emptyFinalStreak = 0;
-    this.lastRepromptAt = Date.now();
-    this.repromptCount++;
-
-    this.log.warn('No-speech recovery: re-prompting caller', {
-      repromptCount: this.repromptCount,
+    this.log.debug('Empty speech event — restarting silence timer', {
+      emptyFinalStreak: this.emptyFinalStreak,
     });
-    this.speakCanned(this.REPROMPT_TEXT);
+    // Restart silence timer so we reprompt if caller remains silent after
+    // a failed recognition attempt.
+    this.startSilenceTimer();
   }
 
   /** Speak a fixed phrase through the persistent TTS — no LLM involved. */
   private speakCanned(text: string): void {
+    if (this.conversationComplete) return; // No more speech after scheduling confirmed
     const myGenId = ++this.generationId;
     this.activeResponseText = text;
 
@@ -412,6 +458,9 @@ export class CallOrchestrator {
     this.state = 'SPEAKING';
     this.suppressBargeInArm = false;
 
+    // Mute STT during echo burst — unmutes after barge-in grace period
+    this.muteSTTForEchoBurst();
+
     this.tts.startTurn(`g${myGenId}`);
     this.tts.streamText(text);
     this.tts.flush();
@@ -425,16 +474,80 @@ export class CallOrchestrator {
    * (verified in call logs), so words are a safe, instant interrupt signal —
    * ~300ms after speech onset instead of waiting ~1s+ for speech_final.
    */
+  /**
+   * Filler/echo words that Deepgram produces from PSTN echo of the agent's
+   * own TTS audio. These must NOT trigger interim barge-in.
+   */
+  private static readonly ECHO_FILLER_PATTERN = /^(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh)(\s+(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh))*$/i;
+
   private handleInterimTranscript(text: string): void {
+    if (!text.trim()) return;
+
+    // Any real interim words in LISTENING = user is actively speaking.
+    // Reset silence timer to avoid reprompting mid-utterance.
+    if (this.state === 'LISTENING') {
+      this.clearSilenceTimer();
+      return;
+    }
+
     // SPEAKING only — during GENERATING, trailing interims from the user's
     // own just-finished utterance would cancel the generation they triggered.
     // The final-transcript path still replaces the turn in that window.
     if (this.state !== 'SPEAKING') return;
     if (this.suppressBargeInArm) return; // greeting — no barge-in
-    if (!text.trim()) return;
+
+    // Filter out filler/echo words — PSTN echo of agent TTS is often
+    // transcribed as "Mhmm mhmm mhmm" by Deepgram. Not real speech.
+    if (CallOrchestrator.ECHO_FILLER_PATTERN.test(text.trim())) {
+      this.log.debug('Interim ignored (echo/filler pattern)', { text });
+      return;
+    }
 
     this.log.info('BargeInDetected (interim words during agent speech)', { text });
     this.handleInterruption();
+  }
+
+  // ─── Stable Interim → Speculative LLM Generation ──────────────────────────
+
+  /**
+   * Stable interim: Deepgram interims haven't changed for ~150ms, meaning
+   * the user likely stopped speaking and we're just waiting for endpointing
+   * to confirm. Start LLM generation speculatively to overlap with the
+   * endpointing window (~150ms). If speech_final confirms the same text,
+   * we save ~150-300ms. If text differs, handleFinalTranscript aborts and restarts.
+   */
+  private handleStableInterim(text: string, confidence: number): void {
+    // Only start speculative generation in LISTENING state
+    if (this.state !== 'LISTENING') return;
+    if (!text.trim()) return;
+    if (this.conversationComplete) return;
+
+    this.log.info('Speculative LLM start from stable interim', {
+      text,
+      confidence,
+      state: this.state,
+    });
+
+    // Reset noise tracking — real speech detected
+    this.consecutiveEmptyVADs = 0;
+    this.emptyFinalStreak = 0;
+    this.lastTranscriptAt = Date.now();
+    this.clearSilenceTimer();
+
+    this.latency.mark('stable_interim');
+
+    // Record the speculative text so handleFinalTranscript can compare
+    this.speculativeText = text.trim();
+
+    // Add to conversation and start generating
+    this.conversation.addUserMessage(text.trim());
+    this.state = 'GENERATING';
+
+    this.log.info('Stable interim → speculative LLM handoff', {
+      transcriptLenChars: text.trim().length,
+    });
+
+    void this.generateAndSpeak();
   }
 
   // ─── Final Transcript ─────────────────────────────────────────────────────
@@ -447,6 +560,7 @@ export class CallOrchestrator {
     this.consecutiveEmptyVADs = 0;
     this.emptyFinalStreak = 0;
     this.lastTranscriptAt = Date.now();
+    this.clearSilenceTimer();
 
     const transcriptAt = Date.now();
     this.latency.mark('speech_final', transcriptAt);
@@ -454,8 +568,47 @@ export class CallOrchestrator {
       text,
       confidence,
       state: this.state,
+      speculativeText: this.speculativeText,
       speechFinalToNowMs: 0, // this IS the speech_final event
     });
+
+    // ── Speculative generation reconciliation ──────────────────────────
+    // If we already started a speculative LLM generation from a stable interim,
+    // check if the final text matches. If so, the speculation was correct —
+    // let it continue (huge latency win). If not, abort and restart.
+    if (this.speculativeText !== null) {
+      const specText = this.speculativeText;
+      this.speculativeText = null;
+
+      if (text.trim() === specText) {
+        // Speculation confirmed — generation is already running, nothing to do.
+        this.log.info('Speculative generation CONFIRMED by speech_final', {
+          text: specText,
+          savedMs: Date.now() - transcriptAt,
+        });
+        return;
+      }
+
+      // Text differs — abort speculative generation and restart with real text.
+      this.log.warn('Speculative generation INVALIDATED — aborting', {
+        speculative: specText,
+        final: text.trim(),
+      });
+      // Cancel in-flight LLM+TTS
+      this.generationId++;
+      if (this.abortController) {
+        this.abortController.abort();
+        this.abortController = null;
+      }
+      this.tts.abort();
+      this.twilioService.clearAudio(this.callSid);
+      // Remove the speculative user message from conversation history
+      this.conversation.discardLastUserMessage();
+      this.conversation.discardLastAssistantMessage();
+      this.state = 'LISTENING';
+      this.ensureSTTUnmuted();
+      // Fall through to start fresh generation with the real text
+    }
 
     // Transcript-gated barge-in: if the agent is still speaking, a real
     // transcript (not just VAD) is the authoritative signal to interrupt.
@@ -470,6 +623,12 @@ export class CallOrchestrator {
 
     // handleInterruption or end() may have changed state
     if ((this.state as string) === 'ENDED') return;
+
+    // Terminal state — no further generations after site visit confirmed.
+    if (this.conversationComplete) {
+      this.log.info('Ignoring transcript — conversation already complete', { text });
+      return;
+    }
 
     this.conversation.addUserMessage(text);
     this.state = 'GENERATING';
@@ -522,17 +681,24 @@ export class CallOrchestrator {
     // a false barge-in and abort the LLM before it has sent a single token.
     this.suppressBargeInArm = opts.suppressBargeIn ?? false;
 
-    // Socket should already be open (persistent); open() is an idempotent
-    // safety net after an unexpected close. streamText() queues while
-    // reconnecting and drains automatically.
-    const ttsOpenPromise = tts.open().then(() => {
-      if (!this.latency.hasMarked('tts_open')) this.latency.mark('tts_open');
-    }).catch((err: Error) => {
-      this.log.error('ElevenLabs failed to open', err);
-    });
+    // Mute STT during echo burst — unmutes after barge-in grace period
+    this.muteSTTForEchoBurst();
+
+    // Socket should already be open (persistent from call start).
+    // If it dropped unexpectedly, streamText() queues and startTurn() reconnects.
+    // No need to await — fire-and-forget safety net only.
+    if (!this.tts.isActive) {
+      tts.open().then(() => {
+        if (!this.latency.hasMarked('tts_open')) this.latency.mark('tts_open');
+      }).catch((err: Error) => {
+        this.log.error('TTS failed to open', err);
+      });
+    }
 
     let fullText = '';
     let firstToken = true;
+    // Decide upfront whether this turn gets a humanization opener (~7% chance).
+    const humanPrefix = Env.humanization.enabled ? maybeGetOpener() : '';
 
     // ZERO BUFFERING: stream every token directly to TTS the instant it
     // arrives. Audio starts once 50 chars accumulate (chunk_length_schedule)
@@ -555,6 +721,10 @@ export class CallOrchestrator {
             this.latency.mark('llm_first_token');
             this.latency.mark('tts_first_text');
             this.log.info('LLM first token received — streaming to TTS immediately');
+            // Prepend humanization opener before first token (if selected)
+            if (humanPrefix) {
+              tts.streamText(humanPrefix);
+            }
           }
 
           // Stream every token directly to TTS — no buffering
@@ -587,13 +757,16 @@ export class CallOrchestrator {
     if (fullText.trim()) {
       this.conversation.addAssistantText(fullText);
       this.log.info('LLM generation complete', { responseLength: fullText.length });
+
+      // Detect scheduling confirmation — terminal state.
+      if (this.isSchedulingConfirmation(fullText)) {
+        this.conversationComplete = true;
+        this.log.info('Conversation complete — site visit scheduled, will end call after playback');
+      }
     }
 
     tts.flush();
     this.abortController = null;
-
-    // Ensure ttsOpenPromise doesn't become an unhandled rejection
-    await ttsOpenPromise;
   }
 
   // ─── TTS Output ───────────────────────────────────────────────────────────
@@ -676,14 +849,65 @@ export class CallOrchestrator {
     this.bargeIn.disarm();
     this.lastTTSCompleteAt = Date.now();
 
-    if (this.state !== 'ENDED') {
-      this.state = 'LISTENING';
-      this.log.info('Playback complete — now LISTENING');
+    if (this.state === 'ENDED') return;
 
-      // Pre-warm TTS now — the user usually replies within seconds, and the
-      // VAD-triggered prewarm path is suppressed for POST_TTS_VAD_SUPPRESS_MS
-      // after TTS ends, so without this the next turn pays the WS connect cost.
-      this.prewarmTTS();
+    // Terminal state: conversation is complete (site visit scheduled).
+    // End the call cleanly after the final acknowledgement played.
+    if (this.conversationComplete) {
+      this.log.info('Playback complete — conversation complete, ending call');
+      void this.end();
+      return;
+    }
+
+    this.state = 'LISTENING';
+    this.ensureSTTUnmuted();
+    this.log.info('Playback complete — now LISTENING');
+
+    // Pre-warm TTS now — the user usually replies within seconds, and the
+    // VAD-triggered prewarm path is suppressed for POST_TTS_VAD_SUPPRESS_MS
+    // after TTS ends, so without this the next turn pays the WS connect cost.
+    this.prewarmTTS();
+
+    // Start silence timer — if caller doesn't speak within SILENCE_TIMEOUT_MS, reprompt.
+    this.startSilenceTimer();
+  }
+
+  /** Start a timer that reprompts if caller is silent for SILENCE_TIMEOUT_MS. */
+  private startSilenceTimer(): void {
+    this.clearSilenceTimer();
+    this.silenceTimer = setTimeout(() => {
+      this.silenceTimer = null;
+      if (this.state !== 'LISTENING') return;
+      if (Date.now() - this.lastRepromptAt < this.REPROMPT_MIN_GAP_MS) return;
+      if (this.repromptCount >= this.MAX_REPROMPTS_PER_CALL) return;
+
+      // Don't reprompt if user recently spoke (VAD/transcript within last 2s)
+      // — they may be mid-utterance or Deepgram is still processing.
+      const now = Date.now();
+      const recentActivity = Math.max(this.lastVADAt, this.lastTranscriptAt);
+      if (recentActivity > 0 && now - recentActivity < 2000) {
+        this.log.debug('Silence timer deferred (recent user activity)', {
+          msSinceActivity: now - recentActivity,
+        });
+        // Restart timer for another check
+        this.startSilenceTimer();
+        return;
+      }
+
+      this.lastRepromptAt = Date.now();
+      this.repromptCount++;
+      this.log.warn('Silence timer: reprompting caller', {
+        repromptCount: this.repromptCount,
+        silenceMs: this.SILENCE_TIMEOUT_MS,
+      });
+      this.speakCanned(this.REPROMPT_TEXT);
+    }, this.SILENCE_TIMEOUT_MS);
+  }
+
+  private clearSilenceTimer(): void {
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
     }
   }
 
@@ -698,6 +922,7 @@ export class CallOrchestrator {
       audioBytesSent: this.ttsAudioBytesSent,
     });
     this.latency.mark('barge_in');
+    this.speculativeText = null;
 
     // Cancel playback-complete timer (barge-in supersedes it)
     if (this.playbackCompleteTimer) {
@@ -728,6 +953,7 @@ export class CallOrchestrator {
     this.conversation.discardLastAssistantMessage();
 
     this.state = 'LISTENING';
+    this.ensureSTTUnmuted();
     this.log.info('Barge-in handled — back to LISTENING');
 
     // Pre-warm TTS now — user is already speaking their next utterance
@@ -740,6 +966,29 @@ export class CallOrchestrator {
   private genIdFromContext(ctxId: string): number {
     const n = parseInt(ctxId.slice(1), 10);
     return Number.isNaN(n) ? -1 : n;
+  }
+
+  // ─── Scheduling Completion Detection ────────────────────────────────────
+
+  /**
+   * Detect if the LLM response is a site visit scheduling confirmation.
+   * Matches patterns like: "noted Saturday 11 AM", "scheduled", "booked",
+   * "visit is confirmed" combined with day/time references.
+   * Synchronous, <1ms, no LLM call.
+   */
+  private static readonly SCHEDULE_CONFIRM_PATTERN =
+    /\b(noted|booked|scheduled|confirm|confirmed|book\b.*(?:for|on)|visit.*(?:book|confirm|noted|schedule))/i;
+  private static readonly DAY_TIME_PATTERN =
+    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend|weekday|tomorrow|आज|कल|\d{1,2}\s*(?:AM|PM|am|pm|बजे))/i;
+  private static readonly THANK_CLOSE_PATTERN =
+    /\b(thank\s*you|धन्यवाद|शुक्रिया)\b/i;
+
+  private isSchedulingConfirmation(text: string): boolean {
+    // Must have a scheduling action word
+    if (!CallOrchestrator.SCHEDULE_CONFIRM_PATTERN.test(text)) return false;
+    // Must also reference a day/time OR be a thank-you closing
+    return CallOrchestrator.DAY_TIME_PATTERN.test(text) ||
+           CallOrchestrator.THANK_CLOSE_PATTERN.test(text);
   }
 
   get currentState(): CallState { return this.state; }
