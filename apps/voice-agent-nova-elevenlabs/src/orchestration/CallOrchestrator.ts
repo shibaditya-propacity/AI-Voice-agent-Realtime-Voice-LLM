@@ -483,6 +483,11 @@ export class CallOrchestrator {
   private handleInterimTranscript(text: string): void {
     if (!text.trim()) return;
 
+    // Track first interim for latency measurement (VAD → first words)
+    if (!this.latency.hasMarked('first_interim')) {
+      this.latency.mark('first_interim');
+    }
+
     // Any real interim words in LISTENING = user is actively speaking.
     // Reset silence timer to avoid reprompting mid-utterance.
     if (this.state === 'LISTENING') {
@@ -574,25 +579,50 @@ export class CallOrchestrator {
 
     // ── Speculative generation reconciliation ──────────────────────────
     // If we already started a speculative LLM generation from a stable interim,
-    // check if the final text matches. If so, the speculation was correct —
-    // let it continue (huge latency win). If not, abort and restart.
+    // check if the final text matches. Three outcomes:
+    //   1. EXACT MATCH: speculation confirmed — let it continue (huge win)
+    //   2. PREFIX MATCH: final extends speculative text — keep generation,
+    //      the extra words don't change the intent enough to matter
+    //      (e.g. "what are the amenities of the" → "...of the project")
+    //   3. MISMATCH: abort and restart with real text
     if (this.speculativeText !== null) {
       const specText = this.speculativeText;
       this.speculativeText = null;
+      const finalText = text.trim();
 
-      if (text.trim() === specText) {
-        // Speculation confirmed — generation is already running, nothing to do.
-        this.log.info('Speculative generation CONFIRMED by speech_final', {
+      if (finalText === specText) {
+        // Exact match — generation already running, nothing to do.
+        this.latency.recordSpeculation('confirmed_exact');
+        this.log.info('Speculative generation CONFIRMED (exact match)', {
           text: specText,
           savedMs: Date.now() - transcriptAt,
         });
         return;
       }
 
+      // Prefix match: final text starts with the speculative text.
+      // The LLM already received the core intent — extra trailing words
+      // (like "project" after "what are the amenities of the") rarely
+      // change the response meaningfully. Keep the generation running.
+      if (finalText.startsWith(specText) && specText.length >= 8) {
+        const extraWords = finalText.slice(specText.length).trim();
+        this.latency.recordSpeculation('confirmed_prefix');
+        this.log.info('Speculative generation CONFIRMED (prefix match)', {
+          speculative: specText,
+          final: finalText,
+          extraWords,
+          savedMs: Date.now() - transcriptAt,
+        });
+        // Update the user message in history to reflect the complete text
+        this.conversation.updateLastUserMessage(finalText);
+        return;
+      }
+
       // Text differs — abort speculative generation and restart with real text.
+      this.latency.recordSpeculation('invalidated');
       this.log.warn('Speculative generation INVALIDATED — aborting', {
         speculative: specText,
-        final: text.trim(),
+        final: finalText,
       });
       // Cancel in-flight LLM+TTS
       this.generationId++;

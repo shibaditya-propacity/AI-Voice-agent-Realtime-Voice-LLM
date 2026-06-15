@@ -68,6 +68,16 @@ export const Env = {
     // Minimum confidence to accept a final transcript (0.0–1.0).
     // Transcripts below this are treated as noise and discarded.
     minConfidence: optionalFloat('DEEPGRAM_MIN_CONFIDENCE', 0.4),
+
+    // ── Speculative Stable Interim Settings ─────────────────────────────
+    // Base stability window (ms) — how long interim text must stay unchanged.
+    // Lower = faster speculation but more invalidations. 120ms is sweet spot.
+    stableInterimBaseMs: optionalInt('DEEPGRAM_STABLE_INTERIM_BASE_MS', 120),
+    // Extended window for short transcripts (≤8 chars / ~1-2 words).
+    // Prevents firing on "what", "मेरा" etc. 300ms lets more words arrive.
+    stableInterimShortMs: optionalInt('DEEPGRAM_STABLE_INTERIM_SHORT_MS', 300),
+    // Character threshold below which the extended window is used.
+    stableShortCharThreshold: optionalInt('DEEPGRAM_STABLE_SHORT_CHAR_THRESHOLD', 8),
   },
 
   llm: {

@@ -83,10 +83,14 @@ export class DeepgramSTT {
   private stableInterimFired = false;
   /** Timer that fires when stability window expires without text change. */
   private stableInterimTimer: ReturnType<typeof setTimeout> | null = null;
-  /** How long interim text must remain unchanged to be considered stable (ms).
-   *  150ms matches endpointing — by this point Deepgram has observed enough
-   *  silence that the text is very likely final. */
-  private readonly STABLE_INTERIM_MS = 150;
+  /** Base stability window — how long interim text must remain unchanged (ms).
+   *  For short transcripts (≤2 words), a longer window is used to avoid
+   *  premature firing on partial utterances like "what" or "मेरा". */
+  private readonly STABLE_INTERIM_MS_BASE = Env.deepgram.stableInterimBaseMs;
+  /** Extended stability window for short transcripts (≤2 words / ≤8 chars). */
+  private readonly STABLE_INTERIM_MS_SHORT = Env.deepgram.stableInterimShortMs;
+  /** Character threshold below which the extended window applies. */
+  private readonly STABLE_SHORT_CHAR_THRESHOLD = Env.deepgram.stableShortCharThreshold;
 
   /**
    * Self-flush timer for is_final buffer. When Deepgram sends is_final without
@@ -300,6 +304,12 @@ export class DeepgramSTT {
           if (this.stableInterimTimer) {
             clearTimeout(this.stableInterimTimer);
           }
+          // Dynamic stability window: short text gets a longer window to avoid
+          // premature firing on partial utterances ("what" → "what is the budget").
+          const stableMs = trimmed.length <= this.STABLE_SHORT_CHAR_THRESHOLD
+            ? this.STABLE_INTERIM_MS_SHORT
+            : this.STABLE_INTERIM_MS_BASE;
+
           this.stableInterimTimer = setTimeout(() => {
             this.stableInterimTimer = null;
             if (!this.stableInterimFired && this.stableInterimText === trimmed) {
@@ -308,10 +318,11 @@ export class DeepgramSTT {
                 text: trimmed,
                 confidence,
                 stableForMs: Date.now() - this.stableInterimSince,
+                windowMs: stableMs,
               });
               this.onStableInterimCb?.(trimmed, confidence);
             }
-          }, this.STABLE_INTERIM_MS);
+          }, stableMs);
         }
       }
       return;

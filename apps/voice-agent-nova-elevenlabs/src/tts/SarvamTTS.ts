@@ -285,18 +285,26 @@ export class SarvamTTS {
   }
 
   /**
-   * Text accumulator — Sarvam rejects rapid-fire small text messages from
-   * LLM token streaming (even single-word messages like "Hello" trigger a
-   * delayed 400). Batch ALL text and send as a single message at flush().
-   * This matches the pattern that works reliably (speakCanned sends full
-   * text + flush). LLM responses are short (~25 tokens, ~24ms) so the
-   * added latency from waiting for flush is negligible.
+   * Text accumulator — Sarvam needs enough text to start synthesis
+   * (min_buffer_size=30 chars). We accumulate tokens until we hit the
+   * threshold, then send immediately so Sarvam can start generating audio
+   * while LLM continues producing tokens. Remaining text is sent at flush().
    */
   private preSendBuffer = '';
+  /** Minimum chars before sending a text chunk to Sarvam mid-stream.
+   *  Must match or exceed the min_buffer_size in config (30). */
+  private readonly PRE_SEND_THRESHOLD = 30;
 
   private sendText(text: string): void {
-    // Just accumulate — sent as one batch in flush()
     this.preSendBuffer += text;
+
+    // Once we accumulate enough text, send immediately so Sarvam can
+    // start synthesis in parallel with ongoing LLM token streaming.
+    // This reduces first-audio latency by ~100-200ms on longer responses.
+    if (this.preSendBuffer.length >= this.PRE_SEND_THRESHOLD) {
+      this.send({ type: 'text', data: { text: this.preSendBuffer } });
+      this.preSendBuffer = '';
+    }
   }
 
   private sendFlush(): void {

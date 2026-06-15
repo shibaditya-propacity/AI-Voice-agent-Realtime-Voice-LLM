@@ -62,6 +62,18 @@ export class ConversationManager {
   }
 
   /**
+   * Update the last user message text — used when speculative generation
+   * is confirmed via prefix match (final text extends the speculative text).
+   * Keeps the LLM generation running but corrects history for future context.
+   */
+  updateLastUserMessage(text: string): void {
+    if (this.history.length > 0 && this.history[this.history.length - 1]?.role === 'user') {
+      this.history[this.history.length - 1] = { role: 'user', content: text };
+      this.log.debug('Updated user message (prefix match)', { length: text.length });
+    }
+  }
+
+  /**
    * Discard the last assistant message on barge-in so the model
    * doesn't see an incomplete assistant turn in context.
    */
