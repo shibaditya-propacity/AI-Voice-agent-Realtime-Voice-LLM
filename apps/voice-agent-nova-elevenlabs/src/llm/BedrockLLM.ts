@@ -143,11 +143,12 @@ export class BedrockLLM {
   async *stream(
     messages: MessageParam[],
     abortSignal?: AbortSignal,
+    systemPrompt?: string,
   ): AsyncGenerator<StreamEvent> {
     const requestStart = Date.now();
     let firstTokenTime: number | null = null;
 
-    const openAIMessages = toOpenAIMessages(Env.llm.systemPrompt, messages);
+    const openAIMessages = toOpenAIMessages(systemPrompt ?? Env.llm.systemPrompt, messages);
 
     this.log.debug('Invoking LLM stream', {
       mode:    'groq',
