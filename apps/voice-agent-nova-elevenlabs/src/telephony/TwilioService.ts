@@ -73,14 +73,29 @@ export class TwilioService {
 
   async initiateOutboundCall(request: OutboundCallRequest): Promise<OutboundCallResponse> {
     const { to, from, metadata = {} } = request;
-    const webhookUrl = `${Env.twilio.webhookBaseUrl}/webhooks/twilio/voice`;
     const statusUrl  = `${Env.twilio.webhookBaseUrl}/webhooks/twilio/status`;
+
+    // Build TwiML inline — avoids Twilio needing to HTTP-fetch our webhook URL
+    // (ngrok/cloudflare tunnels are unreliable for Twilio's TwiML fetch).
+    const streamUrl = Env.twilio.webhookBaseUrl
+      .replace(/^https?:\/\//, 'wss://')
+      .replace(/^http:\/\//, 'ws://')
+      + '/stream';
+
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${streamUrl}">
+      <Parameter name="callerNumber" value="${to}"/>
+    </Stream>
+  </Connect>
+</Response>`;
 
     try {
       const call = await this.client.calls.create({
         to,
         from: from ?? Env.twilio.phoneNumber,
-        url: webhookUrl,
+        twiml,
         statusCallback: statusUrl,
         statusCallbackMethod: 'POST',
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],

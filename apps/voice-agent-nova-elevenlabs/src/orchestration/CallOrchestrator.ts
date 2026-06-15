@@ -529,9 +529,31 @@ export class CallOrchestrator {
     if (this.state !== 'LISTENING') return;
     if (!text.trim()) return;
     if (this.conversationComplete) return;
+    // Block generation if already booked
+    if (this.session.bookingStatus === 'BOOKED') {
+      this.log.info('Ignoring stable interim — booking already complete', { text });
+      return;
+    }
 
-    // Extract user info early from stable interim (name, date, time)
-    this.session.extractFromUserTranscript(text);
+    // ── Speculation safety gate ──────────────────────────────────────────
+    // Block speculative generation during name collection (names arrive in
+    // fragments: "मेरा" → "मेरा नाम" → "मेरा नाम शिवा") and for short
+    // utterances that don't look like complete queries.
+    if (!this.session.shouldAllowSpeculation(text)) {
+      this.log.info('Speculation blocked by safety gate', {
+        text,
+        lastAskedField: this.session.lastAskedField,
+        hasName: !!this.session.info.name,
+      });
+      // Still reset noise tracking and silence timer — real speech is happening
+      this.consecutiveEmptyVADs = 0;
+      this.lastTranscriptAt = Date.now();
+      this.clearSilenceTimer();
+      return;
+    }
+
+    // Do NOT extract user info from stable interims — wait for speech_final.
+    // Extracting from interims caused "मेरा नाम" (incomplete) to be stored as name.
 
     this.log.info('Speculative LLM start from stable interim', {
       text,
@@ -567,7 +589,19 @@ export class CallOrchestrator {
     if (this.state === 'ENDED') return;
     if (!text.trim()) return;
 
+    // Block all processing if already booked — call is ending
+    if (this.session.bookingStatus === 'BOOKED' || this.conversationComplete) {
+      this.log.info('Ignoring final transcript — conversation already complete', { text });
+      return;
+    }
+
+    // ── Track previous state for pin detection ─────────────────────────
+    const prevName = this.session.info.name;
+    const prevDate = this.session.info.preferredDate;
+    const prevTime = this.session.info.preferredTime;
+
     // ── Extract user info from transcript (name, date, time) ───────────
+    this.session.advanceTurn();
     this.session.extractFromUserTranscript(text);
 
     // ── Reset noise tracking — real speech confirmed ────────────────────
@@ -663,13 +697,19 @@ export class CallOrchestrator {
     // handleInterruption or end() may have changed state
     if ((this.state as string) === 'ENDED') return;
 
-    // Terminal state — no further generations after site visit confirmed.
-    if (this.conversationComplete) {
-      this.log.info('Ignoring transcript — conversation already complete', { text });
-      return;
+    this.conversation.addUserMessage(text);
+
+    // ── Pin message if it contained critical info extraction ──────────
+    if (!prevName && this.session.info.name) {
+      this.conversation.pinLastUserMessage('name:' + this.session.info.name);
+    }
+    if (!prevDate && this.session.info.preferredDate) {
+      this.conversation.pinLastUserMessage('date:' + this.session.info.preferredDate);
+    }
+    if (!prevTime && this.session.info.preferredTime) {
+      this.conversation.pinLastUserMessage('time:' + this.session.info.preferredTime);
     }
 
-    this.conversation.addUserMessage(text);
     this.state = 'GENERATING';
 
     this.log.info('Transcript → LLM handoff', {
@@ -684,6 +724,13 @@ export class CallOrchestrator {
   // ─── LLM + TTS Pipeline ───────────────────────────────────────────────────
 
   private async generateAndSpeak(opts: { suppressBargeIn?: boolean } = {}): Promise<void> {
+    // Hard block: never generate after booking is complete
+    if (this.session.bookingStatus === 'BOOKED' && !this.session.shouldEndCall) {
+      this.log.info('generateAndSpeak() blocked — booking already BOOKED');
+      this.state = 'LISTENING';
+      return;
+    }
+
     const myGenId = ++this.generationId;
     this.activeResponseText = '';
 
@@ -803,11 +850,36 @@ export class CallOrchestrator {
     // All tokens received — flush TTS to get remaining audio.
     // flush() handles the 'connecting' state via pendingFlush flag.
     if (fullText.trim()) {
+      // ── Post-generation output validation ──────────────────────────
+      // Catch hallucinations before they reach the user.
+      const validationIssues = this.session.validateOutput(fullText);
+
+      if (this.session.hasHallucinatedBooking(fullText)) {
+        // LLM claimed booking is done but state doesn't support it.
+        // Log the hallucination but still play the response (stripping would
+        // cause awkward silence). The session state machine will NOT advance
+        // to BOOKED, so the next turn will correct course.
+        this.log.warn('HALLUCINATION DETECTED: LLM claimed booking without CONFIRMATION_PENDING', {
+          text: fullText.substring(0, 100),
+          bookingStatus: this.session.bookingStatus,
+          hasDate: !!this.session.info.preferredDate,
+          hasTime: !!this.session.info.preferredTime,
+        });
+        // Do NOT call extractFromAssistantResponse — prevents false BOOKED transition
+      } else {
+        // Normal path: extract booking-related info from the assistant's response
+        this.session.extractFromAssistantResponse(fullText);
+      }
+
+      if (validationIssues.length > 0) {
+        this.log.warn('Output validation issues detected', {
+          issues: validationIssues,
+          text: fullText.substring(0, 150),
+        });
+      }
+
       this.conversation.addAssistantText(fullText);
       this.log.info('LLM generation complete', { responseLength: fullText.length });
-
-      // Extract booking-related info from the assistant's response
-      this.session.extractFromAssistantResponse(fullText);
 
       // State-aware completion: session state tracks whether all info
       // is collected AND the LLM confirmed the booking. This replaces
@@ -974,6 +1046,14 @@ export class CallOrchestrator {
   private handleInterruption(): void {
     if (this.state !== 'SPEAKING' && this.state !== 'GENERATING') return;
 
+    // Do NOT interrupt the final goodbye message — let it finish and end the call.
+    // Without this guard, a user saying "thanks" during the goodbye triggers
+    // a new generation cycle, making the agent continue talking after booking.
+    if (this.conversationComplete) {
+      this.log.info('Barge-in suppressed — conversation complete, letting final response finish');
+      return;
+    }
+
     this.log.info('Barge-in: interrupting AI response', {
       state: this.state,
       ttsGenerationDone: this.ttsGenerationDone,
@@ -1028,7 +1108,7 @@ export class CallOrchestrator {
 
   // ─── Scheduling Completion Detection ────────────────────────────────────
   // Now handled by SessionState.extractFromAssistantResponse() which tracks
-  // collected info (name, date, time) and booking status (SLOT_SELECTED → BOOKED).
+  // collected info (name, date, time) and booking status (CONFIRMATION_PENDING → BOOKED).
   // The old regex-only approach was replaced because it could:
   //   1. Hallucinate completion when the LLM used "noted" without actual booking
   //   2. Miss completion when the LLM used non-English confirmation words
