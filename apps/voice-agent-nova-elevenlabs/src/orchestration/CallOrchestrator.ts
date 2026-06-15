@@ -32,6 +32,7 @@ import { SarvamTTS } from '../tts/SarvamTTS';
 import { hasGreetingAudio, getGreetingChunks } from '../tts/GreetingCache';
 import { BargeInDetector } from '../interruption/BargeInDetector';
 import { ConversationManager } from '../llm/ConversationManager';
+import { SessionState } from './SessionState';
 import { LatencyTracker } from '../metrics/LatencyTracker';
 import { TwilioService } from '../telephony/TwilioService';
 import { globalToolRegistry } from '../tools/ToolRegistry';
@@ -56,6 +57,7 @@ export class CallOrchestrator {
   private readonly stt: DeepgramSTT;
   private readonly llm: BedrockLLM;
   private readonly conversation: ConversationManager;
+  private readonly session: SessionState;
   private readonly latency: LatencyTracker;
   private readonly bargeIn: BargeInDetector;
   private readonly log: Logger;
@@ -174,6 +176,7 @@ export class CallOrchestrator {
                             : new ElevenLabsTTS(callSid);
     this.llm            = new BedrockLLM(callSid, globalToolRegistry);
     this.conversation   = new ConversationManager(callSid);
+    this.session        = new SessionState(callSid);
     this.latency        = new LatencyTracker(callSid);
     this.bargeIn        = new BargeInDetector(callSid);
     this.log            = Logger.forCall(callSid, 'CallOrchestrator');
@@ -527,6 +530,9 @@ export class CallOrchestrator {
     if (!text.trim()) return;
     if (this.conversationComplete) return;
 
+    // Extract user info early from stable interim (name, date, time)
+    this.session.extractFromUserTranscript(text);
+
     this.log.info('Speculative LLM start from stable interim', {
       text,
       confidence,
@@ -560,6 +566,9 @@ export class CallOrchestrator {
   private handleFinalTranscript(text: string, confidence: number): void {
     if (this.state === 'ENDED') return;
     if (!text.trim()) return;
+
+    // ── Extract user info from transcript (name, date, time) ───────────
+    this.session.extractFromUserTranscript(text);
 
     // ── Reset noise tracking — real speech confirmed ────────────────────
     this.consecutiveEmptyVADs = 0;
@@ -736,8 +745,16 @@ export class CallOrchestrator {
     // or at flush() right after the LLM finishes — whichever comes first.
     // Replies are capped at ~12 words so flush lands ~100ms after first token.
 
+    // Inject current session state into the system prompt so the LLM
+    // knows what info has been collected and what to ask next.
+    this.conversation.setSystemPromptSuffix(this.session.toPromptBlock());
+
     try {
-      const stream = this.llm.stream(this.conversation.toMessages(), signal);
+      const stream = this.llm.stream(
+        this.conversation.toMessages(),
+        signal,
+        this.conversation.systemPrompt,
+      );
 
       for await (const event of stream) {
         if (myGenId !== this.generationId || signal.aborted) break;
@@ -789,10 +806,20 @@ export class CallOrchestrator {
       this.conversation.addAssistantText(fullText);
       this.log.info('LLM generation complete', { responseLength: fullText.length });
 
-      // Detect scheduling confirmation — terminal state.
-      if (this.isSchedulingConfirmation(fullText)) {
+      // Extract booking-related info from the assistant's response
+      this.session.extractFromAssistantResponse(fullText);
+
+      // State-aware completion: session state tracks whether all info
+      // is collected AND the LLM confirmed the booking. This replaces
+      // the old regex-only approach that could false-trigger.
+      if (this.session.shouldEndCall && !this.conversationComplete) {
         this.conversationComplete = true;
-        this.log.info('Conversation complete — site visit scheduled, will end call after playback');
+        this.log.info('Conversation complete — booking confirmed by session state', {
+          name: this.session.info.name,
+          date: this.session.info.preferredDate,
+          time: this.session.info.preferredTime,
+          bookingStatus: this.session.bookingStatus,
+        });
       }
     }
 
@@ -1000,27 +1027,12 @@ export class CallOrchestrator {
   }
 
   // ─── Scheduling Completion Detection ────────────────────────────────────
-
-  /**
-   * Detect if the LLM response is a site visit scheduling confirmation.
-   * Matches patterns like: "noted Saturday 11 AM", "scheduled", "booked",
-   * "visit is confirmed" combined with day/time references.
-   * Synchronous, <1ms, no LLM call.
-   */
-  private static readonly SCHEDULE_CONFIRM_PATTERN =
-    /\b(noted|booked|scheduled|confirm|confirmed|book\b.*(?:for|on)|visit.*(?:book|confirm|noted|schedule))/i;
-  private static readonly DAY_TIME_PATTERN =
-    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend|weekday|tomorrow|आज|कल|\d{1,2}\s*(?:AM|PM|am|pm|बजे))/i;
-  private static readonly THANK_CLOSE_PATTERN =
-    /\b(thank\s*you|धन्यवाद|शुक्रिया)\b/i;
-
-  private isSchedulingConfirmation(text: string): boolean {
-    // Must have a scheduling action word
-    if (!CallOrchestrator.SCHEDULE_CONFIRM_PATTERN.test(text)) return false;
-    // Must also reference a day/time OR be a thank-you closing
-    return CallOrchestrator.DAY_TIME_PATTERN.test(text) ||
-           CallOrchestrator.THANK_CLOSE_PATTERN.test(text);
-  }
+  // Now handled by SessionState.extractFromAssistantResponse() which tracks
+  // collected info (name, date, time) and booking status (SLOT_SELECTED → BOOKED).
+  // The old regex-only approach was replaced because it could:
+  //   1. Hallucinate completion when the LLM used "noted" without actual booking
+  //   2. Miss completion when the LLM used non-English confirmation words
+  //   3. Fire without checking if required info was actually collected
 
   get currentState(): CallState { return this.state; }
 }

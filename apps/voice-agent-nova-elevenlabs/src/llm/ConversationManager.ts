@@ -1,6 +1,10 @@
 /**
  * ConversationManager: maintains per-call conversation history.
  * Uses Anthropic SDK MessageParam types directly.
+ *
+ * Also holds a dynamic system prompt suffix (session state) that is
+ * appended to the base system prompt on every LLM call, so the model
+ * always knows what info has been collected and what to ask next.
  */
 
 import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources/messages/messages';
@@ -12,8 +16,22 @@ export class ConversationManager {
   private readonly log: Logger;
   private _turnIndex = 0;
 
+  /** Dynamic suffix appended to system prompt — updated every turn with session state. */
+  private _systemPromptSuffix = '';
+
   constructor(callSid: string) {
     this.log = Logger.forCall(callSid, 'ConversationManager');
+  }
+
+  /** Update the dynamic session state block injected into the system prompt. */
+  setSystemPromptSuffix(suffix: string): void {
+    this._systemPromptSuffix = suffix;
+  }
+
+  /** Full system prompt = base prompt + session state suffix. */
+  get systemPrompt(): string {
+    if (!this._systemPromptSuffix) return Env.llm.systemPrompt;
+    return `${Env.llm.systemPrompt}\n\n${this._systemPromptSuffix}`;
   }
 
   // ─── Mutation ─────────────────────────────────────────────────────────────
