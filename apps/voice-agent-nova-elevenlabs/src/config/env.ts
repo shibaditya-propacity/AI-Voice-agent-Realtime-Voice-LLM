@@ -59,10 +59,15 @@ export const Env = {
     // audio and returns HTTP 400 on the streaming WebSocket endpoint.
     // en-IN alone cannot decode Hindi phonemes → use multi for Hindi support.
     multilingual: optionalBool('DEEPGRAM_MULTILINGUAL', true),
-    // 200ms silence → speech_final (proven stable; 150ms causes empty transcripts)
-    endpointingMs: optionalInt('DEEPGRAM_ENDPOINTING_MS', 200),
-    // 250ms silence → UtteranceEnd (proven stable)
-    utteranceEndMs: optionalInt('DEEPGRAM_UTTERANCE_END_MS', 250),
+    // 150ms silence → speech_final (tight but reliable on Nova-3 Hindi;
+    // saves ~150ms per turn vs 300ms; 100ms causes split-utterance false finals)
+    endpointingMs: optionalInt('DEEPGRAM_ENDPOINTING_MS', 150),
+    // 1000ms silence → UtteranceEnd (Deepgram minimum is 1000ms for this param;
+    // values below 1000 return HTTP 400. The is_final self-flush timer handles fast flushing.)
+    utteranceEndMs: optionalInt('DEEPGRAM_UTTERANCE_END_MS', 1000),
+    // Minimum confidence to accept a final transcript (0.0–1.0).
+    // Transcripts below this are treated as noise and discarded.
+    minConfidence: optionalFloat('DEEPGRAM_MIN_CONFIDENCE', 0.4),
   },
 
   llm: {
@@ -76,7 +81,7 @@ export const Env = {
     // Groq model: llama-3.1-8b-instant (fastest)
     modelId: optional('LLM_MODEL_ID', 'llama-3.1-8b-instant'),
     // 25 tokens — hard cap for sub-second turns; replies must stay under 12 words
-    maxTokens: optionalInt('LLM_MAX_TOKENS', 25),
+    maxTokens: optionalInt('LLM_MAX_TOKENS', 50),
     // Lower temperature = more focused, faster sampling
     temperature: optionalFloat('LLM_TEMPERATURE', 0.3),
     topP: optionalFloat('LLM_TOP_P', 0.9),
@@ -153,6 +158,27 @@ export const Env = {
         'UNKNOWN INFORMATION: "वो detail visit पे बताऊँगा। क्या आप आकर देखना चाहेंगे?"',
         '',
         'FACTS: Akshay Vista | Pimple Gurav, Pune | 2/2.5/3 BHK | 8 to 10 thousand per sqft | April 2027 | R.R. Lunkad Group | 78 units',
+        '',
+        'LANGUAGE SWITCHING RULES (HIGH PRIORITY):',
+        'If the user requests a language change (e.g. "speak in English", "English please", "Hindi bolo", "Marathi madhe bola"):',
+        '1. Immediately acknowledge in ONE SHORT SENTENCE under 10 words.',
+        '   Examples: "Sure, I\'ll continue in English." / "okay, main Hindi mein baat karta hoon." / "okay, Marathi madhye bolto."',
+        '2. Do NOT explain the language change. Do NOT repeat the user\'s request.',
+        '3. Do NOT generate long responses after switching.',
+        '4. Treat language-switch commands as complete intents — stop immediately after acknowledgement.',
+        '5. After confirming, wait for the user\'s next question.',
+        '6. Never ask "How may I assist you?" or similar immediately after a language switch.',
+        '7. Do not provide project details, sales info, or booking info unless the user asks.',
+        '',
+        'SPEECH UNDERSTANDING RULES:',
+        'You are speaking to one caller only.',
+        'If speech is unclear, incomplete, interrupted, overlaps with another speaker, contains background noise, or intent is uncertain:',
+        '- Never guess. Never assume missing information. Never continue based on uncertain understanding.',
+        '- Ask the caller to repeat. Keep clarification under 10 words.',
+        '  "Sorry, kya aap repeat kar sakte hain?"',
+        '  "Maaf kijiye, awaaz clear nahi aayi. Ek baar phir bolenge?"',
+        '  "Thoda background noise tha, kya aap dobara bol sakte hain?"',
+        '- When uncertain, always ask for clarification.',
       ].join('\n'),
     ),
     greetingPrompt: optional(

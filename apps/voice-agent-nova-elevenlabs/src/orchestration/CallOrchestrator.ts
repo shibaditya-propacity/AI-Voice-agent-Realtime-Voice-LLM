@@ -84,6 +84,13 @@ export class CallOrchestrator {
   private activeResponseText = '';
 
   /**
+   * Speculative generation: when a stable interim fires, we start LLM+TTS
+   * speculatively. If speech_final confirms the same text, we keep going
+   * (saving ~150-300ms). If text differs, we abort and restart with the real text.
+   */
+  private speculativeText: string | null = null;
+
+  /**
    * Terminal state: once a site visit is confirmed (day + time acknowledged),
    * no further LLM generations or reprompts are allowed. The call ends
    * cleanly after the final acknowledgement plays.
@@ -152,6 +159,9 @@ export class CallOrchestrator {
   /** Timer that transitions SPEAKING→LISTENING after estimated playback completes. */
   private playbackCompleteTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Timer that unmutes STT after barge-in grace period (echo suppression). */
+  private sttUnmuteTimer: ReturnType<typeof setTimeout> | null = null;
+
   /** Whether TTS generation is done (all chunks received from ElevenLabs). */
   private ttsGenerationDone = false;
 
@@ -180,6 +190,7 @@ export class CallOrchestrator {
     this.stt
       .onSpeech(()               => this.handleSpeechStarted())
       .onInterim((text)          => this.handleInterimTranscript(text))
+      .onStableInterim((text, conf) => this.handleStableInterim(text, conf))
       .onTranscript((text, conf) => this.handleFinalTranscript(text, conf))
       .onNoSpeech(()             => this.handleNoSpeech())
       .onErr((err)               => this.log.error('STT error', err));
@@ -279,6 +290,10 @@ export class CallOrchestrator {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
     }
+    if (this.sttUnmuteTimer) {
+      clearTimeout(this.sttUnmuteTimer);
+      this.sttUnmuteTimer = null;
+    }
     this.clearSilenceTimer();
 
     // Abort any active generation
@@ -314,6 +329,31 @@ export class CallOrchestrator {
     }).catch((err: Error) => {
       this.log.warn('TTS reconnect failed', { error: err.message });
     });
+  }
+
+  // ─── STT Echo Gating ──────────────────────────────────────────────────────
+  // Mute audio to Deepgram during the PSTN echo burst window (first ~1.5s of
+  // agent speech). After the grace period, unmute so transcript-gated barge-in
+  // works. This eliminates ~90% of empty transcript spam from echo.
+
+  private muteSTTForEchoBurst(): void {
+    this.stt.mute();
+    if (this.sttUnmuteTimer) clearTimeout(this.sttUnmuteTimer);
+    this.sttUnmuteTimer = setTimeout(() => {
+      this.sttUnmuteTimer = null;
+      if (this.state === 'SPEAKING' || this.state === 'GENERATING') {
+        this.stt.unmute();
+        this.log.debug('STT unmuted after echo grace period');
+      }
+    }, Env.bargeIn.graceMs);
+  }
+
+  private ensureSTTUnmuted(): void {
+    if (this.sttUnmuteTimer) {
+      clearTimeout(this.sttUnmuteTimer);
+      this.sttUnmuteTimer = null;
+    }
+    this.stt.unmute();
   }
 
   // ─── VAD / Speech Events ──────────────────────────────────────────────────
@@ -418,6 +458,9 @@ export class CallOrchestrator {
     this.state = 'SPEAKING';
     this.suppressBargeInArm = false;
 
+    // Mute STT during echo burst — unmutes after barge-in grace period
+    this.muteSTTForEchoBurst();
+
     this.tts.startTurn(`g${myGenId}`);
     this.tts.streamText(text);
     this.tts.flush();
@@ -464,6 +507,49 @@ export class CallOrchestrator {
     this.handleInterruption();
   }
 
+  // ─── Stable Interim → Speculative LLM Generation ──────────────────────────
+
+  /**
+   * Stable interim: Deepgram interims haven't changed for ~150ms, meaning
+   * the user likely stopped speaking and we're just waiting for endpointing
+   * to confirm. Start LLM generation speculatively to overlap with the
+   * endpointing window (~150ms). If speech_final confirms the same text,
+   * we save ~150-300ms. If text differs, handleFinalTranscript aborts and restarts.
+   */
+  private handleStableInterim(text: string, confidence: number): void {
+    // Only start speculative generation in LISTENING state
+    if (this.state !== 'LISTENING') return;
+    if (!text.trim()) return;
+    if (this.conversationComplete) return;
+
+    this.log.info('Speculative LLM start from stable interim', {
+      text,
+      confidence,
+      state: this.state,
+    });
+
+    // Reset noise tracking — real speech detected
+    this.consecutiveEmptyVADs = 0;
+    this.emptyFinalStreak = 0;
+    this.lastTranscriptAt = Date.now();
+    this.clearSilenceTimer();
+
+    this.latency.mark('stable_interim');
+
+    // Record the speculative text so handleFinalTranscript can compare
+    this.speculativeText = text.trim();
+
+    // Add to conversation and start generating
+    this.conversation.addUserMessage(text.trim());
+    this.state = 'GENERATING';
+
+    this.log.info('Stable interim → speculative LLM handoff', {
+      transcriptLenChars: text.trim().length,
+    });
+
+    void this.generateAndSpeak();
+  }
+
   // ─── Final Transcript ─────────────────────────────────────────────────────
 
   private handleFinalTranscript(text: string, confidence: number): void {
@@ -482,8 +568,47 @@ export class CallOrchestrator {
       text,
       confidence,
       state: this.state,
+      speculativeText: this.speculativeText,
       speechFinalToNowMs: 0, // this IS the speech_final event
     });
+
+    // ── Speculative generation reconciliation ──────────────────────────
+    // If we already started a speculative LLM generation from a stable interim,
+    // check if the final text matches. If so, the speculation was correct —
+    // let it continue (huge latency win). If not, abort and restart.
+    if (this.speculativeText !== null) {
+      const specText = this.speculativeText;
+      this.speculativeText = null;
+
+      if (text.trim() === specText) {
+        // Speculation confirmed — generation is already running, nothing to do.
+        this.log.info('Speculative generation CONFIRMED by speech_final', {
+          text: specText,
+          savedMs: Date.now() - transcriptAt,
+        });
+        return;
+      }
+
+      // Text differs — abort speculative generation and restart with real text.
+      this.log.warn('Speculative generation INVALIDATED — aborting', {
+        speculative: specText,
+        final: text.trim(),
+      });
+      // Cancel in-flight LLM+TTS
+      this.generationId++;
+      if (this.abortController) {
+        this.abortController.abort();
+        this.abortController = null;
+      }
+      this.tts.abort();
+      this.twilioService.clearAudio(this.callSid);
+      // Remove the speculative user message from conversation history
+      this.conversation.discardLastUserMessage();
+      this.conversation.discardLastAssistantMessage();
+      this.state = 'LISTENING';
+      this.ensureSTTUnmuted();
+      // Fall through to start fresh generation with the real text
+    }
 
     // Transcript-gated barge-in: if the agent is still speaking, a real
     // transcript (not just VAD) is the authoritative signal to interrupt.
@@ -555,6 +680,10 @@ export class CallOrchestrator {
     // flowing through the buffer when generation starts) cannot trigger
     // a false barge-in and abort the LLM before it has sent a single token.
     this.suppressBargeInArm = opts.suppressBargeIn ?? false;
+
+    // Mute STT during echo burst — unmutes after barge-in grace period
+    this.muteSTTForEchoBurst();
+
 
     // Socket should already be open (persistent from call start).
     // If it dropped unexpectedly, streamText() queues and startTurn() reconnects.
@@ -732,6 +861,7 @@ export class CallOrchestrator {
     }
 
     this.state = 'LISTENING';
+    this.ensureSTTUnmuted();
     this.log.info('Playback complete — now LISTENING');
 
     // Pre-warm TTS now — the user usually replies within seconds, and the
@@ -793,6 +923,7 @@ export class CallOrchestrator {
       audioBytesSent: this.ttsAudioBytesSent,
     });
     this.latency.mark('barge_in');
+    this.speculativeText = null;
 
     // Cancel playback-complete timer (barge-in supersedes it)
     if (this.playbackCompleteTimer) {
@@ -823,6 +954,7 @@ export class CallOrchestrator {
     this.conversation.discardLastAssistantMessage();
 
     this.state = 'LISTENING';
+    this.ensureSTTUnmuted();
     this.log.info('Barge-in handled — back to LISTENING');
 
     // Pre-warm TTS now — user is already speaking their next utterance

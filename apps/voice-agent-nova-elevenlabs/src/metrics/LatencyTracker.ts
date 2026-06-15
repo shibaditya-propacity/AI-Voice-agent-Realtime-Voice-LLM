@@ -5,6 +5,7 @@ export type LatencyEvent =
   | 'speech_started'
   | 'tts_prewarm_start'
   | 'tts_open'
+  | 'stable_interim'
   | 'speech_final'
   | 'llm_start'
   | 'llm_first_token'
@@ -22,6 +23,7 @@ export type LatencyEvent =
 /** Human-readable event names logged on every mark (one line per event). */
 const EVENT_LABELS: Partial<Record<LatencyEvent, string>> = {
   speech_started:        'SpeechEnd',
+  stable_interim:        'StableInterim',
   speech_final:          'FinalTranscript',
   llm_start:             'LLMStart',
   llm_first_token:       'FirstToken',
@@ -35,7 +37,7 @@ const EVENT_LABELS: Partial<Record<LatencyEvent, string>> = {
 
 const TURN_RESET_EVENTS: LatencyEvent[] = [
   'speech_started', 'tts_prewarm_start', 'tts_open',
-  'speech_final', 'llm_start', 'llm_first_token', 'llm_complete',
+  'stable_interim', 'speech_final', 'llm_start', 'llm_first_token', 'llm_complete',
   'tts_first_text', 'tts_first_audio', 'twilio_playback_start', 'tts_complete',
 ];
 
@@ -82,8 +84,12 @@ export class LatencyTracker {
     const textToAudio        = this.ms('tts_first_text', 'tts_first_audio');
     const firstTokenToAudio  = this.ms('llm_first_token', 'tts_first_audio');
     const firstAudioToTwilio = this.ms('tts_first_audio', 'twilio_playback_start');
+    const stableToFinal      = this.ms('stable_interim', 'speech_final');
+    const stableToLlm        = this.ms('stable_interim', 'llm_start');
     const e2e                = this.ms('speech_final', 'tts_first_audio');
     const e2eTwilio          = this.ms('speech_final', 'twilio_playback_start');
+    // When speculative generation runs, E2E from stable_interim is the real user-perceived latency
+    const e2eSpeculative     = this.ms('stable_interim', 'tts_first_audio');
     const ttsTotal           = this.ms('tts_first_audio', 'tts_complete');
 
     // Was TTS ready before or after speech_final?
@@ -111,9 +117,13 @@ export class LatencyTracker {
       first_token_to_first_audio_ms:    firstTokenToAudio,
       first_audio_to_twilio_ms:         firstAudioToTwilio,
       tts_total_ms:                     ttsTotal,
+      // ── Speculative Generation ─────────────────────────────────────────────
+      stable_interim_to_final_ms:        stableToFinal,
+      stable_interim_to_llm_start_ms:    stableToLlm,
       // ── E2E ──────────────────────────────────────────────────────────────────
       '★ e2e_speech_final_to_audio_ms':  e2e,
       '★ e2e_speech_final_to_twilio_ms': e2eTwilio,
+      '★ e2e_speculative_to_audio_ms':   e2eSpeculative,
     });
 
     // Log a concise one-line pipeline breakdown for quick scanning

@@ -30,6 +30,7 @@ export class DeepgramSTT {
 
   private onFinalTranscript?: OnFinalTranscript;
   private onInterimTranscript?: OnFinalTranscript;
+  private onStableInterimCb?: OnFinalTranscript;
   private onSpeechStarted?: OnSpeechStarted;
   private onNoSpeechCb?: () => void;
   private onError?: OnSTTError;
@@ -37,6 +38,13 @@ export class DeepgramSTT {
   /** Audio chunks buffered while WS is not yet open */
   private readonly pendingAudio: Buffer[] = [];
   private closed = false;
+
+  /**
+   * When true, audio is NOT forwarded to Deepgram. Used to suppress PSTN echo
+   * during the first ~1.5s of agent speech (the echo-burst window). After the
+   * grace period expires the orchestrator calls unmute() to re-enable barge-in.
+   */
+  private muted = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -62,6 +70,24 @@ export class DeepgramSTT {
    *  prevents stale noise interims from becoming phantom turns. */
   private readonly INTERIM_FALLBACK_MAX_AGE_MS = 3000;
 
+  // ─── Stable Interim Detection ──────────────────────────────────────────
+  // When consecutive interims produce the same text for STABLE_INTERIM_MS,
+  // fire onStableInterimCb so the orchestrator can speculatively start LLM.
+  // This saves ~150-300ms per turn by overlapping LLM startup with endpointing.
+
+  /** Text of the last interim that started the stability window. */
+  private stableInterimText = '';
+  /** Timestamp when stableInterimText was first seen. */
+  private stableInterimSince = 0;
+  /** Whether we already fired onStableInterimCb for the current stable text. */
+  private stableInterimFired = false;
+  /** Timer that fires when stability window expires without text change. */
+  private stableInterimTimer: ReturnType<typeof setTimeout> | null = null;
+  /** How long interim text must remain unchanged to be considered stable (ms).
+   *  150ms matches endpointing — by this point Deepgram has observed enough
+   *  silence that the text is very likely final. */
+  private readonly STABLE_INTERIM_MS = 150;
+
   /**
    * Self-flush timer for is_final buffer. When Deepgram sends is_final without
    * speech_final, the buffer waits for UtteranceEnd — but background noise VADs
@@ -84,11 +110,19 @@ export class DeepgramSTT {
   /** Non-empty interim (partial) transcripts — words confirmed while user is
    *  still speaking. Used for instant, word-gated barge-in. */
   onInterim(cb: OnFinalTranscript): this    { this.onInterimTranscript = cb; return this; }
+  /** Fired when interim text stabilizes — same text for STABLE_INTERIM_MS.
+   *  Enables speculative LLM generation before speech_final arrives. */
+  onStableInterim(cb: OnFinalTranscript): this { this.onStableInterimCb = cb; return this; }
   onSpeech(cb: OnSpeechStarted): this       { this.onSpeechStarted = cb;  return this; }
   /** Fired when an utterance ended (speech_final) but Deepgram decoded no
    *  words at all — the caller spoke but recognition failed. */
   onNoSpeech(cb: () => void): this          { this.onNoSpeechCb = cb;     return this; }
   onErr(cb: OnSTTError): this               { this.onError = cb;          return this; }
+
+  /** Mute: stop forwarding audio to Deepgram (echo suppression). */
+  mute(): void   { this.muted = true; }
+  /** Unmute: resume forwarding audio to Deepgram. */
+  unmute(): void { this.muted = false; }
 
   // ─── Connection ───────────────────────────────────────────────────────────
 
@@ -111,7 +145,6 @@ export class DeepgramSTT {
       sample_rate:      '8000',
       channels:         '1',
       interim_results:  'true',
-      smart_format:     'true',
       vad_events:       'true',
       endpointing:      String(Env.deepgram.endpointingMs),
       utterance_end_ms: String(Env.deepgram.utteranceEndMs),
@@ -123,6 +156,9 @@ export class DeepgramSTT {
       model:        Env.deepgram.model,
       language:     effectiveLanguage,
       multilingual: Env.deepgram.multilingual,
+      endpointing:  Env.deepgram.endpointingMs,
+      utteranceEnd: Env.deepgram.utteranceEndMs,
+      params:       Object.fromEntries(params),
     });
 
     const ws = new WebSocket(url, {
@@ -156,6 +192,12 @@ export class DeepgramSTT {
 
     ws.on('error', (err: Error) => {
       this.log.error('Deepgram WS error', err);
+      // HTTP 400 = invalid request params — reconnecting won't help.
+      // Stop reconnect attempts to avoid an infinite loop.
+      if (err.message?.includes('400')) {
+        this.log.error('Deepgram rejected params (HTTP 400) — stopping reconnect attempts');
+        this.closed = true;
+      }
       this.onError?.(err);
     });
 
@@ -169,7 +211,7 @@ export class DeepgramSTT {
 
   /** Send raw PCMU (base64-decoded) bytes to Deepgram. */
   sendAudio(pcmuBuffer: Buffer): void {
-    if (this.closed) return;
+    if (this.closed || this.muted) return;
 
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(pcmuBuffer);
@@ -237,10 +279,40 @@ export class DeepgramSTT {
       if (transcript.trim()) {
         this.log.debug('Deepgram: interim transcript', { transcript, confidence });
         // Track last interim for fallback when speech_final is empty
-        this.lastInterimText = transcript.trim();
+        const trimmed = transcript.trim();
+        this.lastInterimText = trimmed;
         this.lastInterimConfidence = confidence;
         this.lastInterimAt = Date.now();
-        this.onInterimTranscript?.(transcript.trim(), confidence);
+        this.onInterimTranscript?.(trimmed, confidence);
+
+        // ── Stable interim detection ────────────────────────────────
+        // If the interim text matches the previous one, the user may have
+        // stopped speaking and we're waiting for endpointing to confirm.
+        // Start a timer — if text stays the same for STABLE_INTERIM_MS,
+        // fire the stable interim callback for speculative LLM start.
+        if (trimmed === this.stableInterimText) {
+          // Same text — timer is already running (or already fired)
+        } else {
+          // Text changed — reset stability tracking
+          this.stableInterimText = trimmed;
+          this.stableInterimSince = Date.now();
+          this.stableInterimFired = false;
+          if (this.stableInterimTimer) {
+            clearTimeout(this.stableInterimTimer);
+          }
+          this.stableInterimTimer = setTimeout(() => {
+            this.stableInterimTimer = null;
+            if (!this.stableInterimFired && this.stableInterimText === trimmed) {
+              this.stableInterimFired = true;
+              this.log.info('Deepgram: stable interim detected', {
+                text: trimmed,
+                confidence,
+                stableForMs: Date.now() - this.stableInterimSince,
+              });
+              this.onStableInterimCb?.(trimmed, confidence);
+            }
+          }, this.STABLE_INTERIM_MS);
+        }
       }
       return;
     }
@@ -281,9 +353,29 @@ export class DeepgramSTT {
       return;
     }
 
-    // Clear interim fallback — real transcript arrived
+    // Clear interim fallback and stable interim state — real transcript arrived
     this.lastInterimText = '';
     this.lastInterimConfidence = 0;
+    this.resetStableInterim();
+
+    // ── Confidence gate: discard low-confidence finals (background noise,
+    // overlapping speakers, garbled audio). The LLM should not act on these.
+    if (confidence < Env.deepgram.minConfidence) {
+      this.log.warn('Deepgram: low-confidence transcript discarded', {
+        transcript: transcript.trim(),
+        confidence,
+        threshold: Env.deepgram.minConfidence,
+        is_final: msg.is_final,
+        speech_final: msg.speech_final,
+      });
+      // Treat as no-speech so orchestrator can reprompt if needed
+      if (msg.speech_final) {
+        this.isFinalBuffer = [];
+        this.isFinalConfidence = 0;
+        this.onNoSpeechCb?.();
+      }
+      return;
+    }
 
     if (msg.speech_final) {
       // Cancel self-flush timer — speech_final supersedes it
@@ -326,6 +418,17 @@ export class DeepgramSTT {
           this.flushIsFinalBuffer('auto_flush');
         }
       }, this.IS_FINAL_FLUSH_MS);
+    }
+  }
+
+  /** Reset stable interim tracking (called on any finalization event). */
+  private resetStableInterim(): void {
+    this.stableInterimText = '';
+    this.stableInterimSince = 0;
+    this.stableInterimFired = false;
+    if (this.stableInterimTimer) {
+      clearTimeout(this.stableInterimTimer);
+      this.stableInterimTimer = null;
     }
   }
 
@@ -377,6 +480,7 @@ export class DeepgramSTT {
       clearTimeout(this.isFinalFlushTimer);
       this.isFinalFlushTimer = null;
     }
+    this.resetStableInterim();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

@@ -166,7 +166,7 @@ export class BedrockLLM {
         messages:             openAIMessages,
       }, { signal: abortSignal });
     } catch (err) {
-      if ((err as Error).name === 'AbortError') {
+      if ((err as Error).name === 'AbortError' || (err as Error).message?.includes('aborted')) {
         this.log.debug('LLM request aborted before start');
         return;
       }
@@ -203,7 +203,7 @@ export class BedrockLLM {
         }
       }
     } catch (err) {
-      if ((err as Error).name === 'AbortError') {
+      if ((err as Error).name === 'AbortError' || (err as Error).message?.includes('aborted')) {
         this.log.debug('LLM stream aborted mid-flight');
         return;
       }

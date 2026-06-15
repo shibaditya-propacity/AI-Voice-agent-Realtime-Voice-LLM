@@ -48,6 +48,17 @@ export function createApp(): AppInstance {
     await sessionManager.endSession(callSid, 'stream_stopped');
   });
 
+  // ─── Request Logger (debug: see ALL incoming requests) ───────────────────
+  app.use((req, _res, next) => {
+    log.info('HTTP request', {
+      method: req.method,
+      url: req.url,
+      ip: req.ip,
+      ua: req.headers['user-agent']?.substring(0, 60),
+    });
+    next();
+  });
+
   // ─── Routes ──────────────────────────────────────────────────────────────
 
   app.use('/', buildTwilioRouter(twilioService, sessionManager));
