@@ -684,6 +684,7 @@ export class CallOrchestrator {
     // Mute STT during echo burst — unmutes after barge-in grace period
     this.muteSTTForEchoBurst();
 
+
     // Socket should already be open (persistent from call start).
     // If it dropped unexpectedly, streamText() queues and startTurn() reconnects.
     // No need to await — fire-and-forget safety net only.

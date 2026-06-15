@@ -97,7 +97,7 @@ export class DeepgramSTT {
    * Deepgram has already observed endpointing-worth of silence.
    */
   private isFinalFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly IS_FINAL_FLUSH_MS = 200;
+  private readonly IS_FINAL_FLUSH_MS = 150;
 
   constructor(callSid: string) {
     this.callSid = callSid;

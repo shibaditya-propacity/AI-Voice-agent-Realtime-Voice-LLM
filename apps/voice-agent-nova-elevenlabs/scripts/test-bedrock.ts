@@ -10,9 +10,9 @@ const REGION     = process.env.AWS_REGION     ?? 'us-east-1';
 const MODEL_ID   = process.env.LLM_MODEL_ID   ?? 'us.anthropic.claude-sonnet-4-6';
 
 if (!ACCESS_KEY || !SECRET_KEY) {
-  console.error('❌ AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY not set');
+  console.error('AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY not set');
   process.exit(1);
-}
+} 
 
 const client = new AnthropicBedrock({
   awsRegion:    REGION,
@@ -69,7 +69,7 @@ async function main(): Promise<void> {
     console.log(`   Output tok  : ${final.usage.output_tokens}`);
 
   } catch (err) {
-    console.error(`\n❌ Bedrock error: ${(err as Error).message}`);
+    console.error(`\nBedrock error: ${(err as Error).message}`);
     process.exit(1);
   }
 }
