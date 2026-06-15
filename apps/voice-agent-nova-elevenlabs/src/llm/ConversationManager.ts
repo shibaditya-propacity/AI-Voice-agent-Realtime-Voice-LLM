@@ -5,14 +5,27 @@
  * Also holds a dynamic system prompt suffix (session state) that is
  * appended to the base system prompt on every LLM call, so the model
  * always knows what info has been collected and what to ask next.
+ *
+ * MESSAGE PINNING: Critical messages (where user provided name, date, time)
+ * are pinned and preserved even when the sliding history window evicts
+ * older messages. This prevents the LLM from forgetting user-provided info.
  */
 
 import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources/messages/messages';
 import { Env } from '../config/env';
 import { Logger } from '../shared/logger';
 
+/** Metadata for a message in the history. */
+interface MessageEntry {
+  message: MessageParam;
+  /** Pinned messages survive history windowing. */
+  pinned: boolean;
+  /** What info was captured from this message (for logging). */
+  pinnedReason?: string;
+}
+
 export class ConversationManager {
-  private readonly history: MessageParam[] = [];
+  private readonly entries: MessageEntry[] = [];
   private readonly log: Logger;
   private _turnIndex = 0;
 
@@ -37,18 +50,18 @@ export class ConversationManager {
   // ─── Mutation ─────────────────────────────────────────────────────────────
 
   addUserMessage(text: string): void {
-    this.history.push({ role: 'user', content: text });
+    this.entries.push({ message: { role: 'user', content: text }, pinned: false });
     this.log.debug('Added user message', { turn: this._turnIndex, length: text.length });
   }
 
   addAssistantText(text: string): void {
-    this.history.push({ role: 'assistant', content: text });
+    this.entries.push({ message: { role: 'assistant', content: text }, pinned: false });
     this._turnIndex++;
     this.log.debug('Added assistant message', { turn: this._turnIndex });
   }
 
   addAssistantContent(content: ContentBlockParam[]): void {
-    this.history.push({ role: 'assistant', content });
+    this.entries.push({ message: { role: 'assistant', content }, pinned: false });
     this._turnIndex++;
   }
 
@@ -57,15 +70,40 @@ export class ConversationManager {
    * Anthropic requires tool results in user turns.
    */
   addToolResult(toolUseId: string, result: string, isError = false): void {
-    this.history.push({
-      role: 'user',
-      content: [{
-        type:        'tool_result',
-        tool_use_id: toolUseId,
-        content:     result,
-        ...(isError && { is_error: true }),
-      }],
+    this.entries.push({
+      message: {
+        role: 'user',
+        content: [{
+          type:        'tool_result',
+          tool_use_id: toolUseId,
+          content:     result,
+          ...(isError && { is_error: true }),
+        }],
+      },
+      pinned: false,
     });
+  }
+
+  /**
+   * Pin the last user message — marks it as critical (contains name, date, etc.)
+   * so it survives history windowing.
+   */
+  pinLastUserMessage(reason: string): void {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      if (this.entries[i].message.role === 'user' && !this.entries[i].pinned) {
+        this.entries[i].pinned = true;
+        this.entries[i].pinnedReason = reason;
+        this.log.debug('Pinned user message', { index: i, reason });
+
+        // Also pin the preceding assistant message (the question that elicited this response)
+        // so the LLM sees the full Q&A pair
+        if (i > 0 && this.entries[i - 1].message.role === 'assistant') {
+          this.entries[i - 1].pinned = true;
+          this.entries[i - 1].pinnedReason = 'question_for_' + reason;
+        }
+        break;
+      }
+    }
   }
 
   /**
@@ -73,8 +111,8 @@ export class ConversationManager {
    * from a stable interim is invalidated by a different speech_final.
    */
   discardLastUserMessage(): void {
-    if (this.history.length > 0 && this.history[this.history.length - 1]?.role === 'user') {
-      this.history.pop();
+    if (this.entries.length > 0 && this.entries[this.entries.length - 1]?.message.role === 'user') {
+      this.entries.pop();
       this.log.debug('Discarded speculative user message');
     }
   }
@@ -85,8 +123,8 @@ export class ConversationManager {
    * Keeps the LLM generation running but corrects history for future context.
    */
   updateLastUserMessage(text: string): void {
-    if (this.history.length > 0 && this.history[this.history.length - 1]?.role === 'user') {
-      this.history[this.history.length - 1] = { role: 'user', content: text };
+    if (this.entries.length > 0 && this.entries[this.entries.length - 1]?.message.role === 'user') {
+      this.entries[this.entries.length - 1].message = { role: 'user', content: text };
       this.log.debug('Updated user message (prefix match)', { length: text.length });
     }
   }
@@ -96,8 +134,8 @@ export class ConversationManager {
    * doesn't see an incomplete assistant turn in context.
    */
   discardLastAssistantMessage(): void {
-    if (this.history.length > 0 && this.history[this.history.length - 1]?.role === 'assistant') {
-      this.history.pop();
+    if (this.entries.length > 0 && this.entries[this.entries.length - 1]?.message.role === 'assistant') {
+      this.entries.pop();
       this._turnIndex = Math.max(0, this._turnIndex - 1);
       this.log.debug('Discarded partial assistant message');
     }
@@ -109,13 +147,13 @@ export class ConversationManager {
    */
   discardGreetingTurn(): void {
     // Remove last assistant turn
-    if (this.history.length > 0 && this.history[this.history.length - 1]?.role === 'assistant') {
-      this.history.pop();
+    if (this.entries.length > 0 && this.entries[this.entries.length - 1]?.message.role === 'assistant') {
+      this.entries.pop();
       this._turnIndex = Math.max(0, this._turnIndex - 1);
     }
     // Remove the synthetic user greeting prompt
-    if (this.history.length > 0 && this.history[this.history.length - 1]?.role === 'user') {
-      this.history.pop();
+    if (this.entries.length > 0 && this.entries[this.entries.length - 1]?.message.role === 'user') {
+      this.entries.pop();
     }
     this.log.debug('Discarded greeting turn from history');
   }
@@ -126,26 +164,78 @@ export class ConversationManager {
    * Returns messages ready to pass to BedrockLLM.stream().
    * Applies a sliding window to cap context size on long calls.
    * Prevents TTFT degradation as conversation grows.
+   *
+   * PINNED messages are always included at the front, even if they fall
+   * outside the sliding window. This ensures the LLM never forgets
+   * user-provided name, date, time, etc.
    */
   toMessages(): MessageParam[] {
     const window = Env.llm.historyWindow;
-    if (this.history.length <= window) return this.history;
 
-    // Take last N messages, ensuring we start with a user message
-    // (Anthropic API requires messages to start with user role)
-    let start = this.history.length - window;
-    while (start < this.history.length && this.history[start]?.role !== 'user') {
+    if (this.entries.length <= window) {
+      return this.entries.map(e => e.message);
+    }
+
+    // Collect pinned messages that would be evicted by the window
+    const windowStart = this.entries.length - window;
+    const pinnedBefore: MessageParam[] = [];
+    for (let i = 0; i < windowStart; i++) {
+      if (this.entries[i].pinned) {
+        pinnedBefore.push(this.entries[i].message);
+      }
+    }
+
+    // Take last N messages from the window, ensuring we start with a user message
+    let start = windowStart;
+    while (start < this.entries.length && this.entries[start]?.message.role !== 'user') {
       start++;
     }
-    const windowed = this.history.slice(start);
+    const windowed = this.entries.slice(start).map(e => e.message);
+
+    // Merge: pinned messages first, then windowed messages.
+    // Ensure pinned messages start with user role.
+    let result: MessageParam[];
+    if (pinnedBefore.length > 0) {
+      // Ensure first message is user role
+      let pinnedStart = 0;
+      while (pinnedStart < pinnedBefore.length && pinnedBefore[pinnedStart].role !== 'user') {
+        pinnedStart++;
+      }
+      const validPinned = pinnedBefore.slice(pinnedStart);
+
+      if (validPinned.length > 0) {
+        result = [...validPinned, ...windowed];
+      } else {
+        result = windowed;
+      }
+    } else {
+      result = windowed;
+    }
+
+    // Deduplicate adjacent same-role messages (can happen when pinned + window overlap)
+    const deduped: MessageParam[] = [];
+    for (const msg of result) {
+      if (deduped.length > 0 && deduped[deduped.length - 1].role === msg.role) {
+        // Merge content: append text if both are strings
+        const prev = deduped[deduped.length - 1];
+        if (typeof prev.content === 'string' && typeof msg.content === 'string') {
+          deduped[deduped.length - 1] = { role: msg.role, content: prev.content + '\n' + msg.content };
+        }
+        // Otherwise skip the duplicate (keep the earlier one)
+        continue;
+      }
+      deduped.push(msg);
+    }
+
     this.log.debug('History windowed', {
-      total: this.history.length,
-      sent: windowed.length,
+      total: this.entries.length,
+      pinned: pinnedBefore.length,
+      sent: deduped.length,
       window,
     });
-    return windowed;
+    return deduped;
   }
 
-  get messageCount(): number { return this.history.length; }
+  get messageCount(): number { return this.entries.length; }
   get currentTurn(): number  { return this._turnIndex; }
 }
