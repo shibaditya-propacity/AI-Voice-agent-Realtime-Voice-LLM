@@ -15,6 +15,7 @@ import { Logger } from '../../shared/Logger';
 import { latencyRegistry, clearVad } from '../../shared/LatencyRegistry';
 import { withRetry } from '../../utils/helpers';
 import { loadGreetingWav } from '../audio/WavLoader';
+import { ConversationStateManager } from '../conversation/ConversationStateManager';
 import { SessionManager } from '../session/SessionManager';
 import { NovaClient } from './NovaClient';
 import { NovaAudioStreamer } from './NovaAudioStreamer';
@@ -201,6 +202,7 @@ interface NovaContext {
 export class NovaSessionManager {
   private readonly sessions: Map<string, NovaContext> = new Map();
   private readonly sessionManager: SessionManager;
+  private readonly conversationManager: ConversationStateManager;
   private readonly log: Logger;
 
   /** Timer for periodic Bedrock connection re-warming (keep-alive). */
@@ -214,8 +216,9 @@ export class NovaSessionManager {
    */
   private cachedGreeting: { audioPcm16: Buffer; durationMs: number } | null = null;
 
-  constructor(sessionManager: SessionManager) {
+  constructor(sessionManager: SessionManager, conversationManager?: ConversationStateManager) {
     this.sessionManager = sessionManager;
+    this.conversationManager = conversationManager ?? new ConversationStateManager(Env.groq.apiKey);
     this.log = Logger.root('NovaSessionManager');
   }
 
@@ -446,6 +449,9 @@ export class NovaSessionManager {
         },
       },
     );
+
+    // Initialize the deterministic conversation state machine for this call.
+    this.conversationManager.initSession(sessionId);
 
     // The conversation prompt (system + greeting cue + open audio block) was queued
     // before connect(). Nova is generating the opening greeting and is already
@@ -708,6 +714,7 @@ export class NovaSessionManager {
     ctx.unsubscribeClientEvents();
     ctx.client.close();
     this.sessions.delete(sessionId);
+    this.conversationManager.destroySession(sessionId);
     latencyRegistry.clear(sessionId);
     clearVad(sessionId);
 
@@ -1357,6 +1364,18 @@ export class NovaSessionManager {
         });
         this.sessionManager.addTranscriptEntry(sessionId, 'user', finalUserText, true);
         ctx.currentUserTranscript = '';
+
+        // ── Conversation state machine: extract entities + update state ────────
+        // Runs synchronously (regex-based). The returned context block is injected
+        // as a USER text directive so the LLM sees [PROPERTY FACTS] + [SESSION STATE]
+        // + [NEXT ACTION] before generating its next response.
+        const contextBlock = this.conversationManager.processUserUtterance(
+          sessionId, callId, finalUserText,
+        );
+        if (contextBlock && ctx.streamer.isConversationOpen && !interrupted) {
+          ctx.streamer.injectContextBlock(contextBlock);
+        }
+
         // Only clear bargeInPending when NOT interrupted. During an interruption, multiple
         // user speech fragments may arrive as separate content blocks ("हाँ, मैं" then "भी").
         // Keeping bargeInPending=true suppresses interim transcripts from subsequent fragments
@@ -1374,7 +1393,11 @@ export class NovaSessionManager {
         // treated as the live turn. Bypasses dedup entirely — interrupted speech is
         // never suppressed by duplicate detection.
         if (interrupted && Env.nova.promoteInterruptedTranscript) {
-          this.executePromotion(ctx, finalUserText, log, 'interrupted-vad-end');
+          // For promoted turns, inject state context wrapped around the user's text
+          const promotionText = contextBlock
+            ? `${contextBlock}\n\nCaller said: "${finalUserText}"`
+            : finalUserText;
+          this.executePromotion(ctx, promotionText, log, 'interrupted-vad-end');
         }
         ctx.lastFinalizedUserText = finalUserText;
       }
@@ -1430,6 +1453,15 @@ export class NovaSessionManager {
             text: ctx.currentAssistantTranscript.slice(0, 200),
           });
           this.sessionManager.addTranscriptEntry(sessionId, 'assistant', ctx.currentAssistantTranscript, true);
+
+          // ── Conversation state machine: validate assistant response ──────────
+          // Checks for hallucinated bookings, invented prices/dates/amenities.
+          // Issues are logged and traced — the response has already been spoken
+          // (streaming audio), so this is post-hoc validation for monitoring.
+          this.conversationManager.processAssistantUtterance(
+            sessionId, callId, ctx.currentAssistantTranscript,
+          );
+
           ctx.currentAssistantTranscript = '';
         }
       }

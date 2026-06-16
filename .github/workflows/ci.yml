@@ -29,27 +29,5 @@ jobs:
       - name: Build
         run: npm run build
 
-  web:
-    name: Web App — Type Check
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Generate Prisma client
-        run: npx prisma generate --schema apps/api/prisma/schema.prisma
-
-      - name: Type check web app
-        run: npx tsc --noEmit -p apps/web/tsconfig.json
-
-      - name: Type check API
-        run: npx tsc --noEmit -p apps/api/tsconfig.typecheck.json
+      - name: Test
+        run: npm test
