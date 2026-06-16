@@ -35,6 +35,7 @@ import { TelephonyProvider } from './modules/telephony/TelephonyProvider';
 import { AudioRouter } from './modules/media-gateway/AudioRouter';
 import { MediaSessionCoordinator } from './modules/media-gateway/MediaSessionCoordinator';
 import { MediaGatewayService } from './modules/media-gateway/MediaGatewayService';
+import { ConversationStateManager } from './modules/conversation/ConversationStateManager';
 
 const log = Logger.root('App');
 
@@ -68,7 +69,8 @@ export function createApp(): { app: Application; services: AppServices } {
 
   const krispService = new KrispService();
 
-  const novaSessionManager = new NovaSessionManager(sessionManager);
+  const conversationManager = new ConversationStateManager(Env.groq.apiKey);
+  const novaSessionManager = new NovaSessionManager(sessionManager, conversationManager);
 
   // const knowlarityService = new KnowlarityService(); // ← commented out
 

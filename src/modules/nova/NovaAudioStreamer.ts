@@ -295,6 +295,24 @@ export class NovaAudioStreamer {
   }
 
   /**
+   * Inject a context block (state + facts + directive) as an ASSISTANT text turn.
+   * Using ASSISTANT role means Nova treats it as prior context — it does NOT trigger
+   * a response (unlike a USER text block which would make Nova answer immediately).
+   * This silently updates Nova's context with the current session state and next-action
+   * directive so the LLM's next response is state-aware.
+   */
+  injectContextBlock(text: string): void {
+    if (!this.conversationOpen || !this.client.isOpen) return;
+    const contentName = `ctx_${uuidv4().replace(/-/g, '')}`;
+    this.client.sendAssistantTextBlock(this.currentPromptName, contentName, text);
+    this.log.debug('Context block injected as ASSISTANT text', {
+      promptName: this.currentPromptName,
+      contentName,
+      length: text.length,
+    });
+  }
+
+  /**
    * Promote a caller utterance that was captured DURING an interruption into an
    * explicit new USER turn, so Nova generates a fresh response to it. Nova sometimes
    * transcribes barge-in speech but never answers it (it resumes its prior response);
