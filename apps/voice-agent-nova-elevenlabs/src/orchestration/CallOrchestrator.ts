@@ -213,7 +213,11 @@ export class CallOrchestrator {
     this.log.info('Call orchestrator ready', { state: this.state });
 
     // Fixed greeting via TTS — no LLM needed. Reliable and fast.
-    this.speakCanned('Hi, मैं Arjun बोल रहा हूँ Akshay Vista से। क्या मैं आपका नाम जान सकता हूँ?');
+    // Outbound sales opener: short — name, company, project, then check interest.
+    // Deliberately does NOT ask for the name yet (first goal is to gauge interest).
+    this.speakCanned(
+      'Hi, मैं Arjun, R.R. Lunkad की Akshay Vista से। Site visit में interested होंगे?',
+    );
   }
 
   /**
@@ -529,6 +533,21 @@ export class CallOrchestrator {
     if (this.state !== 'LISTENING') return;
     if (!text.trim()) return;
     if (this.conversationComplete) return;
+
+    // ── Speculation DISABLED for reliability ─────────────────────────────
+    // Speculative generation from stable interims was double-firing: when the
+    // final transcript differed, the in-flight LLM+TTS was aborted and a fresh
+    // generation started, but the restart's audio could be dropped — the caller
+    // heard SILENCE after asking a question (observed on a real call). The
+    // ~150ms it could save is not worth dropping answers on a sales call.
+    // Every turn now runs exactly one clean generation on the final transcript.
+    if (!Env.llm.speculationEnabled) {
+      this.consecutiveEmptyVADs = 0;
+      this.emptyFinalStreak = 0;
+      this.lastTranscriptAt = Date.now();
+      this.clearSilenceTimer();
+      return;
+    }
     // Block generation if already booked
     if (this.session.bookingStatus === 'BOOKED') {
       this.log.info('Ignoring stable interim — booking already complete', { text });

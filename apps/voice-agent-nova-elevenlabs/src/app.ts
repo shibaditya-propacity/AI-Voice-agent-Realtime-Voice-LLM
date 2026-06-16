@@ -75,6 +75,8 @@ export function createApp(): AppInstance {
 
   httpServer.on('upgrade', (request, socket, head) => {
     const url = request.url ?? '';
+    const ua  = request.headers['user-agent'] ?? '';
+    log.info('WS upgrade received', { url, ua, ip: request.socket.remoteAddress });
 
     if (url === '/stream' || url.startsWith('/stream?')) {
       wss.handleUpgrade(request, socket, head, (ws) => {

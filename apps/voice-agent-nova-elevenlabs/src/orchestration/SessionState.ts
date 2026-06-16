@@ -52,7 +52,38 @@ export interface CollectedInfo {
   preferredTime: string | null;
   projectInterest: string | null;
   budgetMentioned: string | null;
+  bhkPreference: string | null;
 }
+
+// ─── Application State Machine (outbound sales flow) ────────────────────────
+//
+//   INTRODUCTION → INTEREST_CHECK → GET_NAME → QUESTION_HANDLING
+//                       │                            │
+//                       │                            ├→ ASK_VISIT_DAY → ASK_VISIT_TIME
+//                       │                            │        → CONFIRM_VISIT → BOOKED
+//                       └→ NOT_INTERESTED            └ (answer Qs, steer to visit)
+//
+// The APPLICATION owns every transition (derived from collected slots + user
+// interest/affirmation). The LLM NEVER controls business state — it only renders
+// the [NEXT_ACTION] line the application computes. This is the single biggest
+// anti-hallucination guarantee: the model cannot "book" anything by saying so,
+// and it cannot decide the customer is interested or skip the name step.
+
+export type ConversationStep =
+  | 'INTRODUCTION'      // opener (intro + interest question) is playing
+  | 'INTEREST_CHECK'    // waiting to learn if the caller is interested
+  | 'GET_NAME'          // interested; collect the caller's name
+  | 'QUESTION_HANDLING' // name known; answer questions, steer toward a visit
+  | 'ASK_VISIT_DAY'     // caller agreed to visit; collect preferred day
+  | 'ASK_VISIT_TIME'    // day captured; collect preferred time
+  | 'CONFIRM_VISIT'     // day + time captured; one-line confirmation pending
+  | 'BOOKED'            // caller confirmed; visit booked, call ending
+  | 'NOT_INTERESTED';   // caller declined; close politely, call ending
+
+const AFFIRMATIVE = /^(yes|yeah|yep|sure|ok|okay|haan|हाँ|हां|जी|जी हाँ|ज़रूर|बिल्कुल|bilkul|perfect|theek|ठीक|done|book|interested|chahta|चाहता|चाहूँगा)\b/i;
+
+// Clear rejection of the offer (not just "no" to one question). Drives NOT_INTERESTED.
+const REJECTION = /\b(not interested|no thanks|no thank you|don'?t call|stop calling|busy|interested नहीं|नहीं चाहिए|mat karo|मत करो|नहीं चाहता|remove my number)\b/i;
 
 // ─── Name Extraction Safety ────────────────────────────────────────────────
 // These phrases are TRIGGERS, not names. If the transcript matches one of
@@ -85,7 +116,17 @@ export class SessionState {
     preferredTime: null,
     projectInterest: null,
     budgetMentioned: null,
+    bhkPreference: null,
   };
+
+  /** Caller engaged positively with the offer (drives INTEREST_CHECK → GET_NAME). */
+  interested = false;
+
+  /** Caller clearly declined the offer (drives NOT_INTERESTED → end call). */
+  notInterested = false;
+
+  /** Caller agreed to actually schedule a visit (drives QUESTION_HANDLING → ASK_VISIT_DAY). */
+  visitAgreed = false;
 
   /** Current booking workflow status. */
   bookingStatus: BookingStatus = 'NONE';
@@ -96,8 +137,9 @@ export class SessionState {
   /** Whether the call should end after current playback completes. */
   shouldEndCall = false;
 
-  /** What the agent last asked the user — helps interpret bare responses. */
-  lastAskedField: LastAskedField = 'name'; // greeting asks for name
+  /** What the agent last asked the user — helps interpret bare responses.
+   *  Opener asks about site-visit interest, so a bare "yes/haan" maps to interest. */
+  lastAskedField: LastAskedField = 'site_visit_interest';
 
   /** Turn counter for fact provenance tracking. */
   private turnCount = 0;
@@ -115,6 +157,48 @@ export class SessionState {
 
   get currentTurn(): number {
     return this.turnCount;
+  }
+
+  // ─── Spec-named field accessors ─────────────────────────────────────────
+  // Stable public names for the slots, mapped onto the internal store.
+
+  get customerName(): string | null { return this.info.name; }
+  get budget(): string | null { return this.info.budgetMentioned; }
+  get bhkPreference(): string | null { return this.info.bhkPreference; }
+  get siteVisitDay(): string | null { return this.info.preferredDate; }
+  get siteVisitTime(): string | null { return this.info.preferredTime; }
+  get visitBooked(): boolean { return this.bookingSuccess; }
+
+  /**
+   * Application-owned conversation step. Derived purely from collected slots,
+   * interest, and booking status — never from anything the LLM said.
+   */
+  get currentStep(): ConversationStep {
+    // Terminal states first.
+    if (this.bookingStatus === 'BOOKED') return 'BOOKED';
+    if (this.notInterested) return 'NOT_INTERESTED';
+
+    // Booking funnel (slots take priority once collection has started).
+    if (this.info.preferredDate && this.info.preferredTime) return 'CONFIRM_VISIT';
+    if (this.info.preferredDate) return 'ASK_VISIT_TIME';
+    if (this.visitAgreed) return 'ASK_VISIT_DAY';
+
+    // Discovery funnel.
+    if (!this.interested) return this.turnCount === 0 ? 'INTRODUCTION' : 'INTEREST_CHECK';
+    if (!this.info.name) return 'GET_NAME';
+    return 'QUESTION_HANDLING';
+  }
+
+  /** One-line natural-language summary of progress (spec field). */
+  get summary(): string {
+    const parts: string[] = [];
+    if (this.info.name) parts.push(`name=${this.info.name}`);
+    if (this.info.bhkPreference) parts.push(`bhk=${this.info.bhkPreference}`);
+    if (this.info.budgetMentioned) parts.push(`budget=${this.info.budgetMentioned}`);
+    if (this.info.preferredDate) parts.push(`day=${this.info.preferredDate}`);
+    if (this.info.preferredTime) parts.push(`time=${this.info.preferredTime}`);
+    parts.push(this.visitBooked ? 'visit=BOOKED' : `step=${this.currentStep}`);
+    return parts.join(', ');
   }
 
   // ─── Info Setters ───────────────────────────────────────────────────────
@@ -178,7 +262,16 @@ export class SessionState {
 
   setBudgetMentioned(budget: string): void {
     if (!budget.trim()) return;
+    if (this.info.budgetMentioned === budget.trim()) return;
     this.info.budgetMentioned = budget.trim();
+    this.log.info('slot_update', { field: 'budget', value: this.info.budgetMentioned, turn: this.turnCount });
+  }
+
+  setBhkPreference(bhk: string): void {
+    if (!bhk.trim()) return;
+    if (this.info.bhkPreference === bhk.trim()) return;
+    this.info.bhkPreference = bhk.trim();
+    this.log.info('slot_update', { field: 'bhk', value: this.info.bhkPreference, turn: this.turnCount });
   }
 
   // ─── Booking Status Transitions ──────────────────────────────────────────
@@ -269,13 +362,15 @@ export class SessionState {
   updateLastAskedField(text: string): void {
     const lower = text.toLowerCase();
 
-    if (/\b(naam|name|नाम)\b/i.test(lower)) {
+    // NOTE: \b word boundaries do NOT work around Devanagari (नाम is non-\w),
+    // so ASCII keywords use \b while Devanagari keywords are matched directly.
+    if (/\b(naam|name)\b/i.test(lower) || /नाम/.test(lower)) {
       this.lastAskedField = 'name';
-    } else if (/\b(day|date|din|दिन|weekday|weekend|कब|कौनसा)\b/i.test(lower)) {
+    } else if (/\b(day|date|din|weekday|weekend)\b/i.test(lower) || /दिन|कब|कौनसा/.test(lower)) {
       this.lastAskedField = 'date';
-    } else if (/\b(time|samay|समय|morning|afternoon|evening|बजे|सुबह|दोपहर|शाम)\b/i.test(lower)) {
+    } else if (/\b(time|samay|morning|afternoon|evening)\b/i.test(lower) || /समय|बजे|सुबह|दोपहर|शाम/.test(lower)) {
       this.lastAskedField = 'time';
-    } else if (/\b(visit|देखना|देखेंगे|चाहेंगे|schedule|book)\b/i.test(lower)) {
+    } else if (/\b(visit|schedule|book)\b/i.test(lower) || /देखना|देखेंगे|चाहेंगे/.test(lower)) {
       this.lastAskedField = 'site_visit_interest';
     }
   }
@@ -319,75 +414,40 @@ export class SessionState {
   // ─── State Serialization for System Prompt ───────────────────────────────
 
   toPromptBlock(): string {
-    const lines: string[] = ['[SESSION STATE — GROUND TRUTH — DO NOT CONTRADICT]'];
+    const f = (v: string | null) => (v ? `${v} ✓` : '—');
+    return [
+      '[SESSION_STATE] (ground truth — use ✓ values, never re-ask them)',
+      `Name: ${f(this.info.name)} | BHK: ${f(this.info.bhkPreference)} | Budget: ${f(this.info.budgetMentioned)}`,
+      `Visit day: ${f(this.info.preferredDate)} | Visit time: ${f(this.info.preferredTime)} | Booked: ${this.visitBooked ? 'yes' : 'no'}`,
+      `[NEXT_ACTION] ${this.nextAction()}`,
+    ].join('\n');
+  }
 
-    lines.push('');
-    lines.push('COLLECTED INFO:');
-    if (this.info.name) {
-      lines.push(`  Caller name: ${this.info.name} ✓`);
-    } else {
-      lines.push('  Caller name: ❌ NOT COLLECTED');
-    }
-
-    if (this.info.preferredDate) {
-      lines.push(`  Preferred date: ${this.info.preferredDate} ✓`);
-    } else {
-      lines.push('  Preferred date: ❌ NOT COLLECTED');
-    }
-
-    if (this.info.preferredTime) {
-      lines.push(`  Preferred time: ${this.info.preferredTime} ✓`);
-    } else {
-      lines.push('  Preferred time: ❌ NOT COLLECTED');
-    }
-
-    lines.push(`  Booking status: ${this.bookingStatus}`);
-
-    // What to do next
-    lines.push('');
-    lines.push('PRIORITY: Always answer the user\'s question FIRST. Slot collection is secondary.');
-    lines.push('');
-    switch (this.bookingStatus) {
-      case 'NONE':
-        if (!this.info.name) {
-          lines.push('YOUR NEXT ACTION: Answer user query if any, then ask name.');
-        } else {
-          lines.push('YOUR NEXT ACTION: Answer user query if any, then guide toward site visit.');
-        }
-        break;
-      case 'DATE_CAPTURED':
-        lines.push('YOUR NEXT ACTION: Answer user query if any, then ask preferred time (morning or afternoon).');
-        lines.push('  DO NOT ask for date — already collected.');
-        break;
-      case 'TIME_CAPTURED':
-        lines.push('YOUR NEXT ACTION: Answer user query if any, then ask preferred day (weekday or weekend).');
-        lines.push('  DO NOT ask for time — already collected.');
-        break;
-      case 'CONFIRMATION_PENDING':
-        lines.push(`YOUR NEXT ACTION: Confirm booking for ${this.info.preferredDate} ${this.info.preferredTime}.`);
-        lines.push('  Say "noted" or "booked" + Thank you. Then STOP.');
-        lines.push('  This is your FINAL response. One short confirmation only.');
-        break;
+  /**
+   * The single instruction line for this turn, computed from the application
+   * state machine. The LLM renders this; it never decides the step itself.
+   */
+  private nextAction(): string {
+    const name = this.info.name ? `${this.info.name} जी` : '';
+    switch (this.currentStep) {
+      case 'INTRODUCTION':
+      case 'INTEREST_CHECK':
+        return 'Answer any question briefly, then warmly ask if they\'d like to see the project on a site visit. Gauge interest.';
+      case 'GET_NAME':
+        return 'They are interested. Answer any question first, then politely ask their name (e.g. "May I know your name?").';
+      case 'QUESTION_HANDLING':
+        return `Answer their question fully from PROPERTY_FACTS${name ? `, address them as "${name}"` : ''}. Then, as a natural next step, suggest a site visit ("project देखकर clarity बेहतर आएगी" / "actual layout देखने से decision आसान होगा"). Do NOT pitch the visit every single turn.`;
+      case 'ASK_VISIT_DAY':
+        return `They want to visit. Answer any pending question, then ask ${name ? name + ', ' : ''}which day suits them — weekday or weekend.`;
+      case 'ASK_VISIT_TIME':
+        return 'Day is set. Ask morning or afternoon. Do NOT ask the day again.';
+      case 'CONFIRM_VISIT':
+        return `Confirm the visit for ${this.info.preferredDate} ${this.info.preferredTime} in one short line${name ? ` (use "${name}")` : ''}, then thank them. Ask nothing else.`;
       case 'BOOKED':
-        lines.push('BOOKING COMPLETE. Say nothing. Call is ending.');
-        break;
-      case 'FAILED':
-        lines.push('Booking failed. Apologize and offer to try again.');
-        break;
+        return 'Visit is booked. Say a brief warm thank-you only; the call is ending.';
+      case 'NOT_INTERESTED':
+        return 'They are not interested. Thank them politely in one short line and close warmly. Do NOT pitch the visit.';
     }
-
-    lines.push('');
-    lines.push('FORBIDDEN (violation = system failure):');
-    lines.push('- ❌ Do NOT ask for name/date/time if marked ✓ above.');
-    lines.push('- ❌ Do NOT say "booked"/"confirmed"/"noted" unless status is CONFIRMATION_PENDING.');
-    lines.push('- ❌ Do NOT invent dates, times, prices, or availability not in FACTS.');
-    lines.push('- ❌ Do NOT continue conversation if status is BOOKED.');
-    lines.push('- ❌ Do NOT ignore user questions to collect slots. Answer first, then collect.');
-    if (this.info.name) {
-      lines.push(`- Use "${this.info.name}" once max. Do NOT ask their name again.`);
-    }
-
-    return lines.join('\n');
   }
 
   // ─── Output Validation ──────────────────────────────────────────────────
@@ -424,6 +484,24 @@ export class SessionState {
     // 3. Post-booking continuation
     if (this.bookingStatus === 'BOOKED' && text.trim().length > 0) {
       issues.push('POST_BOOKING_SPEECH');
+    }
+
+    // 4. Invented possession date — only "April 2027" is real.
+    const yearMention = text.match(/\b(20\d{2})\b/);
+    if (yearMention && yearMention[1] !== '2027') {
+      issues.push('INVENTED_POSSESSION: ' + yearMention[1]);
+    }
+    const monthMention = /\b(january|february|march|may|june|july|august|september|october|november|december)\b/i;
+    if (monthMention.test(text) && /\b(possession|ready|मिलेगा|completion)\b/i.test(text)) {
+      issues.push('INVENTED_POSSESSION_MONTH');
+    }
+
+    // 5. Invented price — real price is 8–10 thousand/sqft. Flag any per-sqft
+    //    figure outside that band, or any lakh/crore total presented as a fact.
+    const priceMatch = text.match(/\b(\d{1,3})\s*(thousand|k|हज़ार)\b/i);
+    if (priceMatch) {
+      const n = parseInt(priceMatch[1], 10);
+      if (n < 8 || n > 10) issues.push('INVENTED_PRICE: ' + priceMatch[0]);
     }
 
     if (issues.length > 0) {
@@ -466,25 +544,87 @@ export class SessionState {
     // ── Time extraction ──────────────────────────────────────────────────
     this.extractTime(text, trimmed);
 
-    // ── Site visit agreement detection ────────────────────────────────────
-    if (this.bookingStatus === 'NONE') {
-      const visitContext = /\b(visit|schedule|book|देखना|देखेंगे|site|हाँ|sure|ok)\b/i;
-      if (visitContext.test(lower)) {
-        // Don't auto-transition — just let the LLM guide the conversation
-        this.log.info('site_visit_interest_detected', { text: trimmed.substring(0, 50) });
-      }
+    // ── BHK + budget extraction (regex/rules only — never the LLM) ────────
+    this.extractBhk(lower);
+    this.extractBudget(lower);
 
-      // Accept bare "yes"/"haan" if agent just asked about site visit
-      if (this.lastAskedField === 'site_visit_interest') {
-        const bareYes = /^(yes|yeah|sure|ok|okay|haan|हाँ|हां|जी|जी हाँ|ज़रूर|bilkul|बिल्कुल)\s*$/i;
-        if (bareYes.test(trimmed)) {
-          this.log.info('site_visit_agreed', { response: trimmed });
-        }
+    // ── Interest / rejection detection (drives discovery funnel) ──────────
+    this.detectInterest(lower, trimmed);
+
+    // ── Visit-agreement detection → drives QUESTION_HANDLING → ASK_VISIT_DAY
+    // Explicit visit language, OR a bare yes/haan right after the agent invited
+    // a visit, OR the caller volunteering a day/time, all mean "let's schedule".
+    // GATED ON NAME: per the flow, we always collect the name before scheduling,
+    // so "yes" to the opener marks interest (→ GET_NAME), not agreement to book.
+    const visitContext = /\b(visit|schedule|book|appointment|देखना|देखेंगे|देखने|dekhna|dekhenge|chalenge|चलेंगे)\b/i;
+    const affirmedVisit = this.lastAskedField === 'site_visit_interest' && AFFIRMATIVE.test(trimmed);
+    const wantsVisit = visitContext.test(lower) || affirmedVisit ||
+      !!this.info.preferredDate || !!this.info.preferredTime;
+    if (wantsVisit && !this.notInterested) {
+      this.interested = true;
+      if (this.info.name) {
+        this.visitAgreed = true;
+        this.log.info('site_visit_agreed', { text: trimmed.substring(0, 50) });
       }
+    }
+
+    // ── APPLICATION-CONTROLLED booking confirmation ───────────────────────
+    // The ONLY path to BOOKED: both slots captured (status CONFIRMATION_PENDING)
+    // AND the user affirms. Driven by USER input + state, never by LLM output.
+    if (this.bookingStatus === 'CONFIRMATION_PENDING' && AFFIRMATIVE.test(trimmed)) {
+      this.confirmBooking();
     }
 
     // Log session state after extraction
     this.log.info('session_state', this.getStateSnapshot());
+  }
+
+  /**
+   * Classify the caller's interest from their utterance — drives the discovery
+   * funnel (INTRODUCTION/INTEREST_CHECK → GET_NAME, or → NOT_INTERESTED).
+   * Application-owned: the LLM never decides whether the caller is interested.
+   */
+  private detectInterest(lower: string, trimmed: string): void {
+    if (this.bookingStatus === 'BOOKED' || this.visitAgreed || this.notInterested) return;
+
+    // Clear rejection → NOT_INTERESTED → close politely + end the call.
+    const bareNo = this.lastAskedField === 'site_visit_interest' &&
+      /^(no|nope|nah|nahi|नहीं|ना)\b/i.test(trimmed);
+    if (REJECTION.test(lower) || bareNo) {
+      this.notInterested = true;
+      this.shouldEndCall = true;
+      this.log.info('not_interested', { text: trimmed.substring(0, 50) });
+      return;
+    }
+
+    // Any positive engagement → interested. Affirmative to the offer, a real
+    // question, or a provided name/BHK/budget all signal genuine interest.
+    const queryKeywords = /\b(what|how|price|budget|cost|amenities|location|bhk|possession|floor|plan|kitna|kitne|kahan|kya|क्या|कितना|कहाँ|कीमत|दाम)\b/i;
+    if (AFFIRMATIVE.test(trimmed) || queryKeywords.test(lower) ||
+        this.info.name || this.info.bhkPreference || this.info.budgetMentioned) {
+      if (!this.interested) {
+        this.interested = true;
+        this.log.info('interest_detected', { text: trimmed.substring(0, 50) });
+      }
+    }
+  }
+
+  /** Extract BHK preference: "2 bhk", "2.5 BHK", "3bhk", "two bhk". */
+  private extractBhk(lower: string): void {
+    const m = lower.match(/\b(2\.5|2|3)\s*bhk\b/);
+    if (m) { this.setBhkPreference(`${m[1]} BHK`); return; }
+    const words: Record<string, string> = { two: '2', 'two and half': '2.5', three: '3' };
+    const w = lower.match(/\b(two and half|two|three)\s*bhk\b/);
+    if (w && words[w[1]]) this.setBhkPreference(`${words[w[1]]} BHK`);
+  }
+
+  /** Extract a mentioned budget: "50 lakh", "1 crore", "80 lakhs", "1.2 cr". */
+  private extractBudget(lower: string): void {
+    const m = lower.match(/\b(\d{1,3}(?:\.\d{1,2})?)\s*(lakh|lakhs|lac|crore|cr|करोड़|लाख)\b/);
+    if (m) {
+      const unit = /cr|crore|करोड़/.test(m[2]) ? 'crore' : 'lakh';
+      this.setBudgetMentioned(`${m[1]} ${unit}`);
+    }
   }
 
   /**
@@ -508,8 +648,8 @@ export class SessionState {
       /(?:mera\s+)?naam\s+hai\s+([a-zA-Z]{2,}(?:\s+[a-zA-Z]{2,})?)\s*$/i,
       // Without trailing है: "मेरा नाम शिवा"
       /(?:मेरा\s+नाम|mera\s+naam|mera\s+name)\s+([a-zA-Zऀ-ॿ]{2,}(?:\s+[a-zA-Zऀ-ॿ]{2,})?)\s*$/i,
-      // "my name is Rahul" / "I am Rahul" → "Rahul"
-      /(?:my\s+name\s+is|i\s+am|i'm|this\s+is)\s+([a-zA-Z]{2,}(?:\s+[a-zA-Z]{2,})?)\s*$/i,
+      // "my name is Rahul" / "I am Rahul" / "my name is शिवा" → name (English OR Devanagari)
+      /(?:my\s+name\s+is|i\s+am|i'm|this\s+is)\s+([a-zA-Zऀ-ॿ]{2,}(?:\s+[a-zA-Zऀ-ॿ]{2,})?)\s*$/i,
       // "Rajesh speaking" / "Rajesh here"
       /^([a-zA-Zऀ-ॿ]{2,}(?:\s+[a-zA-Zऀ-ॿ]{2,})?)\s+(?:speaking|here|bol\s+raha|bol\s+rahi|बोल\s+रहा|बोल\s+रही)/i,
       // "मैं शिवा हूँ" → "शिवा" (Hindi "I am X")
@@ -623,27 +763,30 @@ export class SessionState {
    * Detects confirmation patterns to transition CONFIRMATION_PENDING → BOOKED.
    */
   extractFromAssistantResponse(text: string): void {
+    // We ONLY learn what the agent just asked about, so the next bare user
+    // reply can be interpreted. We deliberately do NOT transition booking
+    // state here: the LLM saying "booked"/"noted" must never move business
+    // state. Booking is confirmed by the application on USER affirmation
+    // (see extractFromUserTranscript → confirmBooking). This makes
+    // hallucinated confirmations inert.
     this.updateLastAskedField(text);
-
-    // Only allow CONFIRMATION_PENDING → BOOKED
-    if (this.bookingStatus !== 'CONFIRMATION_PENDING') return;
-    if (!this.info.preferredDate || !this.info.preferredTime) return;
-
-    const confirmPattern = /\b(noted|booked|scheduled|confirm|confirmed|done|पक्का|book\b)/i;
-    if (confirmPattern.test(text)) {
-      this.confirmBooking();
-    }
   }
 
   // ─── State Snapshot (for logging) ────────────────────────────────────────
 
   getStateSnapshot(): Record<string, unknown> {
     return {
+      step: this.currentStep,
       name: this.info.name,
-      preferredDate: this.info.preferredDate,
-      preferredTime: this.info.preferredTime,
+      bhkPreference: this.info.bhkPreference,
+      budget: this.info.budgetMentioned,
+      siteVisitDay: this.info.preferredDate,
+      siteVisitTime: this.info.preferredTime,
+      interested: this.interested,
+      notInterested: this.notInterested,
+      visitAgreed: this.visitAgreed,
       bookingStatus: this.bookingStatus,
-      bookingSuccess: this.bookingSuccess,
+      visitBooked: this.visitBooked,
       lastAskedField: this.lastAskedField,
       turn: this.turnCount,
       shouldEndCall: this.shouldEndCall,

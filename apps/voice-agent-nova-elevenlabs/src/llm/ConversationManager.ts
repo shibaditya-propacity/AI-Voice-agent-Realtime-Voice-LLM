@@ -13,7 +13,16 @@
 
 import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources/messages/messages';
 import { Env } from '../config/env';
+import { PROPERTY_FACTS_BLOCK } from './PropertyFacts';
 import { Logger } from '../shared/logger';
+
+/**
+ * Static prompt prefix = persona/style core + [PROPERTY_FACTS].
+ * Built EXACTLY ONCE at module load (zero-copy): neither the base prompt nor
+ * the property facts change during a call, so they are never re-concatenated
+ * per turn. Only the small dynamic [SESSION_STATE] block is appended at runtime.
+ */
+const STATIC_PROMPT_PREFIX = `${Env.llm.systemPrompt}\n\n${PROPERTY_FACTS_BLOCK}`;
 
 /** Metadata for a message in the history. */
 interface MessageEntry {
@@ -41,10 +50,14 @@ export class ConversationManager {
     this._systemPromptSuffix = suffix;
   }
 
-  /** Full system prompt = base prompt + session state suffix. */
+  /**
+   * Full system prompt = cached static prefix (persona + [PROPERTY_FACTS])
+   * + dynamic [SESSION_STATE] suffix. Only one string concat per turn over the
+   * small dynamic block; the large static prefix is never rebuilt.
+   */
   get systemPrompt(): string {
-    if (!this._systemPromptSuffix) return Env.llm.systemPrompt;
-    return `${Env.llm.systemPrompt}\n\n${this._systemPromptSuffix}`;
+    if (!this._systemPromptSuffix) return STATIC_PROMPT_PREFIX;
+    return `${STATIC_PROMPT_PREFIX}\n\n${this._systemPromptSuffix}`;
   }
 
   // ─── Mutation ─────────────────────────────────────────────────────────────

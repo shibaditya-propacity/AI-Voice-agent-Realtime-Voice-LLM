@@ -46,14 +46,21 @@ describe('SessionState', () => {
     });
 
     it('extracts bare name "Shiva" when agent asked for name', () => {
-      // lastAskedField defaults to 'name' (greeting asks for name)
+      // Outbound flow: the agent reaches GET_NAME and asks the name first.
+      session.updateLastAskedField('May I know your name?');
       session.extractFromUserTranscript('Shiva');
       expect(session.info.name).toBe('Shiva');
     });
 
     it('extracts bare name "Rajesh Kumar" when agent asked for name', () => {
+      session.updateLastAskedField('May I know your name?');
       session.extractFromUserTranscript('Rajesh Kumar');
       expect(session.info.name).toBe('Rajesh Kumar');
+    });
+
+    it('extracts a Devanagari name after an English trigger ("my name is शिवा")', () => {
+      session.extractFromUserTranscript('my name is शिवा');
+      expect(session.info.name).toBe('शिवा');
     });
 
     it('does NOT store "मेरा नाम" as name (trigger phrase only)', () => {
@@ -213,43 +220,66 @@ describe('SessionState', () => {
   // ─── Amenities Question Before Name Collection ────────────────────────────
 
   describe('Query Handling Priority', () => {
-    it('toPromptBlock says to answer query first when name not collected', () => {
+    it('toPromptBlock asks for name during GET_NAME and stays under budget', () => {
+      session.interested = true; // interested but no name yet → GET_NAME
+      expect(session.currentStep).toBe('GET_NAME');
       const block = session.toPromptBlock();
-      expect(block).toContain('Answer user query');
-      expect(block).toContain('PRIORITY');
+      expect(block).toContain('[SESSION_STATE]');
+      expect(block).toContain('[NEXT_ACTION]');
+      expect(block).toContain('name'); // NEXT_ACTION for GET_NAME mentions asking the name
+      expect(block.length).toBeLessThan(400); // slim block — well under the 500-token prompt budget
     });
 
-    it('toPromptBlock says to answer query first during DATE_CAPTURED', () => {
+    it('fresh session starts in INTRODUCTION (no name asked up front)', () => {
+      expect(session.currentStep).toBe('INTRODUCTION');
+      expect(session.toPromptBlock()).not.toContain('ask their name');
+    });
+
+    it('toPromptBlock instructs asking time (not day) once a day is set', () => {
+      session.setName('Shiva');
       session.setPreferredDate('Saturday');
       const block = session.toPromptBlock();
-      expect(block).toContain('Answer user query if any');
+      expect(block).toContain('morning or afternoon');
+      expect(block).not.toContain('which day'); // never re-ask the captured day
     });
   });
 
   // ─── Booking Completion Flow ──────────────────────────────────────────────
 
   describe('Booking Completion Flow', () => {
-    it('full booking flow: date → time → confirm → BOOKED + shouldEndCall', () => {
+    it('app-controlled flow: date → time → CONFIRMING → user "yes" → BOOKED', () => {
       session.setName('Shiva');
       session.extractFromUserTranscript('Saturday morning');
       expect(session.info.preferredDate).toBe('Saturday');
       expect(session.info.preferredTime).toBe('morning');
       expect(session.bookingStatus).toBe('CONFIRMATION_PENDING');
+      expect(session.currentStep).toBe('CONFIRM_VISIT');
 
-      // Simulate LLM confirmation response
-      session.extractFromAssistantResponse('Perfect, Saturday morning noted है। Thank you!');
+      // Booking is confirmed by the USER affirming — never by the LLM's words.
+      session.extractFromUserTranscript('haan, perfect');
       expect(session.bookingStatus).toBe('BOOKED');
-      expect(session.bookingSuccess).toBe(true);
+      expect(session.visitBooked).toBe(true);
       expect(session.shouldEndCall).toBe(true);
+      expect(session.currentStep).toBe('BOOKED');
     });
 
-    it('LLM cannot trigger BOOKED without CONFIRMATION_PENDING', () => {
+    it('LLM saying "booked" never advances business state', () => {
       session.setName('Shiva');
       session.setPreferredDate('Saturday');
-      // Only DATE_CAPTURED — no time yet
-      session.extractFromAssistantResponse('Visit booked for Saturday. Thank you!');
+      session.setPreferredTime('morning');
+      expect(session.bookingStatus).toBe('CONFIRMATION_PENDING');
+      // The model claims the booking is done — must be inert.
+      session.extractFromAssistantResponse('Perfect, Saturday morning booked! Thank you!');
+      expect(session.bookingStatus).toBe('CONFIRMATION_PENDING');
+      expect(session.visitBooked).toBe(false);
+    });
+
+    it('user "yes" cannot book before both slots are captured', () => {
+      session.setName('Shiva');
+      session.setPreferredDate('Saturday'); // only DATE_CAPTURED
+      session.extractFromUserTranscript('yes please');
       expect(session.bookingStatus).toBe('DATE_CAPTURED');
-      expect(session.bookingSuccess).toBe(false);
+      expect(session.visitBooked).toBe(false);
     });
   });
 
@@ -332,6 +362,69 @@ describe('SessionState', () => {
     it('detects visit interest question', () => {
       session.updateLastAskedField('क्या आप visit करना चाहेंगे?');
       expect(session.lastAskedField).toBe('site_visit_interest');
+    });
+  });
+
+  // ─── Outbound Sales Flow (state machine) ──────────────────────────────────
+  describe('Outbound Sales Flow', () => {
+    it('starts in INTRODUCTION, never asking for the name up front', () => {
+      expect(session.currentStep).toBe('INTRODUCTION');
+    });
+
+    it('"yes" to the opener → interested → GET_NAME (name not asked before interest)', () => {
+      session.extractFromUserTranscript('haan'); // affirmative to the interest opener
+      expect(session.interested).toBe(true);
+      expect(session.currentStep).toBe('GET_NAME');
+    });
+
+    it('a question signals interest and routes to GET_NAME', () => {
+      session.extractFromUserTranscript('what is the price?');
+      expect(session.interested).toBe(true);
+      expect(session.currentStep).toBe('GET_NAME');
+    });
+
+    it('clear rejection → NOT_INTERESTED + ends the call', () => {
+      session.extractFromUserTranscript('no, not interested');
+      expect(session.notInterested).toBe(true);
+      expect(session.shouldEndCall).toBe(true);
+      expect(session.currentStep).toBe('NOT_INTERESTED');
+    });
+
+    it('after name, stays in QUESTION_HANDLING until a visit is agreed', () => {
+      session.interested = true;
+      session.updateLastAskedField('your name?');
+      session.extractFromUserTranscript('Rahul');
+      expect(session.customerName).toBe('Rahul');
+      expect(session.currentStep).toBe('QUESTION_HANDLING');
+    });
+
+    it('full conversion: interest → name → visit → day → time → confirm → BOOKED', () => {
+      session.extractFromUserTranscript('haan interested');           // INTEREST
+      session.updateLastAskedField('your name?');
+      session.extractFromUserTranscript('Rahul');                     // GET_NAME → name
+      expect(session.currentStep).toBe('QUESTION_HANDLING');
+      session.updateLastAskedField('site visit करेंगे?');
+      session.extractFromUserTranscript('haan visit karenge');        // visit agreed
+      expect(session.currentStep).toBe('ASK_VISIT_DAY');
+      session.updateLastAskedField('कौनसा day?');
+      session.extractFromUserTranscript('Saturday');                  // day
+      expect(session.currentStep).toBe('ASK_VISIT_TIME');
+      session.updateLastAskedField('morning या afternoon?');
+      session.extractFromUserTranscript('morning');                  // time → CONFIRM_VISIT
+      expect(session.currentStep).toBe('CONFIRM_VISIT');
+      expect(session.visitBooked).toBe(false);                       // not booked until user confirms
+      session.extractFromUserTranscript('haan perfect');             // user confirms
+      expect(session.currentStep).toBe('BOOKED');
+      expect(session.visitBooked).toBe(true);
+      expect(session.customerName).toBe('Rahul');                    // name persisted throughout
+    });
+
+    it('name persists and is never overwritten or re-asked', () => {
+      session.interested = true;
+      session.updateLastAskedField('your name?');
+      session.extractFromUserTranscript('Rahul');
+      session.extractFromUserTranscript('my name is Someone Else');
+      expect(session.customerName).toBe('Rahul');
     });
   });
 });
