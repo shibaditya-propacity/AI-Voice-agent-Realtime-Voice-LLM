@@ -39,6 +39,7 @@ import { globalToolRegistry } from '../tools/ToolRegistry';
 import { humanizeResponse, maybeGetOpener } from '../shared/humanize';
 import { Env } from '../config/env';
 import { Logger, closeCallLogger } from '../shared/logger';
+import { routeQuery } from '../llm/KnowledgeRouter';
 import type { StreamEvent } from '../llm/types';
 
 type CallState =
@@ -111,8 +112,11 @@ export class CallOrchestrator {
   private lastTTSCompleteAt = 0;
 
   /** Ignore VAD events for this long after TTS ends (PSTN echo dies down).
-   *  1500ms: PSTN echo of TTS audio sustains at ~1-1.3s on most calls. */
-  private readonly POST_TTS_VAD_SUPPRESS_MS = 1500;
+   *  500ms: STT muting during TTS already handles echo suppression. This
+   *  post-TTS window only needs to cover the ~200-400ms tail of PSTN echo
+   *  after playback ends. 1500ms was too aggressive — it suppressed real
+   *  user speech and caused 7+ second response delays. */
+  private readonly POST_TTS_VAD_SUPPRESS_MS = 500;
 
   /**
    * Tracks how many consecutive SpeechStarted events had no real transcript.
@@ -141,7 +145,12 @@ export class CallOrchestrator {
   private readonly EMPTY_FINALS_BEFORE_REPROMPT = 2;
   private readonly REPROMPT_MIN_GAP_MS = 8000;
   private readonly MAX_REPROMPTS_PER_CALL = 3;
-  private readonly REPROMPT_TEXT = "Hello? आपकी आवाज़ नहीं आ रही, क्या आप सुन रहे हैं?";
+  /** Empty finals within this window after playback are PSTN echo of our own
+   *  TTS, not the caller — they must not count toward the reprompt streak. */
+  private readonly EMPTY_FINAL_ECHO_WINDOW_MS = 1500;
+  // Idle reprompt: EXACTLY this line — no "hello", no "are you there",
+  // no "kya aap sun rahe hain", no "can you hear me".
+  private readonly REPROMPT_TEXT = "आपकी आवाज़ नहीं आ रही।";
 
   // ─── Silence Timer (dead-air after agent finishes speaking) ────────────
   /** Timer that fires if caller is silent for SILENCE_TIMEOUT_MS after agent speaks. */
@@ -166,6 +175,12 @@ export class CallOrchestrator {
 
   /** Whether TTS generation is done (all chunks received from ElevenLabs). */
   private ttsGenerationDone = false;
+
+  // ─── STT Watchdog ─────────────────────────────────────────────────────
+  // If SpeechStarted fires but no valid transcript arrives within
+  // STT_WATCHDOG_TIMEOUT_MS, cancel the pending turn and reset to LISTENING.
+  // Prevents silent/frozen states after failed STT recognition.
+  private sttWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(callSid: string, twilioService: TwilioService) {
     this.callSid        = callSid;
@@ -302,6 +317,7 @@ export class CallOrchestrator {
       this.sttUnmuteTimer = null;
     }
     this.clearSilenceTimer();
+    this.clearSTTWatchdog();
 
     // Abort any active generation
     this.abortController?.abort();
@@ -315,6 +331,12 @@ export class CallOrchestrator {
 
     this.latency.logCallSummary();
     this.log.info('Call orchestrator ended');
+
+    // Hang up the Twilio call so the line disconnects cleanly.
+    // Small delay to let the final TTS audio finish playing on the caller's end.
+    setTimeout(() => {
+      void this.twilioService.hangup(this.callSid);
+    }, 1500);
 
     // Flush and close the per-call log file
     closeCallLogger(this.callSid);
@@ -395,6 +417,16 @@ export class CallOrchestrator {
       return;
     }
 
+    // ── LISTENING: Post-TTS echo suppression ─────────────────────────────
+    // Check BEFORE incrementing consecutiveEmptyVADs — suppressed echo VADs
+    // must NOT inflate the noise counter (that would trigger ambient noise
+    // suppression and block real user speech that arrives after the echo window).
+    const msSinceTTS = now - this.lastTTSCompleteAt;
+    if (this.lastTTSCompleteAt > 0 && msSinceTTS < this.POST_TTS_VAD_SUPPRESS_MS) {
+      this.log.warn('FALSE_BARGEIN_REJECTED: post-TTS echo VAD suppressed', { msSinceTTS });
+      return;
+    }
+
     // ── LISTENING: track consecutive empty VADs for noise suppression ───
     // Only count VADs in LISTENING state — SPEAKING-state VADs are PSTN echo.
     if (this.lastVADAt > 0 && this.lastVADAt > this.lastTranscriptAt) {
@@ -402,28 +434,29 @@ export class CallOrchestrator {
     }
     this.lastVADAt = now;
 
-    // ── LISTENING: noise suppression for TTS pre-warming ────────────────
-    // Post-TTS echo suppression (1.5s after TTS ends)
-    const msSinceTTS = now - this.lastTTSCompleteAt;
-    if (this.lastTTSCompleteAt > 0 && msSinceTTS < this.POST_TTS_VAD_SUPPRESS_MS) {
-      this.log.debug('VAD ignored (post-TTS echo)', { msSinceTTS });
-      return;
-    }
-
-    // Suppress persistent ambient noise (2+ consecutive empty VADs)
-    if (this.consecutiveEmptyVADs >= this.MAX_EMPTY_VADS_FOR_PREWARM) {
-      this.log.debug('VAD ignored (noise — consecutive empty VADs)', {
-        count: this.consecutiveEmptyVADs,
-      });
-      return;
-    }
-
     // ── Valid speech in LISTENING state ──────────────────────────────────
+    // ALWAYS process VADs — clear silence timer, start watchdog, mark latency.
+    // The ambient noise counter only suppresses TTS prewarm (not VAD handling),
+    // because blocking VADs entirely creates a deadlock: no transcript can
+    // arrive to reset the counter if we stop processing speech events.
     this.latency.mark('speech_started');
     this.log.info('Speech started (VAD)', { state: this.state });
 
     // User is speaking — reset silence timer so we don't reprompt mid-speech.
     this.clearSilenceTimer();
+
+    // Start STT watchdog — if no valid transcript arrives within the timeout,
+    // reset to LISTENING to prevent silent/stuck state after failed STT.
+    this.startSTTWatchdog();
+
+    // Only skip TTS prewarm if ambient noise is detected (2+ consecutive empty VADs).
+    // This avoids wasting a TTS connection on noise, but still allows transcript processing.
+    if (this.consecutiveEmptyVADs >= this.MAX_EMPTY_VADS_FOR_PREWARM) {
+      this.log.debug('Skipping TTS prewarm — ambient noise (consecutive empty VADs)', {
+        count: this.consecutiveEmptyVADs,
+      });
+      return;
+    }
 
     this.prewarmTTS();
   }
@@ -438,12 +471,53 @@ export class CallOrchestrator {
    */
   private handleNoSpeech(): void {
     if (this.state !== 'LISTENING') return;
+
+    // Conversation is ending (booking confirmed / caller declined) — never
+    // reprompt "आपकी आवाज़ नहीं आ रही"; the closing line is playing and the
+    // call is about to hang up.
+    if (this.session.shouldEndCall || this.conversationComplete) return;
+
+    // ── Post-TTS echo guard ──────────────────────────────────────────────
+    // On PSTN, the agent's own TTS echoes back for a short tail after playback
+    // completes. Deepgram VADs that echo and finalizes it with ZERO words.
+    // Those empty finals are NOT the caller failing to be heard, so they must
+    // NOT count toward the "I can't hear you" reprompt streak — otherwise the
+    // agent reprompts repeatedly between turns even though the caller is there.
+    const msSinceTTS = this.lastTTSCompleteAt > 0 ? Date.now() - this.lastTTSCompleteAt : Infinity;
+    if (msSinceTTS < this.EMPTY_FINAL_ECHO_WINDOW_MS) {
+      this.log.debug('Empty final within post-TTS echo window — not counting toward reprompt', { msSinceTTS });
+      this.clearSTTWatchdog();
+      this.state = 'LISTENING';
+      this.startSilenceTimer();
+      return;
+    }
+
     this.emptyFinalStreak++;
-    this.log.debug('Empty speech event — restarting silence timer', {
+    this.log.debug('Empty/rejected speech event — ensuring LISTENING state with silence timer', {
       emptyFinalStreak: this.emptyFinalStreak,
+      state: this.state,
     });
-    // Restart silence timer so we reprompt if caller remains silent after
-    // a failed recognition attempt.
+    // Clear watchdog — the STT turn is over (rejected or empty), not stuck.
+    this.clearSTTWatchdog();
+    // Ensure state is LISTENING (prevents stuck states after rejected transcripts)
+    this.state = 'LISTENING';
+
+    // Direct reprompt after consecutive empty finals — don't rely on silence
+    // timer which gets endlessly reset by frequent empty VAD events.
+    if (this.emptyFinalStreak >= this.EMPTY_FINALS_BEFORE_REPROMPT &&
+        Date.now() - this.lastRepromptAt >= this.REPROMPT_MIN_GAP_MS &&
+        this.repromptCount < this.MAX_REPROMPTS_PER_CALL) {
+      this.emptyFinalStreak = 0;
+      this.lastRepromptAt = Date.now();
+      this.repromptCount++;
+      this.log.warn('Reprompting after consecutive empty speech finals', {
+        repromptCount: this.repromptCount,
+      });
+      this.speakCanned(this.REPROMPT_TEXT);
+      return;
+    }
+
+    // Restart silence timer as fallback for true silence (no VAD events at all).
     this.startSilenceTimer();
   }
 
@@ -511,7 +585,7 @@ export class CallOrchestrator {
     // Filter out filler/echo words — PSTN echo of agent TTS is often
     // transcribed as "Mhmm mhmm mhmm" by Deepgram. Not real speech.
     if (CallOrchestrator.ECHO_FILLER_PATTERN.test(text.trim())) {
-      this.log.debug('Interim ignored (echo/filler pattern)', { text });
+      this.log.warn('FALSE_BARGEIN_REJECTED: interim is echo/filler during SPEAKING', { text });
       return;
     }
 
@@ -555,14 +629,12 @@ export class CallOrchestrator {
     }
 
     // ── Speculation safety gate ──────────────────────────────────────────
-    // Block speculative generation during name collection (names arrive in
-    // fragments: "मेरा" → "मेरा नाम" → "मेरा नाम शिवा") and for short
-    // utterances that don't look like complete queries.
+    // Block speculative generation for short utterances that don't look
+    // like complete queries.
     if (!this.session.shouldAllowSpeculation(text)) {
       this.log.info('Speculation blocked by safety gate', {
         text,
         lastAskedField: this.session.lastAskedField,
-        hasName: !!this.session.info.name,
       });
       // Still reset noise tracking and silence timer — real speech is happening
       this.consecutiveEmptyVADs = 0;
@@ -599,7 +671,17 @@ export class CallOrchestrator {
       transcriptLenChars: text.trim().length,
     });
 
-    void this.generateAndSpeak();
+    // Try deterministic scheduling response before LLM (zero tokens)
+    if (this.trySchedulingResponse()) {
+      return;
+    }
+
+    // Try zero-token fact response before invoking LLM
+    if (this.tryDirectFactResponse(text.trim())) {
+      return;
+    }
+
+    void this.generateAndSpeak({ maxTokens: this.session.selectTokenBudget(text) });
   }
 
   // ─── Final Transcript ─────────────────────────────────────────────────────
@@ -615,7 +697,6 @@ export class CallOrchestrator {
     }
 
     // ── Track previous state for pin detection ─────────────────────────
-    const prevName = this.session.info.name;
     const prevDate = this.session.info.preferredDate;
     const prevTime = this.session.info.preferredTime;
 
@@ -623,11 +704,20 @@ export class CallOrchestrator {
     this.session.advanceTurn();
     this.session.extractFromUserTranscript(text);
 
+    // Did THIS turn end the conversation (booking confirmed, or caller declined)?
+    // If so, any in-flight SPECULATIVE generation was built for the pre-end state
+    // (e.g. "konsa time?") — it must NOT be confirmed. We force a fresh generation
+    // below so the caller hears the proper closing line ("7 बजे site पर मिलते हैं"
+    // / polite decline) and the call ends cleanly instead of lingering and
+    // reprompting "आपकी आवाज़ नहीं आ रही".
+    const conversationEndingThisTurn = this.session.shouldEndCall;
+
     // ── Reset noise tracking — real speech confirmed ────────────────────
     this.consecutiveEmptyVADs = 0;
     this.emptyFinalStreak = 0;
     this.lastTranscriptAt = Date.now();
     this.clearSilenceTimer();
+    this.clearSTTWatchdog();
 
     const transcriptAt = Date.now();
     this.latency.mark('speech_final', transcriptAt);
@@ -652,7 +742,7 @@ export class CallOrchestrator {
       this.speculativeText = null;
       const finalText = text.trim();
 
-      if (finalText === specText) {
+      if (finalText === specText && !conversationEndingThisTurn) {
         // Exact match — generation already running, nothing to do.
         this.latency.recordSpeculation('confirmed_exact');
         this.log.info('Speculative generation CONFIRMED (exact match)', {
@@ -666,7 +756,7 @@ export class CallOrchestrator {
       // The LLM already received the core intent — extra trailing words
       // (like "project" after "what are the amenities of the") rarely
       // change the response meaningfully. Keep the generation running.
-      if (finalText.startsWith(specText) && specText.length >= 8) {
+      if (finalText.startsWith(specText) && specText.length >= 8 && !conversationEndingThisTurn) {
         const extraWords = finalText.slice(specText.length).trim();
         this.latency.recordSpeculation('confirmed_prefix');
         this.log.info('Speculative generation CONFIRMED (prefix match)', {
@@ -719,9 +809,6 @@ export class CallOrchestrator {
     this.conversation.addUserMessage(text);
 
     // ── Pin message if it contained critical info extraction ──────────
-    if (!prevName && this.session.info.name) {
-      this.conversation.pinLastUserMessage('name:' + this.session.info.name);
-    }
     if (!prevDate && this.session.info.preferredDate) {
       this.conversation.pinLastUserMessage('date:' + this.session.info.preferredDate);
     }
@@ -736,13 +823,160 @@ export class CallOrchestrator {
       transcriptToLlmMs: Date.now() - transcriptAt,
     });
 
+    // Try deterministic scheduling response before LLM (zero tokens)
+    if (this.trySchedulingResponse()) {
+      return;
+    }
+
+    // Try zero-token fact response before invoking LLM
+    if (this.tryDirectFactResponse(text)) {
+      return;
+    }
+
     // Non-blocking — errors are caught inside
-    void this.generateAndSpeak();
+    void this.generateAndSpeak({ maxTokens: this.session.selectTokenBudget(text) });
+  }
+
+  // ─── Knowledge Router: Zero-Token Fact Responses ────────────────────────────
+
+  /**
+   * Try to answer a factual query directly from PropertyFacts, bypassing LLM.
+   * Returns true if handled (response is already streaming to TTS).
+   * Returns false if the query needs LLM processing.
+   */
+  private tryDirectFactResponse(text: string): boolean {
+    const result = routeQuery(text, this.session, this.log);
+
+    if (!result.handled) {
+      this.log.debug('ROUTER_DECISION: LLM required', {
+        reason: result.reason,
+        text: text.substring(0, 50),
+      });
+      return false;
+    }
+
+    // ── Direct response path: skip LLM entirely ──────────────────────────
+    this.log.info('DIRECT_FACT_RESPONSE', {
+      intent: result.intent,
+      response: result.response,
+      reason: result.reason,
+      text: text.substring(0, 50),
+    });
+
+    const myGenId = ++this.generationId;
+    this.activeResponseText = result.response;
+
+    // Reset playback tracking
+    this.ttsAudioBytesSent = 0;
+    this.firstTTSAudioSentAt = 0;
+    this.ttsGenerationDone = false;
+    if (this.playbackCompleteTimer) {
+      clearTimeout(this.playbackCompleteTimer);
+      this.playbackCompleteTimer = null;
+    }
+
+    // No AbortController needed — no LLM to cancel
+    this.abortController = null;
+
+    const tts = this.tts;
+    tts.startTurn(`g${myGenId}`);
+
+    this.state = 'SPEAKING';
+    this.suppressBargeInArm = false;
+
+    // Mute STT during echo burst
+    this.muteSTTForEchoBurst();
+
+    // Stream the response directly to TTS
+    const humanPrefix = Env.humanization.enabled ? maybeGetOpener() : '';
+    if (humanPrefix) tts.streamText(humanPrefix);
+    tts.streamText(result.response);
+
+    // Track in conversation history so context is preserved
+    this.session.extractFromAssistantResponse(result.response);
+    this.conversation.addAssistantText(result.response);
+
+    this.log.info('LLM generation complete', {
+      responseLength: result.response.length,
+      response: result.response,
+    });
+
+    // Check for conversation-ending state
+    if (this.session.shouldEndCall && !this.conversationComplete) {
+      this.conversationComplete = true;
+    }
+
+    tts.flush();
+    return true;
+  }
+
+  // ─── Deterministic Scheduling Responses ──────────────────────────────────
+  // Zero-LLM-token responses for scheduling steps. Ensures the scheduling
+  // flow works even if the LLM is unavailable (503/timeout/capacity).
+
+  /**
+   * Try to handle the current step with a deterministic scheduling response.
+   * Returns true if handled (response streaming to TTS), false if LLM needed.
+   */
+  private trySchedulingResponse(): boolean {
+    const response = this.session.getSchedulingResponse();
+    if (!response) return false;
+
+    this.log.info('LLM_BYPASSED_FOR_SCHEDULING', {
+      step: this.session.currentStep,
+      response,
+    });
+
+    const myGenId = ++this.generationId;
+    this.activeResponseText = response;
+
+    // Reset playback tracking
+    this.ttsAudioBytesSent = 0;
+    this.firstTTSAudioSentAt = 0;
+    this.ttsGenerationDone = false;
+    if (this.playbackCompleteTimer) {
+      clearTimeout(this.playbackCompleteTimer);
+      this.playbackCompleteTimer = null;
+    }
+
+    this.abortController = null;
+
+    const tts = this.tts;
+    tts.startTurn(`g${myGenId}`);
+
+    this.state = 'SPEAKING';
+    this.suppressBargeInArm = false;
+    this.muteSTTForEchoBurst();
+
+    // Stream directly to TTS — no LLM involved
+    tts.streamText(response);
+
+    // Track in conversation history
+    this.session.extractFromAssistantResponse(response);
+    this.conversation.addAssistantText(response);
+
+    this.log.info('LLM generation complete', {
+      responseLength: response.length,
+      response,
+    });
+
+    // Check for conversation-ending state
+    if (this.session.shouldEndCall && !this.conversationComplete) {
+      this.conversationComplete = true;
+      this.log.info('Conversation complete — booking confirmed by session state', {
+        date: this.session.info.preferredDate,
+        time: this.session.info.preferredTime,
+        bookingStatus: this.session.bookingStatus,
+      });
+    }
+
+    tts.flush();
+    return true;
   }
 
   // ─── LLM + TTS Pipeline ───────────────────────────────────────────────────
 
-  private async generateAndSpeak(opts: { suppressBargeIn?: boolean } = {}): Promise<void> {
+  private async generateAndSpeak(opts: { suppressBargeIn?: boolean; maxTokens?: number } = {}): Promise<void> {
     // Hard block: never generate after booking is complete
     if (this.session.bookingStatus === 'BOOKED' && !this.session.shouldEndCall) {
       this.log.info('generateAndSpeak() blocked — booking already BOOKED');
@@ -815,11 +1049,47 @@ export class CallOrchestrator {
     // knows what info has been collected and what to ask next.
     this.conversation.setSystemPromptSuffix(this.session.toPromptBlock());
 
+    // ── Lightweight leading-segment guard ──────────────────────────────────
+    // We do NOT buffer full responses (latency-critical). We hold back only the
+    // FIRST sentence/segment — until a sentence boundary, ~100 chars, or ~150ms,
+    // whichever comes first — sanitize it (strip banned filler/pitch/post-
+    // rejection scheduling), emit it, then stream every later token live.
+    const HEAD_CHAR_CAP = 100;
+    const HEAD_TIME_CAP_MS = 150;
+    let head = '';
+    let headFlushed = false;
+    let headStartedAt = 0;
+
+    const flushHead = (): void => {
+      if (headFlushed) return;
+      headFlushed = true;
+      this.latency.mark('tts_first_text');
+      // Measure the guard's added head-buffer cost. This is the ONLY latency
+      // the leading-segment guard introduces; it is bounded by HEAD_TIME_CAP_MS.
+      // (Also surfaced as llm_token_to_tts_text_ms in the TURN LATENCY summary.)
+      const bufferMs = headStartedAt ? Date.now() - headStartedAt : 0;
+      // Humanization opener (if any) leads, then the sanitized segment.
+      if (humanPrefix) tts.streamText(humanPrefix);
+      const cleaned = this.session.sanitizeStreamingHead(head);
+      const modified = cleaned !== head.trim();
+      this.log.info('Leading-segment guard flushed', {
+        head_buffer_ms: bufferMs,
+        head_chars: head.length,
+        guard_modified: modified,
+      });
+      if (cleaned) tts.streamText(cleaned);
+      head = '';
+    };
+
+    let genTokensUsed = 0;
+    let genTruncated = false;
+
     try {
       const stream = this.llm.stream(
         this.conversation.toMessages(),
         signal,
         this.conversation.systemPrompt,
+        opts.maxTokens,
       );
 
       for await (const event of stream) {
@@ -832,18 +1102,30 @@ export class CallOrchestrator {
 
           if (firstToken) {
             firstToken = false;
+            headStartedAt = Date.now();
             this.latency.mark('llm_first_token');
-            this.latency.mark('tts_first_text');
-            this.log.info('LLM first token received — streaming to TTS immediately');
-            // Prepend humanization opener before first token (if selected)
-            if (humanPrefix) {
-              tts.streamText(humanPrefix);
-            }
+            this.log.info('LLM first token received — buffering leading segment for guard');
           }
 
-          // Stream every token directly to TTS — no buffering
-          tts.streamText(text);
+          if (!headFlushed) {
+            head += text;
+            const atBoundary = /[.?!।\n]/.test(text);
+            const overChars = head.length >= HEAD_CHAR_CAP;
+            const overTime = Date.now() - headStartedAt >= HEAD_TIME_CAP_MS;
+            if (atBoundary || overChars || overTime) flushHead();
+          } else {
+            // Leading segment already cleared — stream every later token live.
+            tts.streamText(text);
+          }
+        } else if (event.type === 'done') {
+          const d = event as Extract<StreamEvent, { type: 'done' }>;
+          genTokensUsed = d.tokensUsed ?? 0;
+          genTruncated = d.truncated ?? false;
         }
+      }
+      // Short reply that never tripped a boundary/cap: flush the held segment.
+      if (!headFlushed && (myGenId === this.generationId) && !signal.aborted) {
+        flushHead();
       }
     } catch (err) {
       const e = err as Error;
@@ -852,6 +1134,20 @@ export class CallOrchestrator {
         this.log.debug('LLM stream aborted (expected on barge-in)');
       } else {
         this.log.error('LLM streaming error', e);
+        // ── Fallback: speak a recovery message so the user never hears silence ──
+        // Without this, a Groq 503 or network error produces 0 bytes of audio
+        // and the caller experiences a dead-air deadlock.
+        if (myGenId === this.generationId && !signal.aborted && !fullText.trim()) {
+          // If we're in a scheduling step, use deterministic response instead of generic fallback
+          const schedulingResponse = this.session.getSchedulingResponse();
+          const fallbackMsg = schedulingResponse ?? 'क्षमा करें, फिर से बोलिए।';
+          fullText = fallbackMsg;
+          tts.streamText(fallbackMsg);
+          this.log.warn(schedulingResponse ? 'LLM_ERROR_SCHEDULING_FALLBACK' : 'LLM_ERROR_FALLBACK', {
+            message: 'speaking recovery message to prevent silence',
+            step: this.session.currentStep,
+          });
+        }
       }
     }
 
@@ -865,6 +1161,10 @@ export class CallOrchestrator {
       tts.abort();
       return;
     }
+
+    // Record token usage for adaptive budgeting + auto-escalation (logs
+    // selectedTokenLimit / actualTokensUsed / responseTruncated).
+    this.session.recordGeneration(genTokensUsed, genTruncated);
 
     // All tokens received — flush TTS to get remaining audio.
     // flush() handles the 'connecting' state via pendingFlush flag.
@@ -898,7 +1198,7 @@ export class CallOrchestrator {
       }
 
       this.conversation.addAssistantText(fullText);
-      this.log.info('LLM generation complete', { responseLength: fullText.length });
+      this.log.info('LLM generation complete', { responseLength: fullText.length, response: fullText });
 
       // State-aware completion: session state tracks whether all info
       // is collected AND the LLM confirmed the booking. This replaces
@@ -906,7 +1206,6 @@ export class CallOrchestrator {
       if (this.session.shouldEndCall && !this.conversationComplete) {
         this.conversationComplete = true;
         this.log.info('Conversation complete — booking confirmed by session state', {
-          name: this.session.info.name,
           date: this.session.info.preferredDate,
           time: this.session.info.preferredTime,
           bookingStatus: this.session.bookingStatus,
@@ -1010,6 +1309,8 @@ export class CallOrchestrator {
 
     this.state = 'LISTENING';
     this.ensureSTTUnmuted();
+    // Reset noise counter — any empty VADs from during TTS are echo, not ambient noise.
+    this.consecutiveEmptyVADs = 0;
     this.log.info('Playback complete — now LISTENING');
 
     // Pre-warm TTS now — the user usually replies within seconds, and the
@@ -1027,6 +1328,8 @@ export class CallOrchestrator {
     this.silenceTimer = setTimeout(() => {
       this.silenceTimer = null;
       if (this.state !== 'LISTENING') return;
+      // Conversation ending — don't reprompt while the closing line plays.
+      if (this.session.shouldEndCall || this.conversationComplete) return;
       if (Date.now() - this.lastRepromptAt < this.REPROMPT_MIN_GAP_MS) return;
       if (this.repromptCount >= this.MAX_REPROMPTS_PER_CALL) return;
 
@@ -1057,6 +1360,34 @@ export class CallOrchestrator {
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer);
       this.silenceTimer = null;
+    }
+  }
+
+  // ─── STT Watchdog ─────────────────────────────────────────────────────────
+
+  /** Start a watchdog timer — fires if no valid transcript arrives in time. */
+  private startSTTWatchdog(): void {
+    this.clearSTTWatchdog();
+    this.sttWatchdogTimer = setTimeout(() => {
+      this.sttWatchdogTimer = null;
+      if (this.state !== 'LISTENING') return;
+
+      this.log.warn('WATCHDOG_RESET: no valid transcript within timeout — resetting to LISTENING', {
+        timeoutMs: Env.sttWatchdog.timeoutMs,
+        consecutiveEmptyVADs: this.consecutiveEmptyVADs,
+        emptyFinalStreak: this.emptyFinalStreak,
+      });
+
+      // Ensure we're firmly in LISTENING with a silence timer running
+      this.state = 'LISTENING';
+      this.startSilenceTimer();
+    }, Env.sttWatchdog.timeoutMs);
+  }
+
+  private clearSTTWatchdog(): void {
+    if (this.sttWatchdogTimer) {
+      clearTimeout(this.sttWatchdogTimer);
+      this.sttWatchdogTimer = null;
     }
   }
 
@@ -1112,6 +1443,13 @@ export class CallOrchestrator {
     this.state = 'LISTENING';
     this.ensureSTTUnmuted();
     this.log.info('Barge-in handled — back to LISTENING');
+
+    // Dead-air guard: a barge-in is normally followed by a real transcript that
+    // drives the next generation (and clears this timer). But a barge-in fired
+    // on background noise that Deepgram briefly decoded as interim words may
+    // NEVER finalize — no transcript, no handleNoSpeech, no recovery. Arm the
+    // silence timer so the agent reprompts instead of sitting silent forever.
+    this.startSilenceTimer();
 
     // Pre-warm TTS now — user is already speaking their next utterance
     this.prewarmTTS();

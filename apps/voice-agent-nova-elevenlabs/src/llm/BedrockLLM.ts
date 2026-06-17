@@ -144,9 +144,12 @@ export class BedrockLLM {
     messages: MessageParam[],
     abortSignal?: AbortSignal,
     systemPrompt?: string,
+    maxTokens?: number,
   ): AsyncGenerator<StreamEvent> {
     const requestStart = Date.now();
     let firstTokenTime: number | null = null;
+    // Adaptive per-turn token budget (falls back to the env default).
+    const tokenBudget = maxTokens && maxTokens > 0 ? maxTokens : Env.llm.maxTokens;
 
     const openAIMessages = toOpenAIMessages(systemPrompt ?? Env.llm.systemPrompt, messages);
 
@@ -158,14 +161,24 @@ export class BedrockLLM {
 
     let sdkStream;
     try {
-      sdkStream = await this.client.chat.completions.create({
-        model:                Env.llm.modelId,
-        max_completion_tokens: Env.llm.maxTokens,
-        temperature:          Env.llm.temperature,
-        top_p:                Env.llm.topP,
-        stream:               true,
-        messages:             openAIMessages,
-      }, { signal: abortSignal });
+      // Qwen3 is a reasoning model: by default it emits <think>…</think> tokens
+      // that would be streamed straight to TTS and spoken aloud. Disable
+      // reasoning entirely — we want a single short conversational reply, and
+      // it also lowers TTFT. (llama models don't accept this param, so gate it.)
+      const body: Record<string, unknown> = {
+        model:                 Env.llm.modelId,
+        max_completion_tokens: tokenBudget,
+        temperature:           Env.llm.temperature,
+        top_p:                 Env.llm.topP,
+        stream:                true,
+        stream_options:        { include_usage: true },
+        messages:              openAIMessages,
+      };
+      if (/qwen/i.test(Env.llm.modelId)) {
+        body.reasoning_effort = 'none';
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sdkStream = await this.client.chat.completions.create(body as any, { signal: abortSignal }) as unknown as AsyncIterable<any>;
     } catch (err) {
       if ((err as Error).name === 'AbortError' || (err as Error).message?.includes('aborted')) {
         this.log.debug('LLM request aborted before start');
@@ -175,34 +188,93 @@ export class BedrockLLM {
       throw err;
     }
 
+    // Safety net: even with reasoning_effort=none, strip any <think>…</think>
+    // spans that leak into content so they are never streamed to TTS. Handles
+    // tags split across chunks via a running in-think flag + small carry buffer.
+    let inThink = false;
+    let carry = '';
+    const OPEN = '<think>';
+    // Longest suffix of s that is a proper prefix of OPEN (e.g. "<", "<th").
+    const partialOpenLen = (s: string): number => {
+      const max = Math.min(OPEN.length - 1, s.length);
+      for (let k = max; k > 0; k--) {
+        if (s.endsWith(OPEN.slice(0, k))) return k;
+      }
+      return 0;
+    };
+    const stripThink = (chunk: string): string => {
+      let s = carry + chunk;
+      carry = '';
+      let out = '';
+      while (s.length) {
+        if (!inThink) {
+          const open = s.indexOf(OPEN);
+          if (open === -1) {
+            // No full tag. Hold back only a trailing PARTIAL "<think>" prefix
+            // (so a tag split across chunks still matches); emit the rest.
+            const p = partialOpenLen(s);
+            out += s.slice(0, s.length - p);
+            carry = p ? s.slice(s.length - p) : '';
+            s = '';
+          } else {
+            out += s.slice(0, open);
+            s = s.slice(open + OPEN.length);
+            inThink = true;
+          }
+        } else {
+          const close = s.indexOf('</think>');
+          if (close === -1) { s = ''; }
+          else { s = s.slice(close + 8); inThink = false; }
+        }
+      }
+      return out;
+    };
+
+    let finishReason: string | null = null;
+    let completionTokens = 0;
+    let producedChars = 0;
     try {
       for await (const chunk of sdkStream) {
         if (abortSignal?.aborted) break;
 
         const delta = chunk.choices?.[0]?.delta;
         if (delta?.content) {
-          if (!firstTokenTime) {
-            firstTokenTime = Date.now();
-            this.log.info('LLM first token', {
-              ttft_ms: firstTokenTime - requestStart,
-            });
+          const clean = stripThink(delta.content);
+          if (clean) {
+            producedChars += clean.length;
+            if (!firstTokenTime) {
+              firstTokenTime = Date.now();
+              this.log.info('LLM first token', { ttft_ms: firstTokenTime - requestStart });
+            }
+            yield { type: 'text', text: clean };
           }
-          yield { type: 'text', text: delta.content };
         }
 
-        // Check for stream end
-        const finishReason = chunk.choices?.[0]?.finish_reason;
-        if (finishReason) {
-          const totalMs = Date.now() - requestStart;
-          this.log.info('LLM stream complete', {
-            finish_reason: finishReason,
-            total_ms:      totalMs,
-            ttft_ms:       firstTokenTime ? firstTokenTime - requestStart : null,
-          });
-          yield { type: 'done', stopReason: finishReason };
-          return;
+        // finish_reason arrives on the last content chunk; usage arrives on a
+        // trailing chunk (empty choices) thanks to stream_options.include_usage.
+        // Do NOT return early — keep reading so we capture the usage chunk.
+        const fr = chunk.choices?.[0]?.finish_reason;
+        if (fr) {
+          finishReason = fr;
+          if (carry && !inThink) { yield { type: 'text', text: carry }; producedChars += carry.length; carry = ''; }
         }
+        const usage = (chunk as { usage?: { completion_tokens?: number } }).usage;
+        if (usage?.completion_tokens != null) completionTokens = usage.completion_tokens;
       }
+
+      // Stream exhausted. Fall back to a char-based estimate if usage was absent.
+      const tokensUsed = completionTokens > 0 ? completionTokens : Math.ceil(producedChars / 4);
+      const truncated = finishReason === 'length';
+      this.log.info('LLM stream complete', {
+        finish_reason:       finishReason,
+        total_ms:            Date.now() - requestStart,
+        ttft_ms:             firstTokenTime ? firstTokenTime - requestStart : null,
+        selectedTokenLimit:  tokenBudget,
+        actualTokensUsed:    tokensUsed,
+        responseTruncated:   truncated,
+      });
+      yield { type: 'done', stopReason: finishReason ?? 'stop', tokensUsed, truncated };
+      return;
     } catch (err) {
       if ((err as Error).name === 'AbortError' || (err as Error).message?.includes('aborted')) {
         this.log.debug('LLM stream aborted mid-flight');

@@ -78,6 +78,35 @@ export const Env = {
     stableInterimShortMs: optionalInt('DEEPGRAM_STABLE_INTERIM_SHORT_MS', 300),
     // Character threshold below which the extended window is used.
     stableShortCharThreshold: optionalInt('DEEPGRAM_STABLE_SHORT_CHAR_THRESHOLD', 8),
+
+    // ── Keyword Boosting ────────────────────────────────────────────────
+    // Deepgram keyword boosting: domain-specific terms that the Hindi acoustic
+    // model commonly misrecognizes (e.g. "site visit" → "certificate").
+    // Format: comma-separated "term:intensifier" pairs. Intensifier 1-10.
+    // These are sent as the `keywords` query param on the Deepgram WS URL.
+    keywords: optional(
+      'DEEPGRAM_KEYWORDS',
+      'site visit:5,site:3,visit:3,amenities:2,BHK:3,possession:2,schedule:2,interested:2,morning:1,afternoon:1,evening:1,book:2,booking:2',
+    ),
+
+    // ── Transcript Validation (noise/filler rejection) ──────────────────
+    // Minimum character length for a transcript to be accepted.
+    minTranscriptLength: optionalInt('DEEPGRAM_MIN_TRANSCRIPT_LENGTH', 2),
+    // Minimum speech segment duration (ms) to accept a transcript.
+    // Shorter segments are rejected unless confidence exceeds highConfidenceBypass.
+    minSpeechDurationMs: optionalInt('DEEPGRAM_MIN_SPEECH_DURATION_MS', 200),
+    // Confidence above which the duration gate is bypassed (very clear short speech).
+    highConfidenceBypass: optionalFloat('DEEPGRAM_HIGH_CONFIDENCE_BYPASS', 0.85),
+    // Adaptive confidence thresholds by transcript length:
+    //   - Short (1-2 chars): likely noise artifacts → require high confidence
+    //   - Medium (1-2 words): possibly filler → moderate confidence
+    //   - Long (3+ words): likely real speech → lower threshold is safe
+    confidenceShort: optionalFloat('DEEPGRAM_CONFIDENCE_SHORT', 0.65),
+    confidenceMedium: optionalFloat('DEEPGRAM_CONFIDENCE_MEDIUM', 0.5),
+    // Hindi model (language=hi) returns lower confidence on Hinglish speech
+    // (typical range 0.4-0.7). 0.4 matches minConfidence — any 3+ word
+    // transcript that passes the base gate is real speech, not noise.
+    confidenceLong: optionalFloat('DEEPGRAM_CONFIDENCE_LONG', 0.4),
   },
 
   llm: {
@@ -94,13 +123,23 @@ export const Env = {
     // sentence (the model was overrunning "12 words" at 30 tokens / ~117 chars).
     // Shorter cap = fewer tokens to generate = lower total LLM time and earlier flush.
     maxTokens: optionalInt('LLM_MAX_TOKENS', 24),
+    // Adaptive token tiers (max_completion_tokens is a CEILING, not a target —
+    // short answers finish naturally well below it, so a higher ceiling is
+    // near-free for latency and only prevents cut-offs). Defaults are sized for
+    // Devanagari/Hinglish output, which is ~2× more token-dense than English:
+    //   short factual (price/location)      → tokensShort
+    //   normal / amenities list / multi      → tokensNormal
+    //   comparison / genuinely long          → tokensLong
+    tokensShort:  optionalInt('LLM_TOKENS_SHORT', 48),
+    tokensNormal: optionalInt('LLM_TOKENS_NORMAL', 96),
+    tokensLong:   optionalInt('LLM_TOKENS_LONG', 160),
     // Lower temperature = more focused, faster sampling
     temperature: optionalFloat('LLM_TEMPERATURE', 0.3),
     topP: optionalFloat('LLM_TOP_P', 0.9),
-    // Speculative LLM generation from stable interims. Disabled by default:
-    // it could drop the real answer on a mismatch (caller hears silence). The
-    // ~150ms saving is not worth the reliability cost on a sales call.
-    speculationEnabled: optionalBool('LLM_SPECULATION_ENABLED', false),
+    // Speculative LLM generation from stable interims. Starts LLM+TTS
+    // on a stable interim before speech_final, saving ~150-300ms per turn.
+    // If speech_final differs, abort and restart. Safe with 4-gate validation.
+    speculationEnabled: optionalBool('LLM_SPECULATION_ENABLED', true),
     // Max conversation history messages sent to LLM. Caps context growth on long
     // calls — prevents TTFT degradation. 4 messages = 2 turns of context.
     // Business state lives in [SESSION_STATE], NOT in history, so a tight window
@@ -115,13 +154,13 @@ export const Env = {
     systemPrompt: optional(
       'LLM_SYSTEM_PROMPT',
       [
-        '[ROLE] You are Arjun, a warm, professional OUTBOUND real estate sales consultant at Akshay Vista, Pune — a real person, never an AI, never break character. This is a sales call; your objective is to book a site visit.',
-        'Speak natural Hinglish: Hindi in Devanagari, names and numbers in English. Say "8 thousand", not "8000".',
-        'Reply in ONE short, crisp sentence — max 10 words, at most one question, no filler or repetition. Respond only to the latest message.',
-        'ALWAYS answer the caller\'s question first using ONLY [PROPERTY_FACTS] — never ignore a question to push the visit, and never invent prices, sizes, dates, or amenities.',
-        'After answering, guide toward a site visit as the natural next step using consultative lines ("project देखकर clarity बेहतर आएगी") — but never pitch it every single turn.',
-        'Use only info marked ✓ in [SESSION_STATE]; never re-ask it. Address the caller by name once known.',
-        'Do exactly what [NEXT_ACTION] says, nothing more. The opener already played — never greet again.',
+        '[ROLE] You are Arjun, a warm real OUTBOUND sales consultant at Akshay Vista, Pune (never an AI, never break character). Goal: book a site visit.',
+        'Speak natural Hinglish (Hindi in Devanagari, names/numbers in English; say "8 thousand"). Reply in ONE crisp sentence, ≤10 words, ≤1 question, no filler. Respond only to the latest message.',
+        'Answer from [PROPERTY_FACTS] only — one key fact, never invent prices/sizes/dates/amenities. Answer exactly what was asked (budget→price, location→location).',
+        'If unclear/garbled, ask them to repeat. If the answer is not in [PROPERTY_FACTS], say you will confirm and get back — never "our team will guide you", never deflect to a visit, never make things up.',
+        'Mention a site visit or scheduling ONLY when [NEXT_ACTION] says so — otherwise never add a visit line, even after answering. For visit timing use only "today"/"tomorrow"/"this weekend"; never a specific calendar date, clock time, or "fixed/available" claim.',
+        'Never say "और कुछ?"/"aur kuch?"/"anything else?" or any filler closing. If [SESSION_STATE] shows the caller declined a visit, never raise scheduling again.',
+        'Use only ✓ info in [SESSION_STATE]; never re-ask it; address them by name once known. Do exactly what [NEXT_ACTION] says, nothing more. The opener already played — never greet again.',
       ].join('\n'),
     ),
     greetingPrompt: optional(
@@ -169,6 +208,13 @@ export const Env = {
     // at 608ms — only 8ms past the grace period. 1500ms eliminates PSTN echo
     // false triggers while still catching real interruptions after 1.5s of speech.
     graceMs: optionalInt('BARGEIN_GRACE_MS', 1500),
+  },
+
+  sttWatchdog: {
+    // Max ms to wait for a valid transcript after SpeechStarted fires in LISTENING.
+    // If no valid transcript arrives within this window, cancel the pending turn
+    // and reset to LISTENING — prevents silent/stuck states after failed STT.
+    timeoutMs: optionalInt('STT_WATCHDOG_TIMEOUT_MS', 1500),
   },
 
   session: {

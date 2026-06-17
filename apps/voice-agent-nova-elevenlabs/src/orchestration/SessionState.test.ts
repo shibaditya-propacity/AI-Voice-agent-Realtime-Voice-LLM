@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { SessionState } from './SessionState';
 
 // Mock logger — SessionState expects Logger.forCall() which needs Winston
-// We bypass by creating with a dummy callSid and mocking the logger module.
 import { vi } from 'vitest';
 vi.mock('../shared/logger', () => ({
   Logger: {
@@ -22,138 +21,15 @@ describe('SessionState', () => {
     session = new SessionState('test-call-123');
   });
 
-  // ─── Name Extraction ─────────────────────────────────────────────────────
-
-  describe('Name Extraction', () => {
-    it('extracts name from "मेरा नाम शिवा है"', () => {
-      session.extractFromUserTranscript('मेरा नाम शिवा है');
-      expect(session.info.name).toBe('शिवा');
-    });
-
-    it('extracts name from "I am Rahul"', () => {
-      session.extractFromUserTranscript('I am Rahul');
-      expect(session.info.name).toBe('Rahul');
-    });
-
-    it('extracts name from "my name is Priya"', () => {
-      session.extractFromUserTranscript('my name is Priya');
-      expect(session.info.name).toBe('Priya');
-    });
-
-    it('extracts name from "मैं शिवा हूँ"', () => {
-      session.extractFromUserTranscript('मैं शिवा हूँ');
-      expect(session.info.name).toBe('शिवा');
-    });
-
-    it('extracts bare name "Shiva" when agent asked for name', () => {
-      // Outbound flow: the agent reaches GET_NAME and asks the name first.
-      session.updateLastAskedField('May I know your name?');
-      session.extractFromUserTranscript('Shiva');
-      expect(session.info.name).toBe('Shiva');
-    });
-
-    it('extracts bare name "Rajesh Kumar" when agent asked for name', () => {
-      session.updateLastAskedField('May I know your name?');
-      session.extractFromUserTranscript('Rajesh Kumar');
-      expect(session.info.name).toBe('Rajesh Kumar');
-    });
-
-    it('extracts a Devanagari name after an English trigger ("my name is शिवा")', () => {
-      session.extractFromUserTranscript('my name is शिवा');
-      expect(session.info.name).toBe('शिवा');
-    });
-
-    it('does NOT store "मेरा नाम" as name (trigger phrase only)', () => {
-      session.extractFromUserTranscript('मेरा नाम');
-      expect(session.info.name).toBeNull();
-    });
-
-    it('does NOT store "my name is" as name', () => {
-      session.extractFromUserTranscript('my name is');
-      expect(session.info.name).toBeNull();
-    });
-
-    it('does NOT store "I am" as name', () => {
-      session.extractFromUserTranscript('I am');
-      expect(session.info.name).toBeNull();
-    });
-
-    it('does NOT store "नाम है" as name', () => {
-      session.extractFromUserTranscript('नाम है');
-      expect(session.info.name).toBeNull();
-    });
-
-    it('does NOT store "मैं" as name', () => {
-      session.extractFromUserTranscript('मैं');
-      expect(session.info.name).toBeNull();
-    });
-
-    it('does NOT store common words as name: "yes", "ok", "hello"', () => {
-      session.extractFromUserTranscript('yes');
-      expect(session.info.name).toBeNull();
-      session.extractFromUserTranscript('ok');
-      expect(session.info.name).toBeNull();
-      session.extractFromUserTranscript('hello');
-      expect(session.info.name).toBeNull();
-    });
-
-    it('does NOT re-extract name if already collected', () => {
-      session.extractFromUserTranscript('I am Rahul');
-      expect(session.info.name).toBe('Rahul');
-      session.extractFromUserTranscript('I am Priya');
-      // Name should NOT change — already collected
-      expect(session.info.name).toBe('Rahul');
-    });
-
-    it('extracts name from "मेरा नाम शिवा" (without है)', () => {
-      session.extractFromUserTranscript('मेरा नाम शिवा');
-      expect(session.info.name).toBe('शिवा');
-    });
-
-    it('extracts two-word Hindi name', () => {
-      session.extractFromUserTranscript('मेरा नाम राम कुमार है');
-      expect(session.info.name).toBe('राम कुमार');
-    });
-
-    it('extracts name from copula-first "मेरा नाम है शिव राय"', () => {
-      // Deepgram word order "naam hai X" — name FOLLOWS है (regression: was lost)
-      session.extractFromUserTranscript('मेरा नाम है शिव राय');
-      expect(session.info.name).toBe('शिव राय');
-    });
-
-    it('extracts name from "नाम है शिवा" (no मेरा)', () => {
-      session.extractFromUserTranscript('नाम है शिवा');
-      expect(session.info.name).toBe('शिवा');
-    });
-
-    it('extracts name from romanized "mera naam hai Shiv"', () => {
-      session.extractFromUserTranscript('mera naam hai Shiv');
-      expect(session.info.name).toBe('Shiv');
-    });
-  });
-
   // ─── Speculation Safety ───────────────────────────────────────────────────
 
   describe('Speculation Safety', () => {
-    it('blocks speculation during name collection', () => {
-      // lastAskedField defaults to 'name', no name collected yet
-      expect(session.shouldAllowSpeculation('मेरा नाम')).toBe(false);
-      expect(session.shouldAllowSpeculation('Shiva')).toBe(false);
-    });
-
-    it('allows speculation after name is collected', () => {
-      session.setName('Shiva');
-      expect(session.shouldAllowSpeculation('what is the price')).toBe(true);
-    });
-
-    it('allows speculation for complete queries even without name', () => {
-      // Query keywords bypass the name gate
+    it('allows speculation for complete queries', () => {
       expect(session.shouldAllowSpeculation('what is the price of the project')).toBe(true);
       expect(session.shouldAllowSpeculation('what are the amenities')).toBe(true);
     });
 
     it('blocks speculation for short non-query text', () => {
-      session.setName('Shiva'); // name collected, but text is short non-query
       expect(session.shouldAllowSpeculation('haan')).toBe(false);
       expect(session.shouldAllowSpeculation('ok sure')).toBe(false);
     });
@@ -176,23 +52,16 @@ describe('SessionState', () => {
       expect(session.bookingStatus).toBe('TIME_CAPTURED');
     });
 
-    it('transitions to CONFIRMATION_PENDING when both date and time are set', () => {
+    it('auto-confirms to BOOKED when both date and time are set', () => {
+      // advanceBookingState auto-calls confirmBooking when both slots are present
       session.setPreferredDate('Saturday');
       session.setPreferredTime('morning');
-      expect(session.bookingStatus).toBe('CONFIRMATION_PENDING');
-    });
-
-    it('transitions CONFIRMATION_PENDING → BOOKED on confirmBooking()', () => {
-      session.setPreferredDate('Saturday');
-      session.setPreferredTime('morning');
-      expect(session.bookingStatus).toBe('CONFIRMATION_PENDING');
-      session.confirmBooking();
       expect(session.bookingStatus).toBe('BOOKED');
       expect(session.bookingSuccess).toBe(true);
       expect(session.shouldEndCall).toBe(true);
     });
 
-    it('rejects confirmBooking() when not in CONFIRMATION_PENDING', () => {
+    it('rejects confirmBooking() when only date captured', () => {
       session.setPreferredDate('Saturday');
       // Only DATE_CAPTURED — not CONFIRMATION_PENDING
       session.confirmBooking();
@@ -207,56 +76,41 @@ describe('SessionState', () => {
     });
   });
 
-  // ─── Repeated Name Prevention ─────────────────────────────────────────────
-
-  describe('Repeated Name Prevention', () => {
-    it('does not update name once already set', () => {
-      session.setName('Rajesh');
-      session.extractFromUserTranscript('my name is Priya');
-      expect(session.info.name).toBe('Rajesh');
-    });
-  });
-
-  // ─── Amenities Question Before Name Collection ────────────────────────────
+  // ─── Query Handling Priority ──────────────────────────────────────────────
 
   describe('Query Handling Priority', () => {
-    it('toPromptBlock asks for name during GET_NAME and stays under budget', () => {
-      session.interested = true; // interested but no name yet → GET_NAME
-      expect(session.currentStep).toBe('GET_NAME');
-      const block = session.toPromptBlock();
-      expect(block).toContain('[SESSION_STATE]');
-      expect(block).toContain('[NEXT_ACTION]');
-      expect(block).toContain('name'); // NEXT_ACTION for GET_NAME mentions asking the name
-      expect(block.length).toBeLessThan(400); // slim block — well under the 500-token prompt budget
-    });
-
-    it('fresh session starts in INTRODUCTION (no name asked up front)', () => {
+    it('fresh session starts in INTRODUCTION', () => {
       expect(session.currentStep).toBe('INTRODUCTION');
-      expect(session.toPromptBlock()).not.toContain('ask their name');
     });
 
-    it('toPromptBlock instructs asking time (not day) once a day is set', () => {
-      session.setName('Shiva');
+    it('interested user without visit → VISIT_OFFER', () => {
+      session.interested = true;
+      expect(session.currentStep).toBe('VISIT_OFFER');
+    });
+
+    it('visit agreed → ASK_VISIT_DAY', () => {
+      session.interested = true;
+      session.visitAgreed = true;
+      expect(session.currentStep).toBe('ASK_VISIT_DAY');
+    });
+
+    it('date captured → ASK_VISIT_TIME', () => {
+      session.interested = true;
+      session.visitAgreed = true;
       session.setPreferredDate('Saturday');
-      const block = session.toPromptBlock();
-      expect(block).toContain('morning or afternoon');
-      expect(block).not.toContain('which day'); // never re-ask the captured day
+      expect(session.currentStep).toBe('ASK_VISIT_TIME');
     });
   });
 
   // ─── Booking Completion Flow ──────────────────────────────────────────────
 
   describe('Booking Completion Flow', () => {
-    it('app-controlled flow: date → time → CONFIRMING → user "yes" → BOOKED', () => {
-      session.setName('Shiva');
+    it('auto-books when date + time extracted from user transcript', () => {
+      session.interested = true;
+      session.visitAgreed = true;
       session.extractFromUserTranscript('Saturday morning');
       expect(session.info.preferredDate).toBe('Saturday');
       expect(session.info.preferredTime).toBe('morning');
-      expect(session.bookingStatus).toBe('CONFIRMATION_PENDING');
-      expect(session.currentStep).toBe('CONFIRM_VISIT');
-
-      // Booking is confirmed by the USER affirming — never by the LLM's words.
-      session.extractFromUserTranscript('haan, perfect');
       expect(session.bookingStatus).toBe('BOOKED');
       expect(session.visitBooked).toBe(true);
       expect(session.shouldEndCall).toBe(true);
@@ -264,18 +118,18 @@ describe('SessionState', () => {
     });
 
     it('LLM saying "booked" never advances business state', () => {
-      session.setName('Shiva');
+      session.interested = true;
+      session.visitAgreed = true;
       session.setPreferredDate('Saturday');
-      session.setPreferredTime('morning');
-      expect(session.bookingStatus).toBe('CONFIRMATION_PENDING');
-      // The model claims the booking is done — must be inert.
+      // Only DATE_CAPTURED — LLM output must not advance state
       session.extractFromAssistantResponse('Perfect, Saturday morning booked! Thank you!');
-      expect(session.bookingStatus).toBe('CONFIRMATION_PENDING');
+      expect(session.bookingStatus).toBe('DATE_CAPTURED');
       expect(session.visitBooked).toBe(false);
     });
 
     it('user "yes" cannot book before both slots are captured', () => {
-      session.setName('Shiva');
+      session.interested = true;
+      session.visitAgreed = true;
       session.setPreferredDate('Saturday'); // only DATE_CAPTURED
       session.extractFromUserTranscript('yes please');
       expect(session.bookingStatus).toBe('DATE_CAPTURED');
@@ -286,22 +140,9 @@ describe('SessionState', () => {
   // ─── Output Validation ────────────────────────────────────────────────────
 
   describe('Output Validation', () => {
-    it('detects hallucinated booking when not CONFIRMATION_PENDING', () => {
+    it('detects hallucinated booking when not BOOKED', () => {
       const issues = session.validateOutput('Your visit is booked for Saturday!');
       expect(issues.some(i => i.includes('HALLUCINATED_BOOKING'))).toBe(true);
-    });
-
-    it('no issues when CONFIRMATION_PENDING and LLM confirms', () => {
-      session.setPreferredDate('Saturday');
-      session.setPreferredTime('morning');
-      const issues = session.validateOutput('Saturday morning noted है। Thank you!');
-      expect(issues).toHaveLength(0);
-    });
-
-    it('detects re-asking for collected name', () => {
-      session.setName('Rajesh');
-      const issues = session.validateOutput('आपका नाम बता सकते हैं?');
-      expect(issues.some(i => i.includes('RE_ASK_NAME'))).toBe(true);
     });
 
     it('detects re-asking for collected date', () => {
@@ -344,11 +185,6 @@ describe('SessionState', () => {
   // ─── Last-Asked-Field Tracking ────────────────────────────────────────────
 
   describe('Last-Asked-Field Tracking', () => {
-    it('detects name question in assistant response', () => {
-      session.updateLastAskedField('आपका नाम बता सकते हैं?');
-      expect(session.lastAskedField).toBe('name');
-    });
-
     it('detects date question in assistant response', () => {
       session.updateLastAskedField('कौनसा day prefer करेंगे?');
       expect(session.lastAskedField).toBe('date');
@@ -366,65 +202,87 @@ describe('SessionState', () => {
   });
 
   // ─── Outbound Sales Flow (state machine) ──────────────────────────────────
+
   describe('Outbound Sales Flow', () => {
-    it('starts in INTRODUCTION, never asking for the name up front', () => {
+    it('starts in INTRODUCTION', () => {
       expect(session.currentStep).toBe('INTRODUCTION');
     });
 
-    it('"yes" to the opener → interested → GET_NAME (name not asked before interest)', () => {
-      session.extractFromUserTranscript('haan'); // affirmative to the interest opener
+    it('"haan" to opener (lastAskedField=site_visit_interest) → interested + visitAgreed → ASK_VISIT_DAY', () => {
+      // Default lastAskedField is 'site_visit_interest', so "haan" is classified
+      // as VISIT_INTENT by IntentClassifier → sets both interested and visitAgreed
+      session.extractFromUserTranscript('haan');
       expect(session.interested).toBe(true);
-      expect(session.currentStep).toBe('GET_NAME');
+      expect(session.visitAgreed).toBe(true);
+      expect(session.currentStep).toBe('ASK_VISIT_DAY');
     });
 
-    it('a question signals interest and routes to GET_NAME', () => {
+    it('a question signals interest', () => {
       session.extractFromUserTranscript('what is the price?');
       expect(session.interested).toBe(true);
-      expect(session.currentStep).toBe('GET_NAME');
     });
 
-    it('clear rejection → NOT_INTERESTED + ends the call', () => {
-      session.extractFromUserTranscript('no, not interested');
+    it('explicit "not interested" with word boundary → NOT_INTERESTED', () => {
+      // "nahi chahiye" is explicit rejection via IntentClassifier
+      session.extractFromUserTranscript('nahi chahiye');
       expect(session.notInterested).toBe(true);
       expect(session.shouldEndCall).toBe(true);
       expect(session.currentStep).toBe('NOT_INTERESTED');
     });
 
-    it('after name, stays in QUESTION_HANDLING until a visit is agreed', () => {
-      session.interested = true;
-      session.updateLastAskedField('your name?');
-      session.extractFromUserTranscript('Rahul');
-      expect(session.customerName).toBe('Rahul');
-      expect(session.currentStep).toBe('QUESTION_HANDLING');
-    });
-
-    it('full conversion: interest → name → visit → day → time → confirm → BOOKED', () => {
-      session.extractFromUserTranscript('haan interested');           // INTEREST
-      session.updateLastAskedField('your name?');
-      session.extractFromUserTranscript('Rahul');                     // GET_NAME → name
-      expect(session.currentStep).toBe('QUESTION_HANDLING');
-      session.updateLastAskedField('site visit करेंगे?');
-      session.extractFromUserTranscript('haan visit karenge');        // visit agreed
+    it('full conversion: interest → visit → day → time → BOOKED (auto-confirmed)', () => {
+      // "haan" with site_visit_interest context → VISIT_INTENT → visitAgreed
+      session.extractFromUserTranscript('haan interested');
+      expect(session.interested).toBe(true);
+      expect(session.visitAgreed).toBe(true);
       expect(session.currentStep).toBe('ASK_VISIT_DAY');
+
       session.updateLastAskedField('कौनसा day?');
-      session.extractFromUserTranscript('Saturday');                  // day
+      session.extractFromUserTranscript('Saturday');
       expect(session.currentStep).toBe('ASK_VISIT_TIME');
+
       session.updateLastAskedField('morning या afternoon?');
-      session.extractFromUserTranscript('morning');                  // time → CONFIRM_VISIT
-      expect(session.currentStep).toBe('CONFIRM_VISIT');
-      expect(session.visitBooked).toBe(false);                       // not booked until user confirms
-      session.extractFromUserTranscript('haan perfect');             // user confirms
+      session.extractFromUserTranscript('morning');
+      // Auto-confirms: date + time → BOOKED
       expect(session.currentStep).toBe('BOOKED');
       expect(session.visitBooked).toBe(true);
-      expect(session.customerName).toBe('Rahul');                    // name persisted throughout
+    });
+  });
+
+  // ─── Deterministic Scheduling Responses ───────────────────────────────────
+
+  describe('Deterministic Scheduling Responses', () => {
+    it('returns day request for ASK_VISIT_DAY step', () => {
+      session.interested = true;
+      session.visitAgreed = true;
+      expect(session.currentStep).toBe('ASK_VISIT_DAY');
+      const response = session.getSchedulingResponse();
+      expect(response).not.toBeNull();
+      expect(response).toContain('दिन');
     });
 
-    it('name persists and is never overwritten or re-asked', () => {
+    it('returns time request for ASK_VISIT_TIME step', () => {
       session.interested = true;
-      session.updateLastAskedField('your name?');
-      session.extractFromUserTranscript('Rahul');
-      session.extractFromUserTranscript('my name is Someone Else');
-      expect(session.customerName).toBe('Rahul');
+      session.visitAgreed = true;
+      session.setPreferredDate('Saturday');
+      expect(session.currentStep).toBe('ASK_VISIT_TIME');
+      const response = session.getSchedulingResponse();
+      expect(response).not.toBeNull();
+      expect(response).toContain('Saturday');
+    });
+
+    it('returns null for non-scheduling steps', () => {
+      expect(session.getSchedulingResponse()).toBeNull(); // INTRODUCTION
+      session.interested = true;
+      expect(session.getSchedulingResponse()).toBeNull(); // VISIT_OFFER
+    });
+
+    it('returns farewell for NOT_INTERESTED step', () => {
+      session.notInterested = true;
+      expect(session.currentStep).toBe('NOT_INTERESTED');
+      const response = session.getSchedulingResponse();
+      expect(response).not.toBeNull();
+      expect(response).toContain('धन्यवाद');
     });
   });
 });

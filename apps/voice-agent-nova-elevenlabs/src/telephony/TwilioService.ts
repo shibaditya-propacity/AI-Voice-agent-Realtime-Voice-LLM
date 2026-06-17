@@ -111,6 +111,18 @@ export class TwilioService {
     }
   }
 
+  // ─── Call Control ─────────────────────────────────────────────────────────
+
+  /** Hang up a call via the Twilio REST API. */
+  async hangup(callSid: string): Promise<void> {
+    try {
+      await this.client.calls(callSid).update({ status: 'completed' });
+      this.log.info('Call hung up via Twilio API', { callSid });
+    } catch (err) {
+      this.log.warn('Failed to hang up call', { callSid, error: (err as Error).message });
+    }
+  }
+
   // ─── Utility ──────────────────────────────────────────────────────────────
 
   getSession(callSid: string): TwilioStreamSession | null {

@@ -130,7 +130,8 @@ export const Env = {
     // Static opening greeting. Nova 2 Sonic does NOT speak first (it only responds
     // to caller audio), so the opening greeting is a pre-recorded WAV played the
     // instant the call connects. Put a 1–2s recording of the Stage-1 greeting here.
-    // Loaded once at boot, resampled, and cached. If the file is missing/invalid the
+    // Loaded once at boot, resampled, and cached. 
+    // he file is missing/invalid the
     // agent simply has no opening greeting (it still responds once the caller speaks).
     // Must be 16-bit PCM WAV (any sample rate / mono or stereo).
     greetingWavPath: optionalEnv('NOVA_GREETING_WAV_PATH', './assets/greeting.wav'),

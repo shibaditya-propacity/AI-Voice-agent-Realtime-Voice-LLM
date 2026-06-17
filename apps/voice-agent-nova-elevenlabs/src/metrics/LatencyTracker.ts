@@ -154,6 +154,17 @@ export class LatencyTracker {
       '★ perceived_latency_ms':       perceivedMs,
     });
 
+    // Focused real-time latency line (the metrics that matter for <1s target).
+    // total_silence = gap the caller hears between finishing speaking and audio.
+    this.log.info('★ LATENCY', {
+      turn:             turnIndex,
+      stt_final_ms:     speechStartToFinal,   // speech start → STT final
+      llm_ttft_ms:      llmFirstToken,        // LLM start → first token
+      llm_complete_ms:  llmTotal,             // LLM start → complete
+      tts_start_ms:     llmFirstToText,       // first token → TTS first text
+      total_silence_ms: perceivedMs,          // user-perceived silence
+    });
+
     // Concise one-line pipeline for quick log scanning
     const specLabel = stableToFinal !== null
       ? ` [spec: stable→final=${stableToFinal}ms, LLM head-start=${stableToLlm ?? '?'}ms]`
