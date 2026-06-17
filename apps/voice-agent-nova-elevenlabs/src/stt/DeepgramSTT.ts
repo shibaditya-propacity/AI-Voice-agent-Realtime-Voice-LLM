@@ -23,6 +23,48 @@ const DEEPGRAM_WS_URL = 'wss://api.deepgram.com/v1/listen';
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_MS = 500;
 
+/**
+ * Filler and noise-only patterns that should never reach the LLM.
+ * Covers English fillers, Hindi fillers, and single-letter noise artifacts.
+ * Matched case-insensitively against the trimmed transcript.
+ */
+const FILLER_NOISE_PATTERN = /^(uh+|um+|umm+|hmm*|mhm+|ah+|huh|oh+|ee+|aa+|ha+|mm+|hm+|uhh+|aah+|ooh+|shh+|tch|haan|haa+|na+h?|ji+|acha+|अच्छा|हां+|ना+|जी+|हम्म+)(\s+(uh+|um+|umm+|hmm*|mhm+|ah+|huh|oh+|ee+|aa+|ha+|mm+|hm+|uhh+|aah+|ooh+|shh+|tch|haan|haa+|na+h?|ji+|acha+|अच्छा|हां+|ना+|जी+|हम्म+))*$/i;
+
+/**
+ * Post-STT domain correction: the Hindi acoustic model (language=hi)
+ * systematically misrecognizes certain English terms through phonetic
+ * confusion. These replacements are built from observed call logs, not
+ * guesses — each entry has a documented misrecognition source.
+ *
+ * The corrections are case-insensitive and applied to the full transcript
+ * before it reaches the orchestrator / LLM.
+ */
+const DOMAIN_CORRECTIONS: Array<{ pattern: RegExp; replacement: string }> = [
+  // "site visit" → "certificate" (Hindi phonetic: /saɪt vɪzɪt/ ≈ /sɜːtɪfɪkət/)
+  { pattern: /\bcertificate\b/gi, replacement: 'site visit' },
+  // "site visit" → "certify" (shorter variant of same confusion)
+  { pattern: /\bcertify\b/gi, replacement: 'site visit' },
+  // "site visit" → "five visits" (CA53523e: /saɪt vɪzɪt/ ≈ /faɪv vɪzɪts/)
+  { pattern: /\bfive\s+visits?\b/gi, replacement: 'site visit' },
+  // "site visit" → "five digit" (CA53523e: /saɪt vɪzɪt/ ≈ /faɪv dɪdʒɪt/)
+  { pattern: /\bfive\s+digit\b/gi, replacement: 'site visit' },
+  // "site visit" → "sir five" (CA53523e: partial recognition)
+  { pattern: /\bsir\s+five\b/gi, replacement: 'site visit' },
+];
+
+function applyDomainCorrections(text: string): string {
+  let corrected = text;
+  for (const { pattern, replacement } of DOMAIN_CORRECTIONS) {
+    corrected = corrected.replace(pattern, replacement);
+  }
+  return corrected;
+}
+
+/** Result of transcript validation — either valid or rejected with a reason. */
+type TranscriptValidation =
+  | { valid: true }
+  | { valid: false; reason: 'EMPTY_TRANSCRIPT_REJECTED' | 'NOISE_REJECTED' | 'LOW_CONFIDENCE_REJECTED' | 'SHORT_SPEECH_REJECTED' };
+
 export class DeepgramSTT {
   private ws: WebSocket | null = null;
   private readonly callSid: string;
@@ -69,6 +111,9 @@ export class DeepgramSTT {
   /** Interims older than this cannot be used as a speech_final fallback —
    *  prevents stale noise interims from becoming phantom turns. */
   private readonly INTERIM_FALLBACK_MAX_AGE_MS = 3000;
+
+  /** Timestamp of the last SpeechStarted event — used to compute speech segment duration. */
+  private speechStartedAt = 0;
 
   // ─── Stable Interim Detection ──────────────────────────────────────────
   // When consecutive interims produce the same text for STABLE_INTERIM_MS,
@@ -133,13 +178,14 @@ export class DeepgramSTT {
   connect(): void {
     if (this.closed) return;
 
-    // When multilingual=true, use language=hi — Nova-3's Hindi model.
-    // Reasons for 'hi' over 'multi':
-    //   - 'multi' causes excessive SpeechStarted events for background noise,
-    //     resetting the UtteranceEnd timer repeatedly → 7+ second transcript delays
-    //   - 'hi' is trained on Indian speech (Hindi + English loanwords), handles
-    //     Hinglish naturally, fires speech_final reliably on 200ms silence
-    //   - 'detect_language' returns HTTP 400 on the streaming WebSocket endpoint
+    // Language selection for Nova-3 streaming:
+    //   - 'multi' returns HTTP 400 on the streaming WS endpoint
+    //   - 'en-IN' produces garbage for Hindi speech (empty transcripts, English word soup)
+    //   - 'hi' handles Hindi + Hinglish well; English phrases may be phonetically
+    //     approximated but at least produce usable transcripts. Post-STT domain
+    //     corrections handle known misrecognitions (e.g. "certificate" → "site visit").
+    //   - 'detect_language' returns HTTP 400 on streaming WS
+    // When multilingual=true, force 'hi' for Hindi/Hinglish callers.
     const effectiveLanguage = Env.deepgram.multilingual ? 'hi' : Env.deepgram.language;
 
     const params = new URLSearchParams({
@@ -154,6 +200,13 @@ export class DeepgramSTT {
       utterance_end_ms: String(Env.deepgram.utteranceEndMs),
     });
 
+    // ── Keyword boosting ──────────────────────────────────────────────────
+    // NOTE: Deepgram's streaming WS with language=hi does not support the
+    // `keywords` param (returns 400). Keyword boosting is only available
+    // on pre-recorded and certain English models. Domain term corrections
+    // are handled post-STT via transcript replacement instead.
+    const parsedKeywords: string[] = [];
+
     const url = `${DEEPGRAM_WS_URL}?${params.toString()}`;
 
     this.log.info('Connecting to Deepgram', {
@@ -162,7 +215,7 @@ export class DeepgramSTT {
       multilingual: Env.deepgram.multilingual,
       endpointing:  Env.deepgram.endpointingMs,
       utteranceEnd: Env.deepgram.utteranceEndMs,
-      params:       Object.fromEntries(params),
+      keywords:     parsedKeywords,
     });
 
     const ws = new WebSocket(url, {
@@ -243,6 +296,7 @@ export class DeepgramSTT {
   private handleMessage(msg: DeepgramMessage): void {
     switch (msg.type) {
       case 'SpeechStarted':
+        this.speechStartedAt = Date.now();
         this.log.info('Deepgram: SpeechStarted (VAD)');
         this.onSpeechStarted?.();
         break;
@@ -346,7 +400,18 @@ export class DeepgramSTT {
           fallbackConfidence: fallbackConf,
         });
         if (fallbackText) {
-          this.onFinalTranscript?.(fallbackText, fallbackConf);
+          // Validate fallback transcript too — don't let noise interims sneak through
+          const validation = this.validateTranscript(fallbackText, fallbackConf);
+          if (!validation.valid) {
+            this.onNoSpeechCb?.();
+            return;
+          }
+          // Apply domain corrections
+          const corrected = applyDomainCorrections(fallbackText);
+          if (corrected !== fallbackText) {
+            this.log.info('Domain correction applied (fallback)', { original: fallbackText, corrected });
+          }
+          this.onFinalTranscript?.(corrected, fallbackConf);
         }
         return;
       }
@@ -406,7 +471,20 @@ export class DeepgramSTT {
         detectedLanguage: msg.detected_language,
         languageConfidence: msg.language_confidence,
       });
-      this.onFinalTranscript?.(full, confidence);
+
+      // Validate before emitting — reject noise/filler/low-confidence
+      const validation = this.validateTranscript(full, confidence);
+      if (!validation.valid) {
+        this.onNoSpeechCb?.();
+        return;
+      }
+
+      // Apply domain corrections (e.g. "certificate" → "site visit")
+      const corrected = applyDomainCorrections(full);
+      if (corrected !== full) {
+        this.log.info('Domain correction applied', { original: full, corrected });
+      }
+      this.onFinalTranscript?.(corrected, confidence);
     } else if (msg.is_final) {
       // is_final without speech_final: accumulate — UtteranceEnd will flush.
       this.isFinalBuffer.push(transcript.trim());
@@ -430,6 +508,76 @@ export class DeepgramSTT {
         }
       }, this.IS_FINAL_FLUSH_MS);
     }
+  }
+
+  /**
+   * Validate a final transcript against noise/filler/confidence/duration gates.
+   * Returns { valid: true } or { valid: false, reason } with a specific rejection tag.
+   */
+  private validateTranscript(text: string, confidence: number): TranscriptValidation {
+    const trimmed = text.trim();
+
+    // Gate 1: Empty or too short (< 2 chars) — line noise, single-letter artifacts
+    if (trimmed.length < Env.deepgram.minTranscriptLength) {
+      this.log.warn('EMPTY_TRANSCRIPT_REJECTED', {
+        transcript: trimmed,
+        length: trimmed.length,
+        threshold: Env.deepgram.minTranscriptLength,
+      });
+      return { valid: false, reason: 'EMPTY_TRANSCRIPT_REJECTED' };
+    }
+
+    // Gate 2: Filler/noise-only (uh, umm, hmm, aa, huh, etc.)
+    if (FILLER_NOISE_PATTERN.test(trimmed)) {
+      this.log.warn('NOISE_REJECTED', {
+        transcript: trimmed,
+        confidence,
+      });
+      return { valid: false, reason: 'NOISE_REJECTED' };
+    }
+
+    // Gate 3: Adaptive confidence threshold based on transcript length
+    const wordCount = trimmed.split(/\s+/).length;
+    let requiredConfidence: number;
+    if (trimmed.length <= 3) {
+      // Very short (1-3 chars): likely noise artifact
+      requiredConfidence = Env.deepgram.confidenceShort;
+    } else if (wordCount <= 2) {
+      // 1-2 words: possibly filler or partial
+      requiredConfidence = Env.deepgram.confidenceMedium;
+    } else {
+      // 3+ words: likely real speech
+      requiredConfidence = Env.deepgram.confidenceLong;
+    }
+
+    if (confidence < requiredConfidence) {
+      this.log.warn('LOW_CONFIDENCE_REJECTED', {
+        transcript: trimmed,
+        confidence,
+        requiredConfidence,
+        wordCount,
+        charLength: trimmed.length,
+      });
+      return { valid: false, reason: 'LOW_CONFIDENCE_REJECTED' };
+    }
+
+    // Gate 4: Speech segment duration — reject very short bursts (< 200ms)
+    // unless confidence is very high (clear short word like "haan" or "yes")
+    if (this.speechStartedAt > 0) {
+      const speechDurationMs = Date.now() - this.speechStartedAt;
+      if (speechDurationMs < Env.deepgram.minSpeechDurationMs && confidence < Env.deepgram.highConfidenceBypass) {
+        this.log.warn('SHORT_SPEECH_REJECTED', {
+          transcript: trimmed,
+          confidence,
+          speechDurationMs,
+          minRequired: Env.deepgram.minSpeechDurationMs,
+          bypassThreshold: Env.deepgram.highConfidenceBypass,
+        });
+        return { valid: false, reason: 'SHORT_SPEECH_REJECTED' };
+      }
+    }
+
+    return { valid: true };
   }
 
   /** Reset stable interim tracking (called on any finalization event). */
@@ -458,7 +606,20 @@ export class DeepgramSTT {
     this.isFinalConfidence = 0;
     if (!full) return;
     this.log.info('Deepgram: final transcript (from ' + trigger + ')', { transcript: full, confidence: conf });
-    this.onFinalTranscript?.(full, conf);
+
+    // Validate before emitting — reject noise/filler/low-confidence
+    const validation = this.validateTranscript(full, conf);
+    if (!validation.valid) {
+      this.onNoSpeechCb?.();
+      return;
+    }
+
+    // Apply domain corrections (e.g. "certificate" → "site visit")
+    const corrected = applyDomainCorrections(full);
+    if (corrected !== full) {
+      this.log.info('Domain correction applied', { original: full, corrected });
+    }
+    this.onFinalTranscript?.(corrected, conf);
   }
 
   // ─── Reconnect ────────────────────────────────────────────────────────────

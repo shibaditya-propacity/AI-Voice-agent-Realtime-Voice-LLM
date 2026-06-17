@@ -12,6 +12,8 @@
  */
 
 import { Logger } from '../shared/logger';
+import { Env } from '../config/env';
+import { classifyIntent } from './IntentClassifier';
 
 // ─── Booking Status State Machine ──────────────────────────────────────────
 //
@@ -40,14 +42,12 @@ export type BookingStatus =
 
 /** What field the agent last asked about — used to interpret bare responses. */
 export type LastAskedField =
-  | 'name'
   | 'date'
   | 'time'
   | 'site_visit_interest'
   | null;
 
 export interface CollectedInfo {
-  name: string | null;
   preferredDate: string | null;
   preferredTime: string | null;
   projectInterest: string | null;
@@ -57,7 +57,7 @@ export interface CollectedInfo {
 
 // ─── Application State Machine (outbound sales flow) ────────────────────────
 //
-//   INTRODUCTION → INTEREST_CHECK → GET_NAME → QUESTION_HANDLING
+//   INTRODUCTION → INTEREST_CHECK → VISIT_OFFER → QUESTION_HANDLING
 //                       │                            │
 //                       │                            ├→ ASK_VISIT_DAY → ASK_VISIT_TIME
 //                       │                            │        → CONFIRM_VISIT → BOOKED
@@ -66,44 +66,56 @@ export interface CollectedInfo {
 // The APPLICATION owns every transition (derived from collected slots + user
 // interest/affirmation). The LLM NEVER controls business state — it only renders
 // the [NEXT_ACTION] line the application computes. This is the single biggest
-// anti-hallucination guarantee: the model cannot "book" anything by saying so,
-// and it cannot decide the customer is interested or skip the name step.
+// anti-hallucination guarantee: the model cannot "book" anything by saying so.
+//
+// Scheduling steps (ASK_VISIT_DAY, ASK_VISIT_TIME, CONFIRM_VISIT, BOOKED) use
+// deterministic application-generated responses — zero LLM tokens. The LLM is
+// only used for reasoning, objections, and unsupported questions.
 
 export type ConversationStep =
   | 'INTRODUCTION'      // opener (intro + interest question) is playing
   | 'INTEREST_CHECK'    // waiting to learn if the caller is interested
-  | 'GET_NAME'          // interested; collect the caller's name
-  | 'QUESTION_HANDLING' // name known; answer questions, steer toward a visit
+  | 'VISIT_OFFER'       // interested; offer a site visit ONCE and ask the day
+  | 'QUESTION_HANDLING' // visit already offered; answer questions only
   | 'ASK_VISIT_DAY'     // caller agreed to visit; collect preferred day
   | 'ASK_VISIT_TIME'    // day captured; collect preferred time
   | 'CONFIRM_VISIT'     // day + time captured; one-line confirmation pending
   | 'BOOKED'            // caller confirmed; visit booked, call ending
   | 'NOT_INTERESTED';   // caller declined; close politely, call ending
 
-const AFFIRMATIVE = /^(yes|yeah|yep|sure|ok|okay|haan|हाँ|हां|जी|जी हाँ|ज़रूर|बिल्कुल|bilkul|perfect|theek|ठीक|done|book|interested|chahta|चाहता|चाहूँगा)\b/i;
+// NOTE: AFFIRMATIVE, REJECTION, VISIT_REJECTION regex constants removed.
+// All intent classification now goes through IntentClassifier.classifyIntent()
+// which uses linguistic pattern families instead of brittle word lists.
 
-// Clear rejection of the offer (not just "no" to one question). Drives NOT_INTERESTED.
-const REJECTION = /\b(not interested|no thanks|no thank you|don'?t call|stop calling|busy|interested नहीं|नहीं चाहिए|mat karo|मत करो|नहीं चाहता|remove my number)\b/i;
+// Buying intent: questions that signal the user is seriously considering purchase.
+// When detected, a visit suggestion is appropriate (max 2 per call, spaced 3+ turns).
+const BUYING_INTENT = /\b(possession|available|availability|floor\s*plan|layout|booking|book\s+kar|ready\s+to\s+move|payment\s*plan|loan|emi|registry|registration|कब\s+मिलेगा|कब\s+ready|booking\s+kaise|flat\s+available|unit\s+available|move\s+in|handover|कब\s+मिलेगा|price|rate|cost|कीमत|दाम|kitna|kitne)\b/i;
 
-// ─── Name Extraction Safety ────────────────────────────────────────────────
-// These phrases are TRIGGERS, not names. If the transcript matches one of
-// these WITHOUT a following name, the name slot must NOT be filled.
+// ─── Forbidden Output Patterns (deterministic guards) ──────────────────────
+// These patterns must NEVER reach the caller. They are prevented at the source
+// (prompt + NEXT_ACTION) and stripped from the streamed leading segment as a
+// lightweight safety net. They are NOT used to buffer/block full responses.
 
-const NAME_TRIGGER_PHRASES = new Set([
-  'मेरा नाम', 'mera naam', 'mera name', 'my name', 'my name is',
-  'i am', "i'm", 'this is', 'main', 'मैं', 'mai', 'naam', 'नाम',
-  'naam hai', 'नाम है', 'मेरा नाम है',
-]);
+// Filler closings the agent must never use (problem #2). Matched as a trailing
+// clause and stripped. Covers Hinglish + English variants.
+// NOTE: no \b — word boundaries do not work around Devanagari (और/कुछ are
+// non-\w). The leading [\s,।.!-]* anchors the clause to a sentence boundary.
+const FILLER_CLOSING = /[\s,।.!-]*(aur\s+kuch(\s+(poochh?na|puuchna|puchna|pooch?hna)\s*(hai|h)?)?|और\s+कुछ(\s+पूछना\s*है?)?|kuch\s+aur(\s+(poochh?na|puchna|pooch?hna))?|कुछ\s+और|anything\s+else|aur\s+koi\s+(sawaal|sawal|question|baat))\s*[?।.!]*\s*$/i;
 
-const NAME_FALSE_POSITIVES = new Set([
-  'yes', 'no', 'ok', 'okay', 'hello', 'hi', 'sure', 'fine', 'good',
-  'bye', 'thanks', 'thank', 'hmm', 'haan', 'nahi', 'nah', 'ji',
-  'sir', 'madam', 'please', 'sorry', 'what', 'how', 'when', 'where',
-  'who', 'why', 'which', 'the', 'and', 'but', 'not', 'you', 'your',
-  'main', 'mai', 'मैं', 'naam', 'नाम', 'mera', 'मेरा', 'hai', 'है',
-  'hoon', 'hu', 'hun', 'हूँ', 'हूं', 'speaking', 'here', 'bol',
-  'बोल', 'raha', 'rahi', 'रहा', 'रही',
-]);
+// Unsolicited site-visit pitch. Allowed ONLY when the controller explicitly
+// requested a suggestion this turn (see _visitSuggestedThisTurn). This is the
+// fix for problem #1/#4: "actual site देखकर better idea मिलेगा" / "visit करेंगे?"
+// tails. The leading (site\s+)? on the visit-verb branch absorbs "Site visit …".
+// Matches a TRAILING clause that mentions a site visit / "come see it" pitch in
+// any phrasing — "...site visit करके details मिलेंगी", "...visit पर आइए",
+// "...actual site देखकर better idea मिलेगा", etc. Anchored to the last clause so
+// the actual answer (the preceding sentence) is preserved.
+const VISIT_PITCH = /[\s,।.!-]*[^।.!?]*?\b(site\s*visit|साइट\s*विज़िट|साइट\s*विजिट|विज़िट|विजिट|visit\s*(कर|पर|करेंगे|karenge|karke|kar\s*l(ein|ijiye|o)|chal(ein|enge)|चल(ें|ेंगे))|(actual\s+)?site\s+(देखकर|देख\s*कर|dekh\s*kar|dekhkar)|project\s+(देख|dekh)\w*|better\s+idea\s+(मिलेगा|milega))[^।.!?]*[?।.!]*\s*$/i;
+
+// Day/time scheduling offer. Forbidden after a visit rejection (problem #3:
+// "Kal 7 baje chalega?" after the caller declined a visit).
+const SCHEDULING_OFFER = /\b(kal|aaj|parson|कल|आज|परसों|monday|tuesday|wednesday|thursday|friday|saturday|sunday|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|\d{1,2}\s*(am|pm|बजे|baje|o'?\s*clock)|morning|afternoon|evening|सुबह|दोपहर|शाम)\b[^?।.!]*\b(chalega|चलेगा|chal(ein|enge)|theek|ठीक|fit|suits?|आएंगे|aayenge|aa\s*sak|visit|schedule|book)\b|\b(which\s+day|what\s+time|kaunsa\s+din|कौनसा\s+दिन|kab\s+aa|कब\s+आ)\b/i;
+
 
 export class SessionState {
   private readonly log: Logger;
@@ -111,7 +123,6 @@ export class SessionState {
 
   /** User information collected during the call. */
   readonly info: CollectedInfo = {
-    name: null,
     preferredDate: null,
     preferredTime: null,
     projectInterest: null,
@@ -119,7 +130,7 @@ export class SessionState {
     bhkPreference: null,
   };
 
-  /** Caller engaged positively with the offer (drives INTEREST_CHECK → GET_NAME). */
+  /** Caller engaged positively with the offer (drives INTEREST_CHECK → VISIT_OFFER). */
   interested = false;
 
   /** Caller clearly declined the offer (drives NOT_INTERESTED → end call). */
@@ -127,6 +138,37 @@ export class SessionState {
 
   /** Caller agreed to actually schedule a visit (drives QUESTION_HANDLING → ASK_VISIT_DAY). */
   visitAgreed = false;
+
+  /** Caller declined a site visit specifically (NOT a full call rejection).
+   *  When true: stop all visit scheduling, but continue answering questions. */
+  visitRejected = false;
+
+  /** How many times the agent has suggested a site visit this call (max 2). */
+  private visitSuggestionCount = 0;
+
+  /** Turn number when the last visit suggestion was made. */
+  private lastVisitSuggestionTurn = -999;
+
+  /** Whether the user's current turn shows buying intent (layout/possession/booking questions). */
+  private _buyingIntentThisTurn = false;
+
+  /** Whether the controller asked the LLM to suggest a visit on THIS turn.
+   *  Gates the visit-pitch guard: a pitch is only allowed when this is true. */
+  private _visitSuggestedThisTurn = false;
+
+  /** Whether the deliberate one-time site-visit OFFER (right after interest is
+   *  detected) has been made. Latch: prevents re-offering on every later turn. */
+  private visitOffered = false;
+
+  // ─── Adaptive Token Budget ──────────────────────────────────────────────
+  // Pick the smallest token ceiling that fits the answer (latency-first), and
+  // auto-escalate a tier if it keeps truncating. Tiers: 30 / 50 / 100.
+  private _lastBaseTier = 30;
+  private _lastBudget = 30;
+  /** base tier → escalated budget (learned within the call). */
+  private readonly tierEscalation = new Map<number, number>();
+  /** base tier → consecutive near-limit generations. */
+  private readonly nearLimitStreak = new Map<number, number>();
 
   /** Current booking workflow status. */
   bookingStatus: BookingStatus = 'NONE';
@@ -153,6 +195,9 @@ export class SessionState {
 
   advanceTurn(): void {
     this.turnCount++;
+    // Reset per-turn flags. nextAction() (via toPromptBlock) may set
+    // _visitSuggestedThisTurn later this turn if a suggestion is warranted.
+    this._visitSuggestedThisTurn = false;
   }
 
   get currentTurn(): number {
@@ -162,7 +207,6 @@ export class SessionState {
   // ─── Spec-named field accessors ─────────────────────────────────────────
   // Stable public names for the slots, mapped onto the internal store.
 
-  get customerName(): string | null { return this.info.name; }
   get budget(): string | null { return this.info.budgetMentioned; }
   get bhkPreference(): string | null { return this.info.bhkPreference; }
   get siteVisitDay(): string | null { return this.info.preferredDate; }
@@ -185,14 +229,16 @@ export class SessionState {
 
     // Discovery funnel.
     if (!this.interested) return this.turnCount === 0 ? 'INTRODUCTION' : 'INTEREST_CHECK';
-    if (!this.info.name) return 'GET_NAME';
+    // Interested → make the deliberate site-visit OFFER once (sales goal).
+    // After it's been offered (and if not yet agreed/declined), just answer
+    // questions — the offer is NOT repeated on every turn.
+    if (!this.visitOffered && !this.visitRejected) return 'VISIT_OFFER';
     return 'QUESTION_HANDLING';
   }
 
   /** One-line natural-language summary of progress (spec field). */
   get summary(): string {
     const parts: string[] = [];
-    if (this.info.name) parts.push(`name=${this.info.name}`);
     if (this.info.bhkPreference) parts.push(`bhk=${this.info.bhkPreference}`);
     if (this.info.budgetMentioned) parts.push(`budget=${this.info.budgetMentioned}`);
     if (this.info.preferredDate) parts.push(`day=${this.info.preferredDate}`);
@@ -202,30 +248,6 @@ export class SessionState {
   }
 
   // ─── Info Setters ───────────────────────────────────────────────────────
-
-  setName(name: string): void {
-    if (!name.trim()) return;
-    const cleaned = name.trim();
-    if (cleaned.length < 2) return;
-
-    // Reject if the "name" is actually a trigger phrase or false positive
-    if (NAME_FALSE_POSITIVES.has(cleaned.toLowerCase())) return;
-    if (NAME_TRIGGER_PHRASES.has(cleaned.toLowerCase())) return;
-
-    // Reject if it contains only trigger words (multi-word check)
-    const words = cleaned.toLowerCase().split(/\s+/);
-    if (words.every(w => NAME_FALSE_POSITIVES.has(w) || NAME_TRIGGER_PHRASES.has(w))) return;
-
-    if (this.info.name !== cleaned) {
-      this.info.name = cleaned;
-      this.log.info('slot_update', {
-        field: 'name',
-        value: cleaned,
-        turn: this.turnCount,
-        extracted_name: cleaned,
-      });
-    }
-  }
 
   setPreferredDate(date: string): void {
     if (!date.trim()) return;
@@ -285,7 +307,10 @@ export class SessionState {
     const hasTime = !!this.info.preferredTime;
 
     if (hasDate && hasTime) {
-      // Both captured → ready for confirmation
+      // Both captured → auto-confirm the booking immediately.
+      // The LLM's CONFIRM_VISIT response serves as the acknowledgement;
+      // the call ends after it plays. No extra user affirmation needed —
+      // the user already provided date + time which is implicit consent.
       if (this.bookingStatus !== 'CONFIRMATION_PENDING' &&
           this.bookingStatus !== 'BOOKED') {
         this.bookingStatus = 'CONFIRMATION_PENDING';
@@ -295,6 +320,8 @@ export class SessionState {
           time: this.info.preferredTime,
           session_state: this.getStateSnapshot(),
         });
+        // Auto-confirm: date + time captured = booking is done.
+        this.confirmBooking();
       }
     } else if (hasDate && !hasTime) {
       if (this.bookingStatus === 'NONE') {
@@ -343,7 +370,6 @@ export class SessionState {
     this.bookingSuccess = true;
     this.shouldEndCall = true;
     this.log.info('booking_success', {
-      name: this.info.name,
       date: this.info.preferredDate,
       time: this.info.preferredTime,
       booking_state: 'BOOKED',
@@ -362,11 +388,7 @@ export class SessionState {
   updateLastAskedField(text: string): void {
     const lower = text.toLowerCase();
 
-    // NOTE: \b word boundaries do NOT work around Devanagari (नाम is non-\w),
-    // so ASCII keywords use \b while Devanagari keywords are matched directly.
-    if (/\b(naam|name)\b/i.test(lower) || /नाम/.test(lower)) {
-      this.lastAskedField = 'name';
-    } else if (/\b(day|date|din|weekday|weekend)\b/i.test(lower) || /दिन|कब|कौनसा/.test(lower)) {
+    if (/\b(day|date|din|weekday|weekend)\b/i.test(lower) || /दिन|कब|कौनसा/.test(lower)) {
       this.lastAskedField = 'date';
     } else if (/\b(time|samay|morning|afternoon|evening)\b/i.test(lower) || /समय|बजे|सुबह|दोपहर|शाम/.test(lower)) {
       this.lastAskedField = 'time';
@@ -379,27 +401,16 @@ export class SessionState {
 
   /**
    * Whether speculative generation should be allowed for this transcript.
-   * Blocks speculation when:
-   *   - We're waiting for a name (short/incomplete utterances are common)
-   *   - The transcript is too short to be a complete query
+   * Blocks speculation when the transcript is too short to be a complete query.
    */
   shouldAllowSpeculation(text: string): boolean {
     const trimmed = text.trim();
 
-    // Check if this looks like a complete query (contains query keywords)
     const queryKeywords = /\b(what|how|price|budget|amenities|location|bhk|possession|visit|schedule|book|कब|कहाँ|कितना|क्या)\b/i;
     const isQuery = queryKeywords.test(trimmed);
 
-    // Allow speculation for explicit queries regardless of name collection state
     if (isQuery && trimmed.length >= 15) {
       return true;
-    }
-
-    // Never speculate during name collection — names arrive in fragments
-    // ("मेरा" → "मेरा नाम" → "मेरा नाम शिवा") and speculating on partial
-    // name triggers would store trigger phrases as names.
-    if (!this.info.name && this.lastAskedField === 'name') {
-      return false;
     }
 
     // Only speculate on utterances that look like complete queries (>15 chars)
@@ -417,7 +428,7 @@ export class SessionState {
     const f = (v: string | null) => (v ? `${v} ✓` : '—');
     return [
       '[SESSION_STATE] (ground truth — use ✓ values, never re-ask them)',
-      `Name: ${f(this.info.name)} | BHK: ${f(this.info.bhkPreference)} | Budget: ${f(this.info.budgetMentioned)}`,
+      `BHK: ${f(this.info.bhkPreference)} | Budget: ${f(this.info.budgetMentioned)}`,
       `Visit day: ${f(this.info.preferredDate)} | Visit time: ${f(this.info.preferredTime)} | Booked: ${this.visitBooked ? 'yes' : 'no'}`,
       `[NEXT_ACTION] ${this.nextAction()}`,
     ].join('\n');
@@ -426,27 +437,162 @@ export class SessionState {
   /**
    * The single instruction line for this turn, computed from the application
    * state machine. The LLM renders this; it never decides the step itself.
+   *
+   * CRITICAL: Visit suggestions are ONLY included when shouldSuggestVisit()
+   * returns true (buying intent detected, not rejected, spaced 3+ turns).
+   * The LLM must NEVER inject visit pitches on its own.
    */
   private nextAction(): string {
-    const name = this.info.name ? `${this.info.name} जी` : '';
     switch (this.currentStep) {
       case 'INTRODUCTION':
       case 'INTEREST_CHECK':
         return 'Answer any question briefly, then warmly ask if they\'d like to see the project on a site visit. Gauge interest.';
-      case 'GET_NAME':
-        return 'They are interested. Answer any question first, then politely ask their name (e.g. "May I know your name?").';
+      case 'VISIT_OFFER': {
+        // Deliberate one-time offer right after interest is detected (the sales
+        // goal). Mark it so the pitch guard allows the visit mention this turn.
+        this.visitOffered = true;
+        this.markVisitSuggested();
+        return 'Answer their question in ONE line if they asked one, then warmly offer a site visit and ask which day suits — today, tomorrow, or this weekend. Be direct and natural. Ask only about the day, nothing else.';
+      }
       case 'QUESTION_HANDLING':
-        return `Answer their question fully from PROPERTY_FACTS${name ? `, address them as "${name}"` : ''}. Then, as a natural next step, suggest a site visit ("project देखकर clarity बेहतर आएगी" / "actual layout देखने से decision आसान होगा"). Do NOT pitch the visit every single turn.`;
+        // Visit already offered once — just answer questions. NEVER re-pitch the
+        // visit or append a "site visit" line; only answer what they asked.
+        return 'Answer their question briefly and completely from PROPERTY_FACTS. Give ONLY the answer to what they asked (budget→price, location→location, etc.). Do NOT mention a site visit, do NOT say "aur kuch"/"anything else", and do NOT add any extra line.';
       case 'ASK_VISIT_DAY':
-        return `They want to visit. Answer any pending question, then ask ${name ? name + ', ' : ''}which day suits them — weekday or weekend.`;
+        return '[DETERMINISTIC] Application handles this step directly.';
       case 'ASK_VISIT_TIME':
-        return 'Day is set. Ask morning or afternoon. Do NOT ask the day again.';
+        return '[DETERMINISTIC] Application handles this step directly.';
       case 'CONFIRM_VISIT':
-        return `Confirm the visit for ${this.info.preferredDate} ${this.info.preferredTime} in one short line${name ? ` (use "${name}")` : ''}, then thank them. Ask nothing else.`;
       case 'BOOKED':
-        return 'Visit is booked. Say a brief warm thank-you only; the call is ending.';
+        return '[DETERMINISTIC] Application handles this step directly.';
       case 'NOT_INTERESTED':
         return 'They are not interested. Thank them politely in one short line and close warmly. Do NOT pitch the visit.';
+    }
+  }
+
+  // ─── Deterministic Scheduling Responses ─────────────────────────────────
+  // Zero-LLM-token responses for scheduling steps. These are spoken directly
+  // by TTS without LLM involvement, ensuring the scheduling flow works even
+  // if the LLM is unavailable.
+
+  /**
+   * Get a deterministic response for the current scheduling step.
+   * Returns null if the current step is not a scheduling step (LLM needed).
+   */
+  getSchedulingResponse(): string | null {
+    switch (this.currentStep) {
+      case 'ASK_VISIT_DAY':
+        this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_DAY_REQUESTED', step: this.currentStep });
+        return 'आपको कौन सा दिन सुविधाजनक होगा — आज, कल, या weekend?';
+      case 'ASK_VISIT_TIME':
+        this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_TIME_REQUESTED', step: this.currentStep, day: this.info.preferredDate });
+        return `${this.info.preferredDate} ठीक है। कितने बजे आना चाहेंगे — सुबह, दोपहर, या शाम?`;
+      case 'CONFIRM_VISIT':
+      case 'BOOKED':
+        this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_CONFIRMED', step: this.currentStep, day: this.info.preferredDate, time: this.info.preferredTime });
+        return `Perfect, ${this.info.preferredDate} ${this.info.preferredTime} site पर मिलते हैं। Dhanyavaad!`;
+      case 'NOT_INTERESTED':
+        return 'ठीक है, कोई बात नहीं। आपका समय देने के लिए धन्यवाद!';
+      default:
+        return null;
+    }
+  }
+
+  // ─── Adaptive Token Budget ──────────────────────────────────────────────
+
+  // Token tiers (env-configurable; Devanagari-safe defaults — see env.ts).
+  private static get TIER_SHORT(): number { return Env.llm.tokensShort; }   // short factual
+  private static get TIER_NORMAL(): number { return Env.llm.tokensNormal; } // normal / list / multi
+  private static get TIER_LONG(): number { return Env.llm.tokensLong; }     // comparison / long
+
+  /**
+   * Choose the max_completion_tokens budget for THIS turn from query complexity
+   * + conversation state. Latency-first: default to the smallest tier, only go
+   * bigger when the query genuinely needs it. Applies any learned escalation.
+   *
+   *   "Price?" / "What amenities?"                 → 30
+   *   "Tell me about the project and possession."  → 50
+   *   "Compare 2 BHK and 3 BHK options."           → 100
+   */
+  selectTokenBudget(query: string): number {
+    const base = this.baseTokenTier(query);
+    this._lastBaseTier = base;
+    this._lastBudget = this.tierEscalation.get(base) ?? base;
+    this.log.info('token_budget_selected', {
+      selectedTokenLimit: this._lastBudget,
+      baseTier: base,
+      step: this.currentStep,
+    });
+    return this._lastBudget;
+  }
+
+  private baseTokenTier(query: string): number {
+    const q = (query || '').toLowerCase().trim();
+
+    // Booking / closing steps are always short, fixed replies.
+    switch (this.currentStep) {
+      case 'ASK_VISIT_DAY':
+      case 'ASK_VISIT_TIME':
+      case 'CONFIRM_VISIT':
+      case 'BOOKED':
+      case 'NOT_INTERESTED':
+        return SessionState.TIER_SHORT;
+    }
+
+    // Comparison / multi-question → needs structure → long tier (100).
+    const questionMarks = (query.match(/\?/g) || []).length;
+    const isComparison =
+      /\b(compare|comparison|difference|differ|vs\.?|versus|farak|फ़र्क|फर्क|अंतर|both|dono|which\s+(is\s+)?(better|best))\b/.test(q) ||
+      /\b\d(\.\d)?\s*bhk\b[^?]*\b(and|aur|vs|versus|या|or)\b[^?]*\bbhk\b/.test(q);
+    if (isComparison || questionMarks >= 2) return SessionState.TIER_LONG;
+
+    // List / multi-topic / descriptive answers → normal tier (a list enumerates
+    // several items, which in Devanagari easily exceeds the short ceiling).
+    const words = q.split(/\s+/).filter(Boolean).length;
+    const isList = /\b(amenit|facilit|features?|suvidha|सुविधा|सुविधाएं|amenities)\b/.test(q);
+    const isMultiTopic =
+      /\b(tell me about|explain|describe|overview|details?|batao|बताइए|बताओ|समझाइए|समझाओ)\b/.test(q) ||
+      /\b(and|aur|&|plus|along with|साथ)\b/.test(q);
+    if (isList || (isMultiTopic && words >= 5) || words >= 14) return SessionState.TIER_NORMAL;
+
+    // Default: short factual.
+    return SessionState.TIER_SHORT;
+  }
+
+  /**
+   * Record the outcome of a generation for logging + auto-escalation.
+   * If a tier hits ≥80% of its budget (or truncates) on 2 consecutive turns,
+   * permanently bump that tier to the next one for the rest of the call.
+   */
+  recordGeneration(tokensUsed: number, truncated: boolean): void {
+    const budget = this._lastBudget;
+    const base = this._lastBaseTier;
+    const ratio = budget > 0 ? tokensUsed / budget : 0;
+    const nearLimit = truncated || ratio >= 0.8;
+
+    this.log.info('llm_token_usage', {
+      selectedTokenLimit: budget,
+      actualTokensUsed: tokensUsed,
+      responseTruncated: truncated,
+      ratio: Math.round(ratio * 100) / 100,
+    });
+
+    if (!nearLimit) {
+      this.nearLimitStreak.set(base, 0);
+      return;
+    }
+
+    const streak = (this.nearLimitStreak.get(base) ?? 0) + 1;
+    this.nearLimitStreak.set(base, streak);
+    if (streak >= 2) {
+      const next = budget < SessionState.TIER_NORMAL ? SessionState.TIER_NORMAL
+                 : budget < SessionState.TIER_LONG ? SessionState.TIER_LONG
+                 : SessionState.TIER_LONG;
+      if (next > budget) {
+        this.tierEscalation.set(base, next);
+        this.nearLimitStreak.set(base, 0);
+        this.log.info('token_tier_escalated', { baseTier: base, from: budget, to: next });
+      }
     }
   }
 
@@ -465,11 +611,6 @@ export class SessionState {
     }
 
     // 2. Re-asking collected info
-    if (this.info.name) {
-      if (/(?:your name|naam|नाम|what.*call you|आपका\s*नाम)/i.test(text)) {
-        issues.push('RE_ASK_NAME: already collected: ' + this.info.name);
-      }
-    }
     if (this.info.preferredDate) {
       if (/\b(which day|कौनसा day|कब आ|when.*come|date prefer|day prefer)\b/i.test(text)) {
         issues.push('RE_ASK_DATE: already collected: ' + this.info.preferredDate);
@@ -504,6 +645,24 @@ export class SessionState {
       if (n < 8 || n > 10) issues.push('INVENTED_PRICE: ' + priceMatch[0]);
     }
 
+    // 6. Banned filler closing ("aur kuch", "anything else", …).
+    if (FILLER_CLOSING.test(text)) issues.push('FILLER_CLOSING');
+
+    // 7. Unsolicited site-visit pitch (not requested by the controller this turn).
+    if (!this._visitSuggestedThisTurn && VISIT_PITCH.test(text)) {
+      issues.push('UNSOLICITED_VISIT_PITCH');
+    }
+
+    // 8. Scheduling offer after the caller declined a visit.
+    if (this.visitRejected && SCHEDULING_OFFER.test(text)) {
+      issues.push('SCHEDULING_AFTER_REJECTION');
+    }
+
+    // 9. Invented specific calendar date for a visit (e.g. "23 जून", "26 June").
+    //    The agent must only use relative days (today/tomorrow/weekend).
+    const SPECIFIC_DATE = /\b\d{1,2}\s*(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(tember)?|oct(ober)?|nov(ember)?|dec(ember)?|जनवरी|फ़रवरी|फरवरी|मार्च|अप्रैल|मई|जून|जुलाई|अगस्त|सितंबर|अक्टूबर|नवंबर|दिसंबर)\b/i;
+    if (SPECIFIC_DATE.test(text)) issues.push('INVENTED_VISIT_DATE: ' + (text.match(SPECIFIC_DATE)?.[0] ?? ''));
+
     if (issues.length > 0) {
       this.log.warn('output_validation_issues', { issues, text: text.substring(0, 100) });
     }
@@ -520,23 +679,74 @@ export class SessionState {
     return confirmPattern.test(text) && bookingContext.test(text);
   }
 
+  // ─── Lightweight Streaming Guard ─────────────────────────────────────────
+
+  /**
+   * Strip forbidden content from a STREAMED leading segment before it reaches
+   * TTS. Deliberately lightweight — it removes trailing clauses only and never
+   * buffers the full response (see CallOrchestrator: this runs on the first
+   * ~150ms / ~100 chars of tokens, then the rest streams live).
+   *
+   * Source-prevention (prompt + NEXT_ACTION + state machine) is the primary
+   * defence; this is the safety net for the realistic case (short one-sentence
+   * replies where the leading segment IS the whole reply).
+   *
+   * Removes:
+   *   - filler closings ("aur kuch?", "anything else?")          — always
+   *   - unsolicited site-visit pitch                              — unless asked
+   *   - day/time scheduling offers                                — after rejection
+   */
+  sanitizeStreamingHead(text: string): string {
+    let out = text;
+    let strippedScheduling = false;
+
+    if (FILLER_CLOSING.test(out)) {
+      out = out.replace(FILLER_CLOSING, '');
+      this.log.warn('guard_stripped_filler_closing', { text: text.substring(0, 80) });
+    }
+
+    if (!this._visitSuggestedThisTurn && VISIT_PITCH.test(out)) {
+      out = out.replace(VISIT_PITCH, '');
+      this.log.warn('guard_stripped_unsolicited_pitch', { text: text.substring(0, 80) });
+    }
+
+    if (this.visitRejected && SCHEDULING_OFFER.test(out)) {
+      out = out.replace(SCHEDULING_OFFER, '');
+      strippedScheduling = true;
+      this.log.warn('guard_stripped_scheduling_after_rejection', { text: text.substring(0, 80) });
+    }
+
+    // Clean up orphaned/duplicated punctuation left by the strips.
+    out = out
+      .replace(/\s{2,}/g, ' ')
+      .replace(/\s+([?।.!,])/g, '$1')
+      .replace(/([?।.!,])[?।.!,]+/g, '$1')   // collapse mixed punctuation runs (e.g. "।?")
+      .replace(/^[\s?।.!,-]+/, '')
+      .trim();
+
+    // If a critical strip (post-rejection scheduling) removed the entire
+    // segment, emit a brief neutral acknowledgement instead of bare punctuation
+    // so the caller never hears a fragment like "?" — and never a rescheduling.
+    const hasLetters = /[a-zA-Zऀ-ॿ]/.test(out);
+    if (strippedScheduling && !hasLetters) {
+      return 'ठीक है, कोई बात नहीं।';
+    }
+
+    return out;
+  }
+
   // ─── Extraction from Transcripts ─────────────────────────────────────────
 
   /**
    * Extract user info from a transcript. Called on every user turn.
-   *
-   * NAME SAFETY: Only extracts the actual person name, never the trigger
-   * phrase. If the transcript is "मेरा नाम" without a name following,
-   * the name slot stays empty.
    */
   extractFromUserTranscript(text: string): void {
     const lower = text.toLowerCase().trim();
     const trimmed = text.trim();
 
-    // ── Name extraction ──────────────────────────────────────────────────
-    if (!this.info.name) {
-      this.extractName(trimmed);
-    }
+    // ── BHK + budget extraction ──────────────────────────────────────────
+    this.extractBhk(lower);
+    this.extractBudget(lower);
 
     // ── Date extraction ──────────────────────────────────────────────────
     this.extractDate(lower, trimmed);
@@ -544,34 +754,45 @@ export class SessionState {
     // ── Time extraction ──────────────────────────────────────────────────
     this.extractTime(text, trimmed);
 
-    // ── BHK + budget extraction (regex/rules only — never the LLM) ────────
-    this.extractBhk(lower);
-    this.extractBudget(lower);
+    // ── Buying intent classification (before interest/visit detection) ────
+    this.classifyQueryIntent(lower);
+
+    // ── Visit rejection detection (BEFORE interest detection) ────────────
+    // Must run first: "not interested in visit" should NOT trigger full-call
+    // rejection. If visit rejection fires, skip interest detection.
+    const visitRejectedThisTurn = this.detectVisitRejection(lower, trimmed);
 
     // ── Interest / rejection detection (drives discovery funnel) ──────────
-    this.detectInterest(lower, trimmed);
+    if (!visitRejectedThisTurn) {
+      this.detectInterest(lower, trimmed);
+    }
 
-    // ── Visit-agreement detection → drives QUESTION_HANDLING → ASK_VISIT_DAY
-    // Explicit visit language, OR a bare yes/haan right after the agent invited
-    // a visit, OR the caller volunteering a day/time, all mean "let's schedule".
-    // GATED ON NAME: per the flow, we always collect the name before scheduling,
-    // so "yes" to the opener marks interest (→ GET_NAME), not agreement to book.
-    const visitContext = /\b(visit|schedule|book|appointment|देखना|देखेंगे|देखने|dekhna|dekhenge|chalenge|चलेंगे)\b/i;
-    const affirmedVisit = this.lastAskedField === 'site_visit_interest' && AFFIRMATIVE.test(trimmed);
-    const wantsVisit = visitContext.test(lower) || affirmedVisit ||
-      !!this.info.preferredDate || !!this.info.preferredTime;
-    if (wantsVisit && !this.notInterested) {
+    // ── Visit-agreement detection → drives straight to ASK_VISIT_DAY
+    // Uses IntentClassifier: VISIT_INTENT means explicit visit language,
+    // affirmative in visit context, or volunteered day/time.
+    // AGREEMENT after a visit offer also counts.
+    // BLOCKED if user has rejected visits.
+    const visitIntent = classifyIntent(trimmed, {
+      lastAskedField: this.lastAskedField,
+      currentStep: this.currentStep,
+      hasDate: !!this.info.preferredDate,
+      hasTime: !!this.info.preferredTime,
+    });
+
+    const wantsVisit = visitIntent.intent === 'VISIT_INTENT';
+    if (wantsVisit && !this.notInterested && !this.visitRejected) {
       this.interested = true;
-      if (this.info.name) {
+      if (!this.visitAgreed) {
         this.visitAgreed = true;
-        this.log.info('site_visit_agreed', { text: trimmed.substring(0, 50) });
+        this.log.info('site_visit_agreed', { text: trimmed.substring(0, 50), reason: visitIntent.reason });
       }
     }
 
     // ── APPLICATION-CONTROLLED booking confirmation ───────────────────────
     // The ONLY path to BOOKED: both slots captured (status CONFIRMATION_PENDING)
     // AND the user affirms. Driven by USER input + state, never by LLM output.
-    if (this.bookingStatus === 'CONFIRMATION_PENDING' && AFFIRMATIVE.test(trimmed)) {
+    if (this.bookingStatus === 'CONFIRMATION_PENDING' &&
+        (visitIntent.intent === 'AGREEMENT' || visitIntent.intent === 'VISIT_INTENT')) {
       this.confirmBooking();
     }
 
@@ -587,26 +808,107 @@ export class SessionState {
   private detectInterest(lower: string, trimmed: string): void {
     if (this.bookingStatus === 'BOOKED' || this.visitAgreed || this.notInterested) return;
 
+    const intent = classifyIntent(trimmed, {
+      lastAskedField: this.lastAskedField,
+      currentStep: this.currentStep,
+      hasDate: !!this.info.preferredDate,
+      hasTime: !!this.info.preferredTime,
+    });
+
+    this.log.debug('intent_classification', {
+      intent: intent.intent,
+      confidence: intent.confidence,
+      reason: intent.reason,
+      text: trimmed.substring(0, 50),
+    });
+
     // Clear rejection → NOT_INTERESTED → close politely + end the call.
-    const bareNo = this.lastAskedField === 'site_visit_interest' &&
-      /^(no|nope|nah|nahi|नहीं|ना)\b/i.test(trimmed);
-    if (REJECTION.test(lower) || bareNo) {
+    if (intent.intent === 'REJECTION') {
       this.notInterested = true;
       this.shouldEndCall = true;
-      this.log.info('not_interested', { text: trimmed.substring(0, 50) });
+      this.log.info('not_interested', { text: trimmed.substring(0, 50), reason: intent.reason });
       return;
     }
 
-    // Any positive engagement → interested. Affirmative to the offer, a real
-    // question, or a provided name/BHK/budget all signal genuine interest.
+    // Any positive engagement → interested. Agreement, visit intent, questions,
+    // or already-provided slots all signal genuine interest.
     const queryKeywords = /\b(what|how|price|budget|cost|amenities|location|bhk|possession|floor|plan|kitna|kitne|kahan|kya|क्या|कितना|कहाँ|कीमत|दाम)\b/i;
-    if (AFFIRMATIVE.test(trimmed) || queryKeywords.test(lower) ||
-        this.info.name || this.info.bhkPreference || this.info.budgetMentioned) {
+    if (intent.intent === 'AGREEMENT' || intent.intent === 'VISIT_INTENT' ||
+        intent.intent === 'QUESTION' || queryKeywords.test(lower) ||
+        this.info.bhkPreference || this.info.budgetMentioned) {
       if (!this.interested) {
         this.interested = true;
-        this.log.info('interest_detected', { text: trimmed.substring(0, 50) });
+        this.log.info('interest_detected', { text: trimmed.substring(0, 50), reason: intent.reason });
       }
     }
+  }
+
+  // ─── Visit Rejection Detection ───────────────────────────────────────────
+
+  /**
+   * Detect visit-specific rejection (distinct from full call rejection).
+   * When user declines a visit, stop scheduling but keep answering questions.
+   * Returns true if rejection was detected this turn (caller should skip detectInterest).
+   */
+  private detectVisitRejection(lower: string, trimmed: string): boolean {
+    if (this.visitRejected || this.notInterested) return false;
+    if (this.bookingStatus === 'BOOKED') return false;
+
+    const intent = classifyIntent(trimmed, {
+      lastAskedField: this.lastAskedField,
+      currentStep: this.currentStep,
+      hasDate: !!this.info.preferredDate,
+      hasTime: !!this.info.preferredTime,
+    });
+
+    if (intent.intent === 'VISIT_REJECT') {
+      this.visitRejected = true;
+      this.visitAgreed = false;
+      // Clear any partially captured scheduling info. (BOOKED is impossible
+      // here — the guard at the top of this method returns early when booked.)
+      this.info.preferredDate = null;
+      this.info.preferredTime = null;
+      this.bookingStatus = 'NONE';
+      this.log.info('visit_rejected', {
+        text: trimmed.substring(0, 50),
+        previousStep: this.currentStep,
+        reason: intent.reason,
+      });
+      return true;
+    }
+    return false;
+  }
+
+  // ─── Intent-Based Visit Suggestion ─────────────────────────────────────
+
+  /**
+   * Whether the agent should suggest a visit this turn.
+   * True only when:
+   *   - User hasn't rejected visits
+   *   - Visit hasn't been agreed to yet
+   *   - Suggestion count < 2 per call
+   *   - At least 3 turns since last suggestion
+   *   - User's question signals buying intent
+   */
+  shouldSuggestVisit(): boolean {
+    if (this.visitRejected) return false;
+    if (this.visitAgreed) return false;
+    if (this.notInterested) return false;
+    if (this.visitSuggestionCount >= 2) return false;
+    if (this.turnCount - this.lastVisitSuggestionTurn < 3) return false;
+    return this._buyingIntentThisTurn;
+  }
+
+  /** Mark that a visit suggestion was made this turn. */
+  markVisitSuggested(): void {
+    this.visitSuggestionCount++;
+    this.lastVisitSuggestionTurn = this.turnCount;
+    this._visitSuggestedThisTurn = true;
+  }
+
+  /** Classify whether the user's message signals buying intent. */
+  private classifyQueryIntent(lower: string): void {
+    this._buyingIntentThisTurn = BUYING_INTENT.test(lower);
   }
 
   /** Extract BHK preference: "2 bhk", "2.5 BHK", "3bhk", "two bhk". */
@@ -627,74 +929,32 @@ export class SessionState {
     }
   }
 
-  /**
-   * Extract the actual person name from text.
-   * NEVER stores trigger phrases like "मेरा नाम", "my name is", etc.
-   */
-  private extractName(text: string): void {
-    // Pattern 1: "my name is X", "मेरा नाम X है", "I am X", etc.
-    // The captured group is ONLY the name part — never the trigger phrase.
-    const namePatterns = [
-      // "मेरा नाम शिवा है" → "शिवा"  (name is before है/हूँ)
-      // "मेरा नाम शिवा" → "शिवा"
-      // "मेरा नाम राम कुमार है" → "राम कुमार"
-      // Use non-greedy match + explicit है/हूँ anchor to avoid capturing "है" as part of name
-      /(?:मेरा\s+नाम|mera\s+naam|mera\s+name|नाम\s+है)\s+(.+?)\s*(?:है|हूँ|हूं)\s*$/i,
-      // Name AFTER the copula है: "मेरा नाम है शिव राय" / "नाम है शिव" → "शिव राय".
-      // Deepgram commonly transcribes the "naam hai X" word order. Tried BEFORE the
-      // "name before है" patterns so the greedy one below does not capture "है X".
-      /(?:मेरा\s+)?नाम\s+है\s+([a-zA-Zऀ-ॿ]{2,}(?:\s+[a-zA-Zऀ-ॿ]{2,})?)\s*$/i,
-      // Romanized copula-first: "mera naam hai Shiv Rai" / "naam hai Shiv"
-      /(?:mera\s+)?naam\s+hai\s+([a-zA-Z]{2,}(?:\s+[a-zA-Z]{2,})?)\s*$/i,
-      // Without trailing है: "मेरा नाम शिवा"
-      /(?:मेरा\s+नाम|mera\s+naam|mera\s+name)\s+([a-zA-Zऀ-ॿ]{2,}(?:\s+[a-zA-Zऀ-ॿ]{2,})?)\s*$/i,
-      // "my name is Rahul" / "I am Rahul" / "my name is शिवा" → name (English OR Devanagari)
-      /(?:my\s+name\s+is|i\s+am|i'm|this\s+is)\s+([a-zA-Zऀ-ॿ]{2,}(?:\s+[a-zA-Zऀ-ॿ]{2,})?)\s*$/i,
-      // "Rajesh speaking" / "Rajesh here"
-      /^([a-zA-Zऀ-ॿ]{2,}(?:\s+[a-zA-Zऀ-ॿ]{2,})?)\s+(?:speaking|here|bol\s+raha|bol\s+rahi|बोल\s+रहा|बोल\s+रही)/i,
-      // "मैं शिवा हूँ" → "शिवा" (Hindi "I am X")
-      /^(?:मैं|main|mai)\s+([a-zA-Zऀ-ॿ]{2,}(?:\s+[a-zA-Zऀ-ॿ]{2,})?)\s*(?:हूँ|हूं|hoon|hu|hun)\s*$/i,
-    ];
-
-    for (const pat of namePatterns) {
-      const m = text.match(pat);
-      if (m?.[1]) {
-        const candidate = m[1].trim();
-        // Validate the extracted name isn't a trigger phrase
-        if (!NAME_TRIGGER_PHRASES.has(candidate.toLowerCase()) &&
-            !NAME_FALSE_POSITIVES.has(candidate.toLowerCase())) {
-          this.setName(candidate);
-          return;
-        }
-      }
-    }
-
-    // BARE NAME RESPONSE: If agent just asked for name and user gives
-    // a short response (1-3 words), treat it as the name.
-    if (this.lastAskedField === 'name') {
-      const words = text.split(/\s+/);
-      if (words.length >= 1 && words.length <= 3 && !text.includes('?')) {
-        // Every word must look like a name part (alphabetic, not a trigger/false positive)
-        const allLikeName = words.every(w => {
-          const wLower = w.toLowerCase();
-          return /^[a-zA-Z\u0900-\u097F]{2,}$/.test(w) &&
-            !NAME_FALSE_POSITIVES.has(wLower) &&
-            !NAME_TRIGGER_PHRASES.has(wLower);
-        });
-
-        if (allLikeName) {
-          this.setName(text.trim());
-        }
-      }
-    }
-  }
-
   private extractDate(lower: string, trimmed: string): void {
-    // Use original text for matching to preserve case and Devanagari
+    // Skip extraction if the user is negating/correcting a date
+    // ("मैंने friday बोला ही नहीं", "I didn't say saturday", "not friday")
+    const negation = /\b(nahi|नहीं|didn'?t|never|not|no|mat|मत)\b.*\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|today|tomorrow|aaj|kal|आज|कल)\b/i;
+    const negationReverse = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|today|tomorrow|aaj|kal|आज|कल)\b.*\b(nahi|नहीं|didn'?t|never|not|no|mat|मत|बोला\s+ही\s+नहीं)\b/i;
+    if (negation.test(lower) || negationReverse.test(trimmed)) {
+      // User is correcting — clear the captured date so it can be re-asked
+      if (this.info.preferredDate) {
+        this.log.info('Date cleared by user negation', { previous: this.info.preferredDate, text: trimmed.substring(0, 50) });
+        this.info.preferredDate = null;
+        if (this.bookingStatus === 'DATE_CAPTURED' || this.bookingStatus === 'CONFIRMATION_PENDING') {
+          this.bookingStatus = 'NONE';
+        }
+      }
+      return;
+    }
+
+    // Use original text for matching to preserve case and Devanagari.
+    // NOTE: \b does NOT work with Devanagari characters — use (?:^|\s) and (?:\s|$) instead.
     const datePatterns: Array<[RegExp, string]> = [
-      [/\b(today|aaj|आज)\b/i, 'today'],
-      [/\b(tomorrow|kal|कल)\b/i, 'tomorrow'],
-      [/\b(day after tomorrow|parson|परसों)\b/i, 'day after tomorrow'],
+      [/(?:^|\s)(today|aaj)(?:\s|$)/i, 'today'],
+      [/(?:^|\s)(आज)(?:\s|$)/, 'today'],
+      [/(?:^|\s)(tomorrow|kal)(?:\s|$)/i, 'tomorrow'],
+      [/(?:^|\s)(कल)(?:\s|$)/, 'tomorrow'],
+      [/(?:^|\s)(day after tomorrow|parson)(?:\s|$)/i, 'day after tomorrow'],
+      [/(?:^|\s)(परसों)(?:\s|$)/, 'day after tomorrow'],
       [/(सोमवार)/, 'Monday'],
       [/(मंगलवार)/, 'Tuesday'],
       [/(बुधवार)/, 'Wednesday'],
@@ -731,11 +991,26 @@ export class SessionState {
     }
   }
 
+  /** Map Hindi number words to digits for time extraction. */
+  private static readonly HINDI_NUMBERS: Record<string, string> = {
+    'एक': '1', 'दो': '2', 'तीन': '3', 'चार': '4', 'पांच': '5', 'पाँच': '5',
+    'छह': '6', 'छः': '6', 'सात': '7', 'आठ': '8', 'नौ': '9', 'दस': '10',
+    'ग्यारह': '11', 'बारह': '12',
+    'ek': '1', 'do': '2', 'teen': '3', 'char': '4', 'paanch': '5',
+    'cheh': '6', 'saat': '7', 'aath': '8', 'nau': '9', 'das': '10',
+    'gyarah': '11', 'barah': '12',
+  };
+
   private extractTime(text: string, trimmed: string): void {
     const timePatterns: Array<[RegExp, string]> = [
       [/\b(\d{1,2})\s*(am|pm|AM|PM)\b/, '$1 $2'],
       [/\b(\d{1,2})\s*o'?\s*clock\b/i, '$1 o\'clock'],
-      [/(\d{1,2})\s*(बजे)/, '$1 बजे'],
+      // Digit + बजे: "7 बजे", "10 बजे"
+      [/(\d{1,2})\s*(बजे|baje)/, '$1 बजे'],
+      // Hindi number word + बजे: "सात बजे", "दस बजे"
+      [/(एक|दो|तीन|चार|पांच|पाँच|छह|छः|सात|आठ|नौ|दस|ग्यारह|बारह)\s*(बजे|baje)/i, '$1 बजे'],
+      // Romanized Hindi number + baje: "saat baje", "das baje"
+      [/\b(ek|do|teen|char|paanch|cheh|saat|aath|nau|das|gyarah|barah)\s*(baje|बजे)\b/i, '$1 बजे'],
       [/\b(morning|subah)\b|(?:^|\s)(सुबह)(?:\s|$)/i, 'morning'],
       [/\b(afternoon|dopahar)\b|(?:^|\s)(दोपहर)(?:\s|$)/i, 'afternoon'],
       [/\b(evening|shaam)\b|(?:^|\s)(शाम)(?:\s|$)/i, 'evening'],
@@ -743,7 +1018,12 @@ export class SessionState {
     for (const [pat, replacement] of timePatterns) {
       const m = trimmed.match(pat);
       if (m) {
-        const time = replacement.replace(/\$(\d)/g, (_, i) => m[parseInt(i)] || '');
+        let time = replacement.replace(/\$(\d)/g, (_, i) => m[parseInt(i)] || '');
+        // Convert Hindi number words to digits: "सात बजे" → "7 बजे"
+        const hindiNum = time.match(/^(\S+)\s+बजे$/);
+        if (hindiNum && SessionState.HINDI_NUMBERS[hindiNum[1].toLowerCase()]) {
+          time = `${SessionState.HINDI_NUMBERS[hindiNum[1].toLowerCase()]} बजे`;
+        }
         this.setPreferredTime(time);
         return;
       }
@@ -777,7 +1057,6 @@ export class SessionState {
   getStateSnapshot(): Record<string, unknown> {
     return {
       step: this.currentStep,
-      name: this.info.name,
       bhkPreference: this.info.bhkPreference,
       budget: this.info.budgetMentioned,
       siteVisitDay: this.info.preferredDate,
@@ -785,6 +1064,9 @@ export class SessionState {
       interested: this.interested,
       notInterested: this.notInterested,
       visitAgreed: this.visitAgreed,
+      visitRejected: this.visitRejected,
+      visitSuggestionCount: this.visitSuggestionCount,
+      buyingIntent: this._buyingIntentThisTurn,
       bookingStatus: this.bookingStatus,
       visitBooked: this.visitBooked,
       lastAskedField: this.lastAskedField,

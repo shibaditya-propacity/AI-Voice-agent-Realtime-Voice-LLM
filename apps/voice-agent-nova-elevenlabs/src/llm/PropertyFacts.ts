@@ -19,6 +19,7 @@ export const PROPERTY_FACTS = Object.freeze({
   possession: 'April 2027',
   developer: 'R.R. Lunkad',
   units: 78,
+  amenities: ['gym', 'swimming pool', 'EV charging', 'kids zone'],
 } as const);
 
 /**
@@ -30,6 +31,7 @@ export const PROPERTY_FACTS_BLOCK: string = [
   `Project: ${PROPERTY_FACTS.project}`,
   `Location: ${PROPERTY_FACTS.location}`,
   `Configs: ${PROPERTY_FACTS.bhk.join(', ')} BHK`,
+  `Amenities: ${PROPERTY_FACTS.amenities.join(', ')}`,
   `Price: ${PROPERTY_FACTS.pricePerSqft}`,
   `Possession: ${PROPERTY_FACTS.possession}`,
   `Developer: ${PROPERTY_FACTS.developer}`,

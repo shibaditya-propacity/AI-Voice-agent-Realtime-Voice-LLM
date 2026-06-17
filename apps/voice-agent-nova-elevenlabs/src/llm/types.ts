@@ -62,7 +62,7 @@ export interface BedrockMessage {
 export type StreamEvent =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; toolUseId: string; name: string; input: Record<string, unknown> }
-  | { type: 'done'; stopReason: string };
+  | { type: 'done'; stopReason: string; tokensUsed?: number; truncated?: boolean };
 
 // ─── Tools ───────────────────────────────────────────────────────────────────
 
