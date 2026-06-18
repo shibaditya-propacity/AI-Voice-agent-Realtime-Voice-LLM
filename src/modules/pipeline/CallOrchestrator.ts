@@ -518,7 +518,9 @@ export class CallOrchestrator {
 
     let fullText = '';
     let firstToken = true;
-    const humanPrefix = Env.humanization.enabled ? maybeGetOpener() : '';
+    const humanPrefix = Env.humanization.enabled
+      ? maybeGetOpener(this.conversation.getLastUserText())
+      : '';
 
     // Inject session state into system prompt
     this.conversation.setSystemPromptSuffix(this.session.toPromptBlock());

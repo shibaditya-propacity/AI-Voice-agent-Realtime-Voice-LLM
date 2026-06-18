@@ -36,7 +36,7 @@ import { SessionState } from './SessionState';
 import { LatencyTracker } from '../metrics/LatencyTracker';
 import { TwilioService } from '../telephony/TwilioService';
 import { globalToolRegistry } from '../tools/ToolRegistry';
-import { humanizeResponse, maybeGetOpener } from '../shared/humanize';
+import { maybeGetOpener } from '../shared/humanize';
 import { Env } from '../config/env';
 import { Logger, closeCallLogger } from '../shared/logger';
 import { routeQuery } from '../llm/KnowledgeRouter';
@@ -888,7 +888,9 @@ export class CallOrchestrator {
     this.muteSTTForEchoBurst();
 
     // Stream the response directly to TTS
-    const humanPrefix = Env.humanization.enabled ? maybeGetOpener() : '';
+    const humanPrefix = Env.humanization.enabled
+      ? maybeGetOpener(this.conversation.getLastUserText())
+      : '';
     if (humanPrefix) tts.streamText(humanPrefix);
     tts.streamText(result.response);
 
@@ -1037,8 +1039,10 @@ export class CallOrchestrator {
 
     let fullText = '';
     let firstToken = true;
-    // Decide upfront whether this turn gets a humanization opener (~7% chance).
-    const humanPrefix = Env.humanization.enabled ? maybeGetOpener() : '';
+    // Decide upfront whether this turn gets a context-aware acknowledgement.
+    const humanPrefix = Env.humanization.enabled
+      ? maybeGetOpener(this.conversation.getLastUserText())
+      : '';
 
     // ZERO BUFFERING: stream every token directly to TTS the instant it
     // arrives. Audio starts once 50 chars accumulate (chunk_length_schedule)
