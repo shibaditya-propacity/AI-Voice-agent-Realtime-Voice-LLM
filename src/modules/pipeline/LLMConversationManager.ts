@@ -146,6 +146,14 @@ export class LLMConversationManager {
     return [{ role: 'system', content: this.systemPrompt }, ...deduped];
   }
 
+  /** Returns the content of the most recent user message, or empty string. */
+  getLastUserText(): string {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      if (this.entries[i].message.role === 'user') return this.entries[i].message.content;
+    }
+    return '';
+  }
+
   get messageCount(): number { return this.entries.length; }
   get currentTurn(): number  { return this._turnIndex; }
 }
