@@ -156,6 +156,24 @@ export class SessionState {
    *  Gates the visit-pitch guard: a pitch is only allowed when this is true. */
   private _visitSuggestedThisTurn = false;
 
+  /** Whether the USER's transcript this turn explicitly mentions visits/site.
+   *  When true, the visit-pitch guard is relaxed — the user asked about it. */
+  private _userMentionedVisitThisTurn = false;
+
+  /**
+   * Check if the given text mentions a visit/site, and set the guard flag.
+   * Called from the speculative path (stable interim) so the visit-pitch guard
+   * doesn't strip LLM responses to user-initiated visit requests.
+   */
+  checkVisitMention(text: string): void {
+    const lower = text.toLowerCase();
+    const trimmed = text.trim();
+    if (/\b(visit|site\s*visit|site|schedule|reschedule|book|appointment)\b/i.test(lower) ||
+        /(?:विज़िट|विजिट|साइट|देखना|देखने|देखेंगे)/.test(trimmed)) {
+      this._userMentionedVisitThisTurn = true;
+    }
+  }
+
   /** Whether the deliberate one-time site-visit OFFER (right after interest is
    *  detected) has been made. Latch: prevents re-offering on every later turn. */
   private visitOffered = false;
@@ -198,6 +216,7 @@ export class SessionState {
     // Reset per-turn flags. nextAction() (via toPromptBlock) may set
     // _visitSuggestedThisTurn later this turn if a suggestion is warranted.
     this._visitSuggestedThisTurn = false;
+    this._userMentionedVisitThisTurn = false;
   }
 
   get currentTurn(): number {
@@ -483,16 +502,16 @@ export class SessionState {
     switch (this.currentStep) {
       case 'ASK_VISIT_DAY':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_DAY_REQUESTED', step: this.currentStep });
-        return 'आपको कौन सा दिन सुविधाजनक होगा — आज, कल, या weekend?';
+        return 'बहुत अच्छा! आपको कौन सा दिन सही रहेगा — आज, कल, या weekend?';
       case 'ASK_VISIT_TIME':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_TIME_REQUESTED', step: this.currentStep, day: this.info.preferredDate });
-        return `${this.info.preferredDate} ठीक है। कितने बजे आना चाहेंगे — सुबह, दोपहर, या शाम?`;
+        return `${this.info.preferredDate} बिल्कुल ठीक है। कितने बजे आना चाहेंगे — सुबह, दोपहर, या शाम?`;
       case 'CONFIRM_VISIT':
       case 'BOOKED':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_CONFIRMED', step: this.currentStep, day: this.info.preferredDate, time: this.info.preferredTime });
-        return `Perfect, ${this.info.preferredDate} ${this.info.preferredTime} site पर मिलते हैं। Dhanyavaad!`;
+        return `बहुत अच्छा! ${this.info.preferredDate} को ${this.info.preferredTime} site visit fix है। आपसे मिलकर खुशी होगी। धन्यवाद, आपका दिन शुभ हो!`;
       case 'NOT_INTERESTED':
-        return 'ठीक है, कोई बात नहीं। आपका समय देने के लिए धन्यवाद!';
+        return 'ठीक है, कोई बात नहीं। आपका समय देने के लिए बहुत धन्यवाद, आपका दिन शुभ हो!';
       default:
         return null;
     }
@@ -549,7 +568,11 @@ export class SessionState {
     // List / multi-topic / descriptive answers → normal tier (a list enumerates
     // several items, which in Devanagari easily exceeds the short ceiling).
     const words = q.split(/\s+/).filter(Boolean).length;
-    const isList = /\b(amenit|facilit|features?|suvidha|सुविधा|सुविधाएं|amenities)\b/.test(q);
+    // NOTE: stems are prefix-matched (no trailing \b) so inflections match —
+    // "facility", "facilities", "amenities", "features" all count. A trailing
+    // \b here previously matched NONE of them (a word-char follows the stem),
+    // so list answers wrongly got the SHORT budget and truncated mid-sentence.
+    const isList = /\b(amenit|facilit|feature|suvidha|सुविधा)/.test(q);
     const isMultiTopic =
       /\b(tell me about|explain|describe|overview|details?|batao|बताइए|बताओ|समझाइए|समझाओ)\b/.test(q) ||
       /\b(and|aur|&|plus|along with|साथ)\b/.test(q);
@@ -648,8 +671,9 @@ export class SessionState {
     // 6. Banned filler closing ("aur kuch", "anything else", …).
     if (FILLER_CLOSING.test(text)) issues.push('FILLER_CLOSING');
 
-    // 7. Unsolicited site-visit pitch (not requested by the controller this turn).
-    if (!this._visitSuggestedThisTurn && VISIT_PITCH.test(text)) {
+    // 7. Unsolicited site-visit pitch (not requested by the controller this turn
+    //    AND the user didn't ask about visits themselves).
+    if (!this._visitSuggestedThisTurn && !this._userMentionedVisitThisTurn && VISIT_PITCH.test(text)) {
       issues.push('UNSOLICITED_VISIT_PITCH');
     }
 
@@ -705,7 +729,7 @@ export class SessionState {
       this.log.warn('guard_stripped_filler_closing', { text: text.substring(0, 80) });
     }
 
-    if (!this._visitSuggestedThisTurn && VISIT_PITCH.test(out)) {
+    if (!this._visitSuggestedThisTurn && !this._userMentionedVisitThisTurn && VISIT_PITCH.test(out)) {
       out = out.replace(VISIT_PITCH, '');
       this.log.warn('guard_stripped_unsolicited_pitch', { text: text.substring(0, 80) });
     }
@@ -753,6 +777,12 @@ export class SessionState {
 
     // ── Time extraction ──────────────────────────────────────────────────
     this.extractTime(text, trimmed);
+
+    // ── Track if user explicitly mentions visit/site this turn ────────────
+    if (/\b(visit|site\s*visit|site|schedule|reschedule|book|appointment)\b/i.test(lower) ||
+        /(?:विज़िट|विजिट|साइट|देखना|देखने|देखेंगे)/.test(trimmed)) {
+      this._userMentionedVisitThisTurn = true;
+    }
 
     // ── Buying intent classification (before interest/visit detection) ────
     this.classifyQueryIntent(lower);
@@ -930,6 +960,24 @@ export class SessionState {
   }
 
   private extractDate(lower: string, trimmed: string): void {
+    // ── Guard: only extract dates in scheduling context ──────────────
+    // Day names like "saturday" appear in Deepgram hallucinations of general
+    // speech ("i want to know they are saturday"). Extracting a date from a
+    // non-scheduling utterance hijacks the conversation into the booking flow.
+    // Only extract when:
+    //   1. Visit is already agreed (ASK_VISIT_DAY / ASK_VISIT_TIME), OR
+    //   2. We explicitly asked for a date (lastAskedField === 'date'), OR
+    //   3. A date was already captured (user is correcting it)
+    const step = this.currentStep;
+    const inSchedulingContext =
+      this.visitAgreed ||
+      step === 'ASK_VISIT_DAY' || step === 'ASK_VISIT_TIME' || step === 'CONFIRM_VISIT' ||
+      this.lastAskedField === 'date' ||
+      !!this.info.preferredDate;
+    if (!inSchedulingContext) {
+      return;
+    }
+
     // Skip extraction if the user is negating/correcting a date
     // ("मैंने friday बोला ही नहीं", "I didn't say saturday", "not friday")
     const negation = /\b(nahi|नहीं|didn'?t|never|not|no|mat|मत)\b.*\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|today|tomorrow|aaj|kal|आज|कल)\b/i;

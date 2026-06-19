@@ -56,8 +56,10 @@ const INTENT_RULES: IntentRule[] = [
   {
     intent: 'AMENITIES',
     patterns: [
-      /\b(amenit|facilit|features?|suvidha|सुविधा|सुविधाएं|सुविधाएँ|gym|pool|swimming|parking|garden|club\s*house|ev\s*charg|kids?\s*zone|play\s*area)\b/i,
-      /(?:kya|क्या)\s+(?:kya|क्या)?\s*(?:hai|है|milta|मिलता|milega|मिलेगा)/i,
+      /\b(ameniti|amenity|amenities|facilities|facility|features?|suvidha|सुविधा|सुविधाएं|सुविधाएँ|gym|pool|swimming|parking|garden|club\s*house|ev\s*charg|kids?\s*zone|play\s*area)\b/i,
+      // NOTE: The old catch-all "kya hai" pattern was removed — it matched ANY
+      // "क्या है" question (e.g. "configuration का क्या है" → AMENITIES instead of BHK).
+      // Amenity-specific keywords in the first pattern are sufficient.
     ],
   },
   {
@@ -158,6 +160,14 @@ export interface RouterResult {
  * @param log   - Logger instance for the call
  * @returns RouterResult indicating whether the query was handled
  */
+/** Last intent handled by the router — used to prevent identical repeated responses. */
+let lastHandledIntent: FactIntent | null = null;
+
+/** Reset after LLM handles a turn, so the next same-intent question gets the canned response. */
+export function resetLastRouterIntent(): void {
+  lastHandledIntent = null;
+}
+
 export function routeQuery(
   text: string,
   session: SessionState,
@@ -165,15 +175,15 @@ export function routeQuery(
 ): RouterResult {
   const trimmed = text.trim();
 
-  // ── Gate 1: Only route during conversational steps ──────────────────────
-  // During visit scheduling or booking confirmation, the application handles
-  // the dialogue flow deterministically — don't intercept.
+  // ── Gate 1: Terminal steps are always deterministic ──────────────────────
+  // CONFIRM_VISIT, BOOKED, NOT_INTERESTED are handled by the application.
+  // ASK_VISIT_DAY and ASK_VISIT_TIME allow factual questions through — the
+  // scheduling re-prompt is appended after the fact answer.
   const step = session.currentStep;
-  const deterministicSteps = new Set([
-    'ASK_VISIT_DAY', 'ASK_VISIT_TIME',
+  const terminalSteps = new Set([
     'CONFIRM_VISIT', 'BOOKED', 'NOT_INTERESTED',
   ]);
-  if (deterministicSteps.has(step)) {
+  if (terminalSteps.has(step)) {
     return { handled: false, intent: null, response: '', reason: `step=${step} handled deterministically` };
   }
 
@@ -197,16 +207,37 @@ export function routeQuery(
   }
 
   if (!matchedIntent) {
+    // No fact intent → during scheduling steps, fall through to the
+    // deterministic scheduling handler (user is likely providing a date/time).
     return { handled: false, intent: null, response: '', reason: 'no fact intent matched' };
+  }
+
+  // ── Repeat guard: if the same fact intent was just answered, fall through
+  // to LLM for a varied response instead of repeating the same canned line.
+  if (matchedIntent === lastHandledIntent) {
+    log.info('ROUTER_REPEAT_SKIP', { intent: matchedIntent, reason: 'same intent as last turn — falling through to LLM' });
+    return { handled: false, intent: matchedIntent, response: '', reason: `repeat_skip:${matchedIntent}` };
   }
 
   // ── Build response ──────────────────────────────────────────────────────
   let response = buildResponse(matchedIntent);
 
-  // During VISIT_OFFER, append the visit offer
-  if (step === 'VISIT_OFFER') {
+  // During VISIT_OFFER, append the visit offer — but only once.
+  if (step === 'VISIT_OFFER' && session.shouldSuggestVisit()) {
     response += ` क्या आप site visit करना चाहेंगे?`;
+    session.markVisitSuggested();
   }
+
+  // During scheduling steps (ASK_VISIT_DAY, ASK_VISIT_TIME), the user asked
+  // a factual question instead of providing a date/time. Answer the question
+  // and gently re-prompt for the scheduling info.
+  if (step === 'ASK_VISIT_DAY') {
+    response += ' तो आपको कौन सा दिन सही रहेगा — आज, कल, या weekend?';
+  } else if (step === 'ASK_VISIT_TIME') {
+    response += ' कितने बजे आना चाहेंगे — सुबह, दोपहर, या शाम?';
+  }
+
+  lastHandledIntent = matchedIntent;
 
   log.info('ROUTER_DECISION', {
     intent: matchedIntent,

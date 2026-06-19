@@ -19,6 +19,8 @@ export type LatencyEvent =
   | 'barge_in'
   | 'llm_cancelled'
   | 'tts_cancelled'
+  | 'generation_cancelled'
+  | 'playback_interrupted'
   | 'call_end';
 
 /** Human-readable event names logged on every mark (one line per event). */
@@ -35,6 +37,8 @@ const EVENT_LABELS: Partial<Record<LatencyEvent, string>> = {
   barge_in:              'BargeInDetected',
   llm_cancelled:         'LLMCancelled',
   tts_cancelled:         'TTSCancelled',
+  generation_cancelled:  'GenerationCancelled',
+  playback_interrupted:  'PlaybackInterrupted',
 };
 
 const TURN_RESET_EVENTS: LatencyEvent[] = [
@@ -81,6 +85,10 @@ export class LatencyTracker {
 
   hasMarked(event: LatencyEvent): boolean {
     return this.marks.has(event);
+  }
+
+  getMarkTime(event: LatencyEvent): number | undefined {
+    return this.marks.get(event);
   }
 
   ms(from: LatencyEvent, to: LatencyEvent): number | null {
