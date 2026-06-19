@@ -130,15 +130,27 @@ export const Env = {
     //   short factual (price/location)      → tokensShort
     //   normal / amenities list / multi      → tokensNormal
     //   comparison / genuinely long          → tokensLong
-    tokensShort:  optionalInt('LLM_TOKENS_SHORT', 48),
-    tokensNormal: optionalInt('LLM_TOKENS_NORMAL', 96),
-    tokensLong:   optionalInt('LLM_TOKENS_LONG', 160),
+    // Sized so a normal reply NEVER truncates mid-sentence. The model often
+    // emits a list + an appended visit question in Devanagari (transliterated
+    // English nouns are very token-dense), which overflowed the old 64/80
+    // SHORT ceiling and cut off mid-word ("…क्या आप" → silence). These are
+    // CEILINGS, not targets — a price/location reply still finishes ~20 tokens
+    // in, so the higher cap is near-free for latency and only prevents cut-offs.
+    tokensShort:  optionalInt('LLM_TOKENS_SHORT', 128),
+    tokensNormal: optionalInt('LLM_TOKENS_NORMAL', 176),
+    tokensLong:   optionalInt('LLM_TOKENS_LONG', 256),
     // Lower temperature = more focused, faster sampling
     temperature: optionalFloat('LLM_TEMPERATURE', 0.3),
     topP: optionalFloat('LLM_TOP_P', 0.9),
-    // Speculative LLM generation from stable interims. Starts LLM+TTS
-    // on a stable interim before speech_final, saving ~150-300ms per turn.
-    // If speech_final differs, abort and restart. Safe with 4-gate validation.
+    // Speculative LLM generation from stable interims. Starts LLM+TTS on a
+    // stable interim before speech_final, overlapping the endpointing/
+    // utterance-end window (~850-1000ms) so the answer is ready the moment
+    // the caller stops talking.
+    // SAFE because speculative audio is GATED: it is held (never sent to Twilio)
+    // until speech_final confirms the text — on match it plays, on mismatch it
+    // is discarded silently. This removed the old mid-sentence-silence failure
+    // (aborting audible playback) while keeping the latency win. See
+    // CallOrchestrator beginSpeculativeHold / releaseSpeculativeAudio.
     speculationEnabled: optionalBool('LLM_SPECULATION_ENABLED', true),
     // Max conversation history messages sent to LLM. Caps context growth on long
     // calls — prevents TTFT degradation. 4 messages = 2 turns of context.
@@ -155,11 +167,11 @@ export const Env = {
       'LLM_SYSTEM_PROMPT',
       [
         '[ROLE] You are Arjun, a warm real OUTBOUND sales consultant at Akshay Vista, Pune (never an AI, never break character). Goal: book a site visit.',
-        'Speak natural Hinglish (Hindi in Devanagari, names/numbers in English; say "8 thousand"). Reply in ONE crisp sentence, ≤10 words, ≤1 question. Respond only to the latest message.',
+        'Reply in natural Hindi in Devanagari script, keeping proper names and common English nouns in English (gym, swimming pool, site visit). Write everything as it should be SPOKEN ALOUD: spell out units and avoid abbreviations (write "square feet", not "sqft"; "do BHK" spoken, not "2BHK"), keep numbers spoken (say "8 thousand"). NEVER use Roman-script Hindi (write ठीक है, not theek hai). Reply in ONE crisp sentence, ≤12 words, ≤1 question. Respond only to the latest message.',
         'ACKNOWLEDGEMENTS are auto-prepended by the system when appropriate — never start your reply with okay/sure/got it/right/great/thik hain or any filler. Never praise or use enthusiasm.',
         'Answer from [PROPERTY_FACTS] only — one key fact, never invent prices/sizes/dates/amenities. Answer exactly what was asked (budget→price, location→location).',
-        'If unclear/garbled, ask them to repeat. If the answer is not in [PROPERTY_FACTS], say you will confirm and get back — never "our team will guide you", never deflect to a visit, never make things up.',
-        'Mention a site visit or scheduling ONLY when [NEXT_ACTION] says so — otherwise never add a visit line, even after answering. For visit timing use only "today"/"tomorrow"/"this weekend"; never a specific calendar date, clock time, or "fixed/available" claim.',
+        'If unclear/garbled, ask them to repeat. If the answer is NOT in [PROPERTY_FACTS] (e.g. financing, loans, legal, possession paperwork), do NOT guess, invent, or claim you can explain it — say you do not have that detail and warmly invite them to visit the site where our team will help. Never make up prices/sizes/dates/amenities.',
+        'Mention a site visit or scheduling ONLY when [NEXT_ACTION] says so, OR when the answer is not in [PROPERTY_FACTS] (then invite a visit so the team can help) — otherwise never add a visit line, even after answering. For visit timing use only "today"/"tomorrow"/"this weekend"; never a specific calendar date, clock time, or "fixed/available" claim.',
         'Never say "और कुछ?"/"aur kuch?"/"anything else?" or any filler closing. If [SESSION_STATE] shows the caller declined a visit, never raise scheduling again.',
         'Use only ✓ info in [SESSION_STATE]; never re-ask it; address them by name once known. Do exactly what [NEXT_ACTION] says, nothing more. The opener already played — never greet again.',
       ].join('\n'),
@@ -196,6 +208,16 @@ export const Env = {
     temperature: optionalFloat('SARVAM_TEMPERATURE', 0.7),
   },
 
+  audio: {
+    // Raw mulaw bytes to buffer before starting Twilio playback (8000 B/s).
+    // This is a direct latency↔underrun tradeoff: every turn waits to
+    // accumulate this much audio before the bot is heard. 2400 B = 300ms,
+    // ~2× the worst observed inter-chunk gap (~140ms) — enough to ride out
+    // Sarvam jitter without the audible delay a deeper prime adds. Raise only
+    // if AUDIO_BUFFER_UNDERRUN / TTS_CHUNK_GAP start appearing in logs.
+    minBufferBytes: optionalInt('MIN_AUDIO_BUFFER_BYTES', 2400),
+  },
+
   humanization: {
     enabled: optionalBool('ENABLE_HUMANIZATION', true),
   },
@@ -206,9 +228,11 @@ export const Env = {
     cooldownMs: optionalInt('BARGEIN_COOLDOWN_MS', 300),
     // How long after TTS starts before any barge-in can fire.
     // 600ms was too short: PSTN echo (RMS ~32512) sustained for 597ms triggered it
-    // at 608ms — only 8ms past the grace period. 1500ms eliminates PSTN echo
-    // false triggers while still catching real interruptions after 1.5s of speech.
-    graceMs: optionalInt('BARGEIN_GRACE_MS', 1500),
+    // at 608ms — only 8ms past the grace period. 2500ms gives the bot a clean
+    // opening window: PSTN echo and the caller's own trailing audio cannot cut
+    // the response short in the first 2.5s; real interruptions still register
+    // after that. (Also gates STT echo-unmute — see muteSTTForEchoBurst.)
+    graceMs: optionalInt('BARGEIN_GRACE_MS', 2500),
   },
 
   sttWatchdog: {

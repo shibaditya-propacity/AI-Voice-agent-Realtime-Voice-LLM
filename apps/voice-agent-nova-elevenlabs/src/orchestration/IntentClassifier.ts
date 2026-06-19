@@ -150,6 +150,13 @@ export function classifyIntent(
   const hasImperative = IMPERATIVE_ACCEPT.test(lower) || IMPERATIVE_HI.test(trimmed);
 
   if (hasWillingness || hasImperative) {
+    // If the text also contains question markers, the willingness verb is part
+    // of a question construction (e.g. "amenities क्या करें" = "what about
+    // amenities?"), NOT an expression of willingness for a visit.
+    const hasQuestionMarker = QUESTION_MARKERS.test(lower) || trimmed.includes('?');
+    if (hasQuestionMarker) {
+      return { intent: 'QUESTION', confidence: 0.75, reason: 'question_with_willingness_verb' };
+    }
     // Willingness/imperative in visit context = visit intent
     if (context.lastAskedField === 'site_visit_interest' || inVisitScheduling) {
       return { intent: 'VISIT_INTENT', confidence: 0.9, reason: 'willingness_in_visit_context' };

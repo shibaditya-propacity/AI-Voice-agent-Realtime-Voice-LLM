@@ -29,6 +29,7 @@ import { DeepgramSTT } from '../stt/DeepgramSTT';
 import { BedrockLLM }  from '../llm/BedrockLLM';
 import { ElevenLabsTTS } from '../tts/ElevenLabsTTS';
 import { SarvamTTS } from '../tts/SarvamTTS';
+import { normalizeTTSText } from '../tts/TTSNormalizer';
 import { hasGreetingAudio, getGreetingChunks } from '../tts/GreetingCache';
 import { BargeInDetector } from '../interruption/BargeInDetector';
 import { ConversationManager } from '../llm/ConversationManager';
@@ -39,7 +40,7 @@ import { globalToolRegistry } from '../tools/ToolRegistry';
 import { maybeGetOpener } from '../shared/humanize';
 import { Env } from '../config/env';
 import { Logger, closeCallLogger } from '../shared/logger';
-import { routeQuery } from '../llm/KnowledgeRouter';
+import { routeQuery, resetLastRouterIntent } from '../llm/KnowledgeRouter';
 import type { StreamEvent } from '../llm/types';
 
 type CallState =
@@ -175,6 +176,57 @@ export class CallOrchestrator {
 
   /** Whether TTS generation is done (all chunks received from ElevenLabs). */
   private ttsGenerationDone = false;
+
+  // ─── TTS Chunk Gap Tracking (speech-gap diagnostics) ───────────────
+  /** Timestamp of the last TTS audio chunk received. */
+  private lastTTSChunkAt = 0;
+  /** Total TTS audio chunks received in the current generation. */
+  private ttsChunkCount = 0;
+  /** Maximum gap (ms) between consecutive TTS audio chunks. */
+  private maxTTSChunkGapMs = 0;
+  /** Last time BUFFER_DEPTH_MS was logged (throttle continuous depth telemetry). */
+  private lastBufferDepthLogAt = 0;
+
+  // ─── Minimum Audio Buffer (underrun prevention) ───────────────────
+  // Buffer initial TTS chunks until we have enough audio depth to survive
+  // gaps between TTS chunks. Once the threshold is met, drain the buffer
+  // and stream all subsequent chunks immediately.
+  /** Minimum raw audio bytes to buffer before starting Twilio playback.
+   *  Latency↔underrun tradeoff (every turn waits to accumulate this much
+   *  before the bot is heard). Env-tunable; default 2400 B = 300ms, ~2× the
+   *  worst observed inter-chunk gap. See Env.audio.minBufferBytes. */
+  private static readonly MIN_AUDIO_BUFFER_BYTES = Env.audio.minBufferBytes;
+  /** Buffered audio chunks waiting for minimum depth. */
+  private audioPreBuffer: string[] = [];
+  /** Whether the minimum buffer has been met and we're streaming live. */
+  private audioBufferPrimed = false;
+
+  // ─── Speculative audio gating ─────────────────────────────────────────
+  // When a generation is started speculatively from a stable interim, its
+  // audio is HELD (not sent to Twilio) until speech_final confirms the text.
+  // On confirm → release (play); on mismatch → discard silently. This gives
+  // the latency win of overlapping the endpointing window WITHOUT the
+  // mid-sentence silence that aborting audible playback used to cause.
+  /** Last-resort release if speech_final is dropped entirely. Sized far past
+   *  the realistic stable_interim→final gap (~2.7s) so it never beats a slow
+   *  real final. */
+  private static readonly SPECULATIVE_SAFETY_RELEASE_MS = 4500;
+
+  // ─── Booking-confirmation termination ─────────────────────────────────
+  /** Extra pad on the closing turn's playback estimate, covering Twilio
+   *  jitter-buffer + network latency the byte estimate can't see — so the
+   *  call is never declared "played" a beat before the caller hears the end. */
+  private static readonly CLOSING_PLAYBACK_MARGIN_MS = 600;
+  /** Grace after the confirmation fully drains before disconnecting. */
+  private static readonly POST_CONFIRMATION_GRACE_MS = 500;
+  /** True while the current generation is speculative and unconfirmed. */
+  private holdSpeculativeAudio = false;
+  /** TTS audio chunks held during speculation, in arrival order. */
+  private speculativeAudioHold: string[] = [];
+  /** TTS finished while still holding — replay handleTTSDone on release. */
+  private speculativeDonePending = false;
+  /** Safety release: if speech_final never arrives, play held audio anyway. */
+  private speculativeReleaseTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ─── STT Watchdog ─────────────────────────────────────────────────────
   // If SpeechStarted fires but no valid transcript arrives within
@@ -316,6 +368,7 @@ export class CallOrchestrator {
       clearTimeout(this.sttUnmuteTimer);
       this.sttUnmuteTimer = null;
     }
+    this.discardSpeculativeAudio();
     this.clearSilenceTimer();
     this.clearSTTWatchdog();
 
@@ -333,10 +386,11 @@ export class CallOrchestrator {
     this.log.info('Call orchestrator ended');
 
     // Hang up the Twilio call so the line disconnects cleanly.
-    // Small delay to let the final TTS audio finish playing on the caller's end.
+    // Delay to let the final TTS farewell finish playing on the caller's end.
+    // 4s accounts for Twilio jitter buffer + network delay + full farewell playback.
     setTimeout(() => {
       void this.twilioService.hangup(this.callSid);
-    }, 1500);
+    }, 4000);
 
     // Flush and close the per-call log file
     closeCallLogger(this.callSid);
@@ -531,6 +585,8 @@ export class CallOrchestrator {
     this.ttsAudioBytesSent = 0;
     this.firstTTSAudioSentAt = 0;
     this.ttsGenerationDone = false;
+    this.audioPreBuffer.length = 0;
+    this.audioBufferPrimed = false;
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
@@ -559,7 +615,23 @@ export class CallOrchestrator {
    * Filler/echo words that Deepgram produces from PSTN echo of the agent's
    * own TTS audio. These must NOT trigger interim barge-in.
    */
-  private static readonly ECHO_FILLER_PATTERN = /^(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh)(\s+(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh))*$/i;
+  private static readonly ECHO_FILLER_PATTERN = /^(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh|oh|uh-huh|ha|haan|okay|ok|hmm+)(\s+(mhmm|hmm|mm|uh|um|uhh|umm|hm|mmm|ah|huh|oh|uh-huh|ha|haan|okay|ok|hmm+))*[.!?]?$/i;
+
+  /**
+   * Minimum distinct words in an interim transcript before it can trigger
+   * barge-in during SPEAKING. Single-word interims are too often PSTN echo
+   * decoded as a short word ("hello", "yeah"). Requiring ≥2 words dramatically
+   * reduces false barge-ins while adding only ~100-200ms latency (Deepgram
+   * produces 2-word interims quickly once real speech starts).
+   */
+  private static readonly MIN_BARGEIN_WORDS = 2;
+
+  /**
+   * Minimum time (ms) after first TTS audio before interim barge-in is allowed.
+   * Early interims during the first 800ms of TTS playback are almost always
+   * PSTN echo of the agent's own speech being decoded by Deepgram.
+   */
+  private static readonly MIN_TTS_PLAY_BEFORE_BARGEIN_MS = 800;
 
   private handleInterimTranscript(text: string): void {
     if (!text.trim()) return;
@@ -582,14 +654,34 @@ export class CallOrchestrator {
     if (this.state !== 'SPEAKING') return;
     if (this.suppressBargeInArm) return; // greeting — no barge-in
 
+    const trimmed = text.trim();
+
     // Filter out filler/echo words — PSTN echo of agent TTS is often
     // transcribed as "Mhmm mhmm mhmm" by Deepgram. Not real speech.
-    if (CallOrchestrator.ECHO_FILLER_PATTERN.test(text.trim())) {
+    if (CallOrchestrator.ECHO_FILLER_PATTERN.test(trimmed)) {
       this.log.warn('FALSE_BARGEIN_REJECTED: interim is echo/filler during SPEAKING', { text });
       return;
     }
 
-    this.log.info('BargeInDetected (interim words during agent speech)', { text });
+    // Reject short interims — single-word transcripts during SPEAKING are
+    // overwhelmingly PSTN echo decoded as a word, not real user speech.
+    const wordCount = trimmed.split(/\s+/).length;
+    if (wordCount < CallOrchestrator.MIN_BARGEIN_WORDS) {
+      this.log.warn('FALSE_BARGEIN_REJECTED: too few words for interim barge-in', { text, wordCount });
+      return;
+    }
+
+    // Reject interims that arrive too early after TTS started playing —
+    // the first ~800ms of playback creates strong PSTN echo.
+    if (this.firstTTSAudioSentAt > 0) {
+      const msSinceTTSStart = Date.now() - this.firstTTSAudioSentAt;
+      if (msSinceTTSStart < CallOrchestrator.MIN_TTS_PLAY_BEFORE_BARGEIN_MS) {
+        this.log.warn('FALSE_BARGEIN_REJECTED: too early after TTS start', { text, msSinceTTSStart });
+        return;
+      }
+    }
+
+    this.log.info('BargeInDetected (interim words during agent speech)', { text, wordCount });
     this.handleInterruption();
   }
 
@@ -663,23 +755,35 @@ export class CallOrchestrator {
     // Record the speculative text so handleFinalTranscript can compare
     this.speculativeText = text.trim();
 
+    // Check if the stable interim mentions a visit — sets the guard flag
+    // so the visit-pitch guard doesn't strip LLM responses to user-initiated
+    // visit requests during speculative generation.
+    this.session.checkVisitMention(text.trim());
+
     // Add to conversation and start generating
     this.conversation.addUserMessage(text.trim());
     this.state = 'GENERATING';
+
+    // Hold all audio this speculative turn produces (direct-fact OR LLM) until
+    // speech_final confirms the text. generateAndSpeak() below must NOT clear
+    // this flag in its per-generation reset.
+    this.beginSpeculativeHold();
 
     this.log.info('Stable interim → speculative LLM handoff', {
       transcriptLenChars: text.trim().length,
     });
 
-    // Try deterministic scheduling response before LLM (zero tokens)
-    if (this.trySchedulingResponse()) {
-      return;
-    }
-
-    // Try zero-token fact response before invoking LLM
+    // Try zero-token fact response FIRST (handles factual Qs during scheduling too)
     if (this.tryDirectFactResponse(text.trim())) {
       return;
     }
+
+    // NOTE: Do NOT call trySchedulingResponse() in the speculative path.
+    // Scheduling responses need proper date/time extraction which only runs
+    // on final transcripts (extractFromUserTranscript). Without extraction,
+    // the scheduling prompt repeats asking for the day/time even when the
+    // user already said them (e.g. "today 7pm" → "कौन सा दिन?" 3x).
+    // Let the final transcript handle scheduling deterministically.
 
     void this.generateAndSpeak({ maxTokens: this.session.selectTokenBudget(text) });
   }
@@ -743,39 +847,58 @@ export class CallOrchestrator {
       const finalText = text.trim();
 
       if (finalText === specText && !conversationEndingThisTurn) {
-        // Exact match — generation already running, nothing to do.
+        // Exact match — generation already running, release its held audio.
         this.latency.recordSpeculation('confirmed_exact');
         this.log.info('Speculative generation CONFIRMED (exact match)', {
           text: specText,
           savedMs: Date.now() - transcriptAt,
         });
+        this.releaseSpeculativeAudio('confirmed_exact');
         return;
       }
 
-      // Prefix match: final text starts with the speculative text.
-      // The LLM already received the core intent — extra trailing words
-      // (like "project" after "what are the amenities of the") rarely
-      // change the response meaningfully. Keep the generation running.
-      if (finalText.startsWith(specText) && specText.length >= 8 && !conversationEndingThisTurn) {
-        const extraWords = finalText.slice(specText.length).trim();
+      // Containment match: the final transcript fully CONTAINS the speculative
+      // text (prefix, suffix, or interior). ASR routinely revises the leading
+      // words it had not finalized — e.g. interim "location क्या रहेगी" becomes
+      // final "और location क्या रहेगी" (a prepended word). The core intent the
+      // LLM is already answering is unchanged, so keep the generation running
+      // instead of aborting into mid-sentence silence. (Prefix-only matching
+      // missed the prepend case and needlessly invalidated.)
+      if (specText.length >= 8 && finalText.includes(specText) && !conversationEndingThisTurn) {
         this.latency.recordSpeculation('confirmed_prefix');
-        this.log.info('Speculative generation CONFIRMED (prefix match)', {
+        this.log.info('Speculative generation CONFIRMED (containment match)', {
           speculative: specText,
           final: finalText,
-          extraWords,
           savedMs: Date.now() - transcriptAt,
         });
         // Update the user message in history to reflect the complete text
         this.conversation.updateLastUserMessage(finalText);
+        this.releaseSpeculativeAudio('confirmed_containment');
         return;
       }
 
-      // Text differs — abort speculative generation and restart with real text.
+      // Text genuinely differs — abort the wrong speculation and regenerate.
+      // With audio gating, held speculative audio never reached Twilio, so this
+      // is INAUDIBLE (was_audible=false). It only becomes audible if the audio
+      // was already released (safety_timeout / confirmed) before the mismatch.
+      const wasAudible = this.ttsAudioBytesSent > 0;
+      this.discardSpeculativeAudio();
       this.latency.recordSpeculation('invalidated');
       this.log.warn('Speculative generation INVALIDATED — aborting', {
         speculative: specText,
         final: finalText,
+        GENERATION_OVERLAP: true,
+        was_audible: wasAudible,
       });
+      if (wasAudible) {
+        this.latency.mark('playback_interrupted');
+        this.log.warn('PLAYBACK_INTERRUPTED', {
+          reason: 'speculative_invalidated',
+          audio_bytes_played: this.ttsAudioBytesSent,
+          speculative: specText,
+          final: finalText,
+        });
+      }
       // Cancel in-flight LLM+TTS
       this.generationId++;
       if (this.abortController) {
@@ -795,12 +918,39 @@ export class CallOrchestrator {
     // Transcript-gated barge-in: if the agent is still speaking, a real
     // transcript (not just VAD) is the authoritative signal to interrupt.
     // This avoids false barge-ins from background noise on PSTN.
+    //
+    // GUARD: Do NOT fire barge-in if zero audio bytes have been sent to
+    // Twilio. The user hasn't heard anything yet — there's nothing to
+    // "interrupt". Firing barge-in here would discard a perfectly good
+    // response the user never heard, causing silence. Instead, let the
+    // new transcript replace the generation naturally below.
     if (this.state === 'SPEAKING' || this.state === 'GENERATING') {
-      this.log.info('Transcript-gated barge-in: real speech confirmed during agent speech', {
-        text,
-        state: this.state,
-      });
-      this.handleInterruption();
+      if (this.ttsAudioBytesSent === 0) {
+        this.log.info('Barge-in SKIPPED: no audio sent yet — user heard nothing', {
+          text,
+          state: this.state,
+          generationId: this.generationId,
+        });
+        // Don't fire handleInterruption — fall through to start a fresh
+        // generation below. The old generation's audio will be discarded
+        // by the genId guard when it eventually arrives.
+        this.generationId++;
+        if (this.abortController) {
+          this.abortController.abort();
+          this.abortController = null;
+        }
+        this.tts.abort();
+        this.conversation.discardLastAssistantMessage();
+        resetLastRouterIntent();
+        this.state = 'LISTENING';
+        this.ensureSTTUnmuted();
+      } else {
+        this.log.info('Transcript-gated barge-in: real speech confirmed during agent speech', {
+          text,
+          state: this.state,
+        });
+        this.handleInterruption();
+      }
     }
 
     // handleInterruption or end() may have changed state
@@ -823,13 +973,16 @@ export class CallOrchestrator {
       transcriptToLlmMs: Date.now() - transcriptAt,
     });
 
-    // Try deterministic scheduling response before LLM (zero tokens)
-    if (this.trySchedulingResponse()) {
+    // Try zero-token fact response FIRST — this handles factual questions
+    // even during scheduling steps (appending the scheduling re-prompt).
+    if (this.tryDirectFactResponse(text)) {
       return;
     }
 
-    // Try zero-token fact response before invoking LLM
-    if (this.tryDirectFactResponse(text)) {
+    // Try deterministic scheduling response (zero tokens) — only fires
+    // when KnowledgeRouter didn't handle it (user provided a date/time,
+    // not a factual question).
+    if (this.trySchedulingResponse()) {
       return;
     }
 
@@ -870,6 +1023,8 @@ export class CallOrchestrator {
     this.ttsAudioBytesSent = 0;
     this.firstTTSAudioSentAt = 0;
     this.ttsGenerationDone = false;
+    this.audioPreBuffer.length = 0;
+    this.audioBufferPrimed = false;
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
@@ -904,9 +1059,7 @@ export class CallOrchestrator {
     });
 
     // Check for conversation-ending state
-    if (this.session.shouldEndCall && !this.conversationComplete) {
-      this.conversationComplete = true;
-    }
+    if (this.session.shouldEndCall) this.markConfirmationComplete();
 
     tts.flush();
     return true;
@@ -936,6 +1089,8 @@ export class CallOrchestrator {
     this.ttsAudioBytesSent = 0;
     this.firstTTSAudioSentAt = 0;
     this.ttsGenerationDone = false;
+    this.audioPreBuffer.length = 0;
+    this.audioBufferPrimed = false;
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
@@ -963,14 +1118,7 @@ export class CallOrchestrator {
     });
 
     // Check for conversation-ending state
-    if (this.session.shouldEndCall && !this.conversationComplete) {
-      this.conversationComplete = true;
-      this.log.info('Conversation complete — booking confirmed by session state', {
-        date: this.session.info.preferredDate,
-        time: this.session.info.preferredTime,
-        bookingStatus: this.session.bookingStatus,
-      });
-    }
+    if (this.session.shouldEndCall) this.markConfirmationComplete();
 
     tts.flush();
     return true;
@@ -986,6 +1134,19 @@ export class CallOrchestrator {
       return;
     }
 
+    // ── Abort any in-flight generation to prevent overlapping streams ──
+    // Without this, two concurrent LLM→TTS streams can race, causing
+    // interleaved audio chunks and mid-sentence silence.
+    if (this.abortController) {
+      this.log.warn('GENERATION_OVERLAP: aborting previous generation before starting new one', {
+        previousGenId: this.generationId,
+      });
+      this.abortController.abort();
+      this.abortController = null;
+      this.tts.abort();
+      this.twilioService.clearAudio(this.callSid);
+    }
+
     const myGenId = ++this.generationId;
     this.activeResponseText = '';
 
@@ -993,6 +1154,9 @@ export class CallOrchestrator {
     this.ttsAudioBytesSent = 0;
     this.firstTTSAudioSentAt = 0;
     this.ttsGenerationDone = false;
+    this.audioPreBuffer.length = 0;
+    this.audioBufferPrimed = false;
+    this.lastBufferDepthLogAt = 0;
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
@@ -1064,6 +1228,22 @@ export class CallOrchestrator {
     let headFlushed = false;
     let headStartedAt = 0;
 
+    // ── Post-head token accumulator ──────────────────────────────────────
+    // After the head segment flushes, individual LLM tokens (1-5 chars each)
+    // trickle in. Sarvam needs ≥30 chars to start synthesis, so sending
+    // individual tokens causes a gap between first and second audio chunks.
+    // We accumulate post-head tokens and flush at sentence boundaries or
+    // when the buffer is large enough for TTS to act on.
+    const POST_HEAD_FLUSH_CHARS = 25; // slightly below Sarvam's 30-char min
+    let postHeadBuffer = '';
+
+    const flushPostHead = (): void => {
+      if (postHeadBuffer) {
+        tts.streamText(postHeadBuffer);
+        postHeadBuffer = '';
+      }
+    };
+
     const flushHead = (): void => {
       if (headFlushed) return;
       headFlushed = true;
@@ -1118,8 +1298,13 @@ export class CallOrchestrator {
             const overTime = Date.now() - headStartedAt >= HEAD_TIME_CAP_MS;
             if (atBoundary || overChars || overTime) flushHead();
           } else {
-            // Leading segment already cleared — stream every later token live.
-            tts.streamText(text);
+            // Accumulate post-head tokens into phrase-sized chunks to avoid
+            // TTS buffer starvation (Sarvam needs ≥30 chars to start synthesis).
+            postHeadBuffer += text;
+            const atSentenceBoundary = /[.?!।,\n]/.test(text);
+            if (atSentenceBoundary || postHeadBuffer.length >= POST_HEAD_FLUSH_CHARS) {
+              flushPostHead();
+            }
           }
         } else if (event.type === 'done') {
           const d = event as Extract<StreamEvent, { type: 'done' }>;
@@ -1130,6 +1315,10 @@ export class CallOrchestrator {
       // Short reply that never tripped a boundary/cap: flush the held segment.
       if (!headFlushed && (myGenId === this.generationId) && !signal.aborted) {
         flushHead();
+      }
+      // Drain any remaining post-head tokens before final TTS flush.
+      if (myGenId === this.generationId && !signal.aborted) {
+        flushPostHead();
       }
     } catch (err) {
       const e = err as Error;
@@ -1202,23 +1391,77 @@ export class CallOrchestrator {
       }
 
       this.conversation.addAssistantText(fullText);
+      // LLM handled this turn — reset the router's repeat guard so the next
+      // same-intent question gets the canned response instead of LLM again.
+      resetLastRouterIntent();
       this.log.info('LLM generation complete', { responseLength: fullText.length, response: fullText });
+      // Turn-level pronunciation audit: full LLM text vs. the canonical
+      // normalized form sent to TTS. Per-chunk normalization (boundary-safe)
+      // happens in SarvamTTS; this is the readable before/after for the turn.
+      this.log.info('TTS_NORMALIZATION', {
+        ORIGINAL_LLM_TEXT: fullText,
+        NORMALIZED_TTS_TEXT: normalizeTTSText(fullText),
+      });
 
       // State-aware completion: session state tracks whether all info
       // is collected AND the LLM confirmed the booking. This replaces
       // the old regex-only approach that could false-trigger.
-      if (this.session.shouldEndCall && !this.conversationComplete) {
-        this.conversationComplete = true;
-        this.log.info('Conversation complete — booking confirmed by session state', {
-          date: this.session.info.preferredDate,
-          time: this.session.info.preferredTime,
-          bookingStatus: this.session.bookingStatus,
-        });
-      }
+      if (this.session.shouldEndCall) this.markConfirmationComplete();
     }
 
     tts.flush();
     this.abortController = null;
+  }
+
+  // ─── Speculative audio gating ─────────────────────────────────────────
+
+  /** Begin holding TTS audio for a speculative generation. */
+  private beginSpeculativeHold(): void {
+    this.holdSpeculativeAudio = true;
+    this.speculativeAudioHold.length = 0;
+    this.speculativeDonePending = false;
+    if (this.speculativeReleaseTimer) clearTimeout(this.speculativeReleaseTimer);
+    // Safety net for a GENUINELY DROPPED speech_final only. It must NOT beat a
+    // real (merely slow) speech_final, or it releases audio that a later
+    // mismatch then cuts mid-sentence (observed: stable_interim→final gaps run
+    // up to ~2.7s when the caller pauses, e.g. "ठीक है … friday को"). So this is
+    // sized far past the realistic max gap; on a true drop the held answer waits
+    // this long (rare, acceptable) instead of being lost.
+    this.speculativeReleaseTimer = setTimeout(
+      () => this.releaseSpeculativeAudio('safety_timeout'),
+      CallOrchestrator.SPECULATIVE_SAFETY_RELEASE_MS,
+    );
+  }
+
+  /** speech_final confirmed the speculation — play the held audio now. */
+  private releaseSpeculativeAudio(reason: string): void {
+    if (!this.holdSpeculativeAudio) return;
+    this.holdSpeculativeAudio = false;
+    if (this.speculativeReleaseTimer) {
+      clearTimeout(this.speculativeReleaseTimer);
+      this.speculativeReleaseTimer = null;
+    }
+    const held = this.speculativeAudioHold;
+    this.speculativeAudioHold = [];
+    const genId = this.generationId;
+    this.log.info('Speculative audio RELEASED', { reason, held_chunks: held.length });
+    // Replay through the normal path: prime (≥500ms) then stream live.
+    for (const chunk of held) this.handleTTSAudio(chunk, genId);
+    if (this.speculativeDonePending) {
+      this.speculativeDonePending = false;
+      this.handleTTSDone(genId);
+    }
+  }
+
+  /** speech_final differed (or barge-in/overlap) — drop held audio silently. */
+  private discardSpeculativeAudio(): void {
+    if (this.speculativeReleaseTimer) {
+      clearTimeout(this.speculativeReleaseTimer);
+      this.speculativeReleaseTimer = null;
+    }
+    this.holdSpeculativeAudio = false;
+    this.speculativeDonePending = false;
+    this.speculativeAudioHold.length = 0;
   }
 
   // ─── TTS Output ───────────────────────────────────────────────────────────
@@ -1228,10 +1471,24 @@ export class CallOrchestrator {
     if (genId !== this.generationId) return;
     if (this.state === 'ENDED') return;
 
+    // Speculative gating: hold audio until speech_final confirms the text.
+    // Nothing reaches Twilio (and ttsAudioBytesSent stays 0) so an
+    // invalidation is inaudible rather than a mid-sentence cut.
+    if (this.holdSpeculativeAudio) {
+      this.speculativeAudioHold.push(audioBase64);
+      return;
+    }
+
+    const now = Date.now();
+
     if (!this.latency.hasMarked('tts_first_audio')) {
       this.latency.mark('tts_first_audio');
-      this.firstTTSAudioSentAt = Date.now();
-      this.log.info('TTS first audio chunk received');
+      this.lastTTSChunkAt = now;
+      this.ttsChunkCount = 1;
+      this.maxTTSChunkGapMs = 0;
+      this.log.info('TTS_FIRST_CHUNK', {
+        tts_first_chunk_ms: now - (this.latency.getMarkTime('llm_start') ?? now),
+      });
 
       // Arm barge-in HERE — not at generation start — so that trailing audio
       // frames from the user's own completed speech cannot trigger a false
@@ -1240,22 +1497,116 @@ export class CallOrchestrator {
       if (!this.suppressBargeInArm) {
         this.bargeIn.arm();
       }
+    } else {
+      // Track inter-chunk gaps — large gaps cause audible silence
+      const gapMs = now - this.lastTTSChunkAt;
+      this.ttsChunkCount++;
+      this.lastTTSChunkAt = now;
+      if (gapMs > this.maxTTSChunkGapMs) this.maxTTSChunkGapMs = gapMs;
+
+      // Live buffer depth = audio we've handed Twilio minus what's been played.
+      // Negative ⇒ Twilio ran out of audio before the next chunk arrived
+      // (an underrun = the audible mid-sentence gap).
+      const bufferDepthMs = this.audioBufferPrimed
+        ? Math.round((this.ttsAudioBytesSent / 8000) * 1000 - (now - this.firstTTSAudioSentAt))
+        : Math.round((this.ttsAudioBytesSent / 8000) * 1000);
+
+      // Continuous depth telemetry, throttled to ~250ms so it doesn't flood.
+      if (now - this.lastBufferDepthLogAt >= 250) {
+        this.lastBufferDepthLogAt = now;
+        this.log.info('BUFFER_DEPTH_MS', {
+          buffer_depth_ms: bufferDepthMs,
+          chunk_index: this.ttsChunkCount,
+          last_gap_ms: gapMs,
+        });
+      }
+
+      // Explicit underrun signal: buffer drained while audio is still flowing.
+      if (this.audioBufferPrimed && bufferDepthMs <= 0) {
+        this.log.warn('AUDIO_BUFFER_UNDERRUN', {
+          buffer_depth_ms: bufferDepthMs,
+          gap_ms: gapMs,
+          chunk_index: this.ttsChunkCount,
+        });
+      }
+
+      // Log warning for gaps that would cause audible buffer underrun.
+      // Twilio's jitter buffer is ~200ms — gaps beyond that cause silence.
+      if (gapMs > 200) {
+        this.log.warn('TTS_CHUNK_GAP', {
+          gap_ms: gapMs,
+          chunk_index: this.ttsChunkCount,
+          audio_buffer_depth_ms: bufferDepthMs,
+        });
+      }
     }
 
     // Track raw audio bytes for playback duration estimation.
     // Base64 encodes 3 bytes into 4 chars → raw bytes = base64.length * 0.75
-    this.ttsAudioBytesSent += Math.floor(audioBase64.length * 0.75);
+    const rawBytes = Math.floor(audioBase64.length * 0.75);
+    this.ttsAudioBytesSent += rawBytes;
 
-    // ElevenLabs ulaw_8000 base64 → send directly to Twilio (same format, zero conversion)
-    this.twilioService.sendAudio(this.callSid, audioBase64);
-
-    if (!this.latency.hasMarked('twilio_playback_start')) {
-      this.latency.mark('twilio_playback_start');
+    // ── Minimum audio buffer: hold initial chunks until we have enough
+    // audio depth to survive inter-chunk gaps. Once primed, stream live.
+    if (!this.audioBufferPrimed) {
+      this.audioPreBuffer.push(audioBase64);
+      let bufferedBytes = 0;
+      for (const chunk of this.audioPreBuffer) {
+        bufferedBytes += Math.floor(chunk.length * 0.75);
+      }
+      if (bufferedBytes >= CallOrchestrator.MIN_AUDIO_BUFFER_BYTES) {
+        // Drain the buffer — enough audio to survive initial gaps
+        this.audioBufferPrimed = true;
+        this.firstTTSAudioSentAt = Date.now();
+        for (const chunk of this.audioPreBuffer) {
+          this.twilioService.sendAudio(this.callSid, chunk);
+        }
+        this.audioPreBuffer.length = 0;
+        if (!this.latency.hasMarked('twilio_playback_start')) {
+          this.latency.mark('twilio_playback_start');
+        }
+        this.log.info('AUDIO_BUFFER_PRIMED', {
+          buffered_bytes: bufferedBytes,
+          buffered_chunks: this.ttsChunkCount,
+          buffer_depth_ms: Math.round((bufferedBytes / 8000) * 1000),
+        });
+      }
+    } else {
+      // Buffer is primed — stream directly to Twilio
+      this.twilioService.sendAudio(this.callSid, audioBase64);
+      if (!this.latency.hasMarked('twilio_playback_start')) {
+        this.latency.mark('twilio_playback_start');
+      }
     }
   }
 
   private handleTTSDone(genId: number): void {
     if (genId !== this.generationId) return;
+
+    // Still holding speculative audio — defer completion until release so we
+    // don't compute playback timers / transition to LISTENING on zero bytes.
+    if (this.holdSpeculativeAudio) {
+      this.speculativeDonePending = true;
+      return;
+    }
+
+    // ── Drain audio pre-buffer if it never met the minimum threshold ──
+    // Very short TTS responses may not produce enough audio to prime the buffer.
+    // Send whatever we have so the caller hears something.
+    if (!this.audioBufferPrimed && this.audioPreBuffer.length > 0) {
+      this.audioBufferPrimed = true;
+      this.firstTTSAudioSentAt = Date.now();
+      for (const chunk of this.audioPreBuffer) {
+        this.twilioService.sendAudio(this.callSid, chunk);
+      }
+      this.log.info('AUDIO_BUFFER_FORCE_DRAIN (TTS done, buffer under threshold)', {
+        chunks: this.audioPreBuffer.length,
+      });
+      this.audioPreBuffer.length = 0;
+      if (!this.latency.hasMarked('twilio_playback_start')) {
+        this.latency.mark('twilio_playback_start');
+      }
+    }
 
     this.latency.mark('tts_complete');
     this.ttsGenerationDone = true;
@@ -1271,11 +1622,20 @@ export class CallOrchestrator {
       elapsedMs: Math.round(elapsedMs),
       remainingMs: Math.round(remainingMs),
       audioBytes: this.ttsAudioBytesSent,
+      tts_chunks: this.ttsChunkCount,
+      max_chunk_gap_ms: this.maxTTSChunkGapMs,
+      audio_buffer_depth_ms: Math.round(totalPlaybackMs - elapsedMs),
     });
 
     this.latency.logTurnSummary(this.conversation.currentTurn);
 
-    if (remainingMs <= 0) {
+    // On the closing/booking turn, pad the estimate so we never declare
+    // playback finished before the caller has actually heard the full
+    // acknowledgement (Twilio jitter buffer + network add unobservable delay).
+    const closingMargin = this.conversationComplete ? CallOrchestrator.CLOSING_PLAYBACK_MARGIN_MS : 0;
+    const waitMs = remainingMs + closingMargin;
+
+    if (waitMs <= 0) {
       // Playback already finished (very short response)
       this.transitionToListeningAfterPlayback(genId);
       return;
@@ -1288,7 +1648,7 @@ export class CallOrchestrator {
       if (genId === this.generationId) {
         this.transitionToListeningAfterPlayback(genId);
       }
-    }, remainingMs);
+    }, waitMs);
   }
 
   /**
@@ -1304,10 +1664,19 @@ export class CallOrchestrator {
     if (this.state === 'ENDED') return;
 
     // Terminal state: conversation is complete (site visit scheduled).
-    // End the call cleanly after the final acknowledgement played.
+    // The booking acknowledgement has now FULLY played — only here do we move
+    // to the terminal BOOKED phase, wait a grace, then disconnect, so the
+    // caller always hears the complete confirmation before the line drops.
     if (this.conversationComplete) {
-      this.log.info('Playback complete — conversation complete, ending call');
-      void this.end();
+      this.log.info('PLAYBACK_COMPLETED', {
+        audio_bytes: this.ttsAudioBytesSent,
+        tts_generation_done: this.ttsGenerationDone,
+      });
+      this.log.info('VISIT_CONFIRMATION_PLAYED', {
+        date: this.session.info.preferredDate,
+        time: this.session.info.preferredTime,
+      });
+      this.finalizeAfterConfirmation(genId);
       return;
     }
 
@@ -1324,6 +1693,54 @@ export class CallOrchestrator {
 
     // Start silence timer — if caller doesn't speak within SILENCE_TIMEOUT_MS, reprompt.
     this.startSilenceTimer();
+  }
+
+  /**
+   * Booking confirmation was generated and is now playing toward the caller.
+   * Marks the call complete and signals that termination must wait for this
+   * audio to fully drain (handled in transitionToListeningAfterPlayback).
+   */
+  private markConfirmationComplete(): void {
+    if (this.conversationComplete) return;
+    this.conversationComplete = true;
+    this.log.info('VISIT_CONFIRMATION_STARTED', {
+      date: this.session.info.preferredDate,
+      time: this.session.info.preferredTime,
+      bookingStatus: this.session.bookingStatus,
+    });
+  }
+
+  /**
+   * The booking acknowledgement has fully drained. Apply a short grace so the
+   * final syllables clear Twilio's buffer, then disconnect. Re-checks that no
+   * TTS audio is still queued/generating first — we NEVER hang up mid-audio.
+   */
+  private finalizeAfterConfirmation(genId: number): void {
+    if (this.state === 'ENDED') return;
+    if (genId !== this.generationId) return;
+
+    // Guard: never terminate while audio is still in flight (generating,
+    // pre-buffered but unsent, or held for speculation). Re-poll until drained.
+    if (!this.ttsGenerationDone || this.audioPreBuffer.length > 0 || this.holdSpeculativeAudio) {
+      this.log.warn('Termination deferred — TTS audio still in flight', {
+        tts_generation_done: this.ttsGenerationDone,
+        prebuffered_chunks: this.audioPreBuffer.length,
+        holding_speculative: this.holdSpeculativeAudio,
+      });
+      setTimeout(() => this.finalizeAfterConfirmation(genId), 250);
+      return;
+    }
+
+    this.log.info('CALL_TERMINATION_DELAY', { delay_ms: CallOrchestrator.POST_CONFIRMATION_GRACE_MS });
+    setTimeout(() => {
+      if (this.state === 'ENDED') return;
+      this.log.info('CALL_ENDED_AFTER_CONFIRMATION', {
+        date: this.session.info.preferredDate,
+        time: this.session.info.preferredTime,
+        bookingStatus: this.session.bookingStatus,
+      });
+      void this.end();
+    }, CallOrchestrator.POST_CONFIRMATION_GRACE_MS);
   }
 
   /** Start a timer that reprompts if caller is silent for SILENCE_TIMEOUT_MS. */
@@ -1414,7 +1831,10 @@ export class CallOrchestrator {
       audioBytesSent: this.ttsAudioBytesSent,
     });
     this.latency.mark('barge_in');
+    this.latency.mark('playback_interrupted');
+    this.latency.mark('generation_cancelled');
     this.speculativeText = null;
+    this.discardSpeculativeAudio();
 
     // Cancel playback-complete timer (barge-in supersedes it)
     if (this.playbackCompleteTimer) {
@@ -1446,6 +1866,11 @@ export class CallOrchestrator {
 
     this.state = 'LISTENING';
     this.ensureSTTUnmuted();
+
+    // Reset the router repeat guard — user didn't fully hear the canned response,
+    // so the same fact question should get the canned response again, not LLM.
+    resetLastRouterIntent();
+
     this.log.info('Barge-in handled — back to LISTENING');
 
     // Dead-air guard: a barge-in is normally followed by a real transcript that

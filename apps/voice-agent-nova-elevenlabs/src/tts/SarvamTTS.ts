@@ -19,6 +19,7 @@
 import WebSocket from 'ws';
 import { Env } from '../config/env';
 import { Logger } from '../shared/logger';
+import { normalizeTTSText } from './TTSNormalizer';
 import type { OnTTSError } from './types';
 
 const SARVAM_WS_BASE = 'wss://api.sarvam.ai/text-to-speech/ws';
@@ -57,6 +58,15 @@ export class SarvamTTS {
   /** Latency tracking. */
   private turnStartTime = 0;
   private firstAudioReceived = false;
+
+  /**
+   * Stale audio guard: after abort(), Sarvam's drain flush may still produce
+   * audio chunks from the OLD generation. If startTurn() is called before
+   * those chunks finish, they'd be accepted under the NEW contextId — causing
+   * a "speaks, goes silent, speaks again" glitch (stale snippet → gap → real audio).
+   * This flag is false until text is actually sent for the current turn.
+   */
+  private textSentThisTurn = false;
 
   constructor(callSid: string) {
     this.log = Logger.forCall(callSid, 'SarvamTTS');
@@ -114,10 +124,8 @@ export class SarvamTTS {
           this.pendingFlush = false;
           // Drain preSendBuffer before flush — text queued via streamText()
           // went through sendText() which only accumulates into preSendBuffer.
-          if (this.preSendBuffer) {
-            this.send({ type: 'text', data: { text: this.ensureHindiCompat(this.preSendBuffer) } });
-            this.preSendBuffer = '';
-          }
+          this.drainPreSendBuffer();
+          this.textSentThisTurn = true;
           this.sendFlush();
           this.log.debug('Sarvam deferred flush sent (with buffered text)');
         }
@@ -178,6 +186,7 @@ export class SarvamTTS {
     this.turnStartTime = Date.now();
     this.preSendBuffer = '';
     this.hindiInjectedThisTurn = false;
+    this.textSentThisTurn = false;
 
     if (this.state !== 'open') {
       // Ensure we're connecting; text will drain from queue once open.
@@ -206,10 +215,8 @@ export class SarvamTTS {
       return;
     }
     // Drain any buffered text before flushing
-    if (this.preSendBuffer) {
-      this.send({ type: 'text', data: { text: this.ensureHindiCompat(this.preSendBuffer) } });
-      this.preSendBuffer = '';
-    }
+    this.drainPreSendBuffer();
+    this.textSentThisTurn = true;
     this.sendFlush();
     this.log.debug('Sarvam flush sent');
   }
@@ -319,6 +326,33 @@ export class SarvamTTS {
     return 'तो, ' + text;
   }
 
+  /**
+   * Single pre-synthesis choke point: every text chunk bound for Sarvam passes
+   * through here. Applies TTS normalization (abbreviation expansion, filler
+   * removal, Devanagari↔English fixes) BEFORE ensureHindiCompat, then sends.
+   * Logs ORIGINAL_TTS_CHUNK → NORMALIZED_TTS_CHUNK when normalization changed
+   * the text. No-ops on empty/whitespace input (e.g. a chunk that was pure filler).
+   */
+  private sendNormalizedText(raw: string): void {
+    const normalized = normalizeTTSText(raw);
+    if (normalized !== raw) {
+      this.log.debug('TTS chunk normalized', {
+        ORIGINAL_TTS_CHUNK: raw,
+        NORMALIZED_TTS_CHUNK: normalized,
+      });
+    }
+    if (!normalized) return;
+    this.textSentThisTurn = true;
+    this.send({ type: 'text', data: { text: this.ensureHindiCompat(normalized) } });
+  }
+
+  /** Drain whatever is buffered (called before flush / on socket open). */
+  private drainPreSendBuffer(): void {
+    if (!this.preSendBuffer) return;
+    this.sendNormalizedText(this.preSendBuffer);
+    this.preSendBuffer = '';
+  }
+
   private sendText(text: string): void {
     this.preSendBuffer += text;
 
@@ -326,8 +360,15 @@ export class SarvamTTS {
     // start synthesis in parallel with ongoing LLM token streaming.
     // This reduces first-audio latency by ~100-200ms on longer responses.
     if (this.preSendBuffer.length >= this.PRE_SEND_THRESHOLD) {
-      this.send({ type: 'text', data: { text: this.ensureHindiCompat(this.preSendBuffer) } });
-      this.preSendBuffer = '';
+      // Split only at the last whitespace so multi-character tokens that
+      // normalization targets (BHK, sqft, EV, project/builder names) are never
+      // cut across two sends — a split token would slip past the normalizer.
+      // The trailing partial word stays buffered for the next chunk / flush.
+      const lastSpace = this.preSendBuffer.lastIndexOf(' ');
+      if (lastSpace <= 0) return; // no safe split point yet — keep buffering
+      const ready = this.preSendBuffer.slice(0, lastSpace);
+      this.preSendBuffer = this.preSendBuffer.slice(lastSpace + 1);
+      this.sendNormalizedText(ready);
     }
   }
 
@@ -350,6 +391,13 @@ export class SarvamTTS {
 
     // Drop audio/events if no active context (stale from pre-barge-in)
     if (!this.activeContextId) return;
+
+    // Stale audio guard: after abort() → startTurn(), residual audio from the
+    // old Sarvam generation arrives before we've sent any new text. Discard it.
+    if (!this.textSentThisTurn) {
+      this.log.debug('Discarding stale audio (no text sent yet this turn)', { contextId: this.activeContextId });
+      return;
+    }
 
     if (data.type === 'audio' && data.data?.audio) {
       if (!this.firstAudioReceived) {
