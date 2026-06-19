@@ -10,6 +10,7 @@ import { rootLogger } from './shared/logger';
 import { createApp } from './app';
 import { warmUpBedrock } from './llm/BedrockLLM';
 import { loadGreetingAudio } from './tts/GreetingCache';
+import { loadAckClips } from './tts/AckCache';
 
 const log = rootLogger;
 
@@ -26,6 +27,9 @@ async function main(): Promise<void> {
 
   // Load pre-recorded greeting audio (raw ulaw 8kHz mono)
   loadGreetingAudio('./assets/greet.raw');
+
+  // Load latency-masking acknowledgement clips (raw ulaw 8kHz mono)
+  loadAckClips('./assets/ack');
 
   const { httpServer, shutdown } = createApp();
 

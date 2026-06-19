@@ -55,8 +55,8 @@ const AFFIRM_ROMANIZED = /\b(haan(ji)?|han(ji)?|ji(\s*haan)?|zaroor|bilkul|pakka
 
 // Family 2: Willingness constructions — "I want to", "dekhna chahta hoon"
 const WILLINGNESS_EN = /\b(i('d|\s+would)\s+like\s+to|i\s+want\s+to|i('m|\s+am)\s+(ready|willing|interested)|let'?s\s+(do|go|see|visit|schedule|book)|sounds?\s+good|i('m|\s+am)\s+in|count\s+me\s+in|go\s+ahead|do\s+it)\b/i;
-const WILLINGNESS_HI = /(चाह(ता|ती|ूँ|ूंगा|ेंगे|िए|ते)\s*(ह(ूँ|ूं|ैं))?|देख(ना|ने|ते|ूँगा|ेंगे|ूंगा)\s*(है|हैं|चाह)?|कर(ना|ने|ें|ो|ते)\s*(है|हैं|चाह)?)/;
-const WILLINGNESS_ROMAN = /\b(chah(ta|ti|unga|enge|iye|te)|dekh(na|ne|te|unga|enge)\s*(hai|chahta|chahunga)?|kar(na|ne|en|o|te)\s*(hai|chahta)?)\b/i;
+const WILLINGNESS_HI = /(चाह(ता|ती|ूँ|ूंगा|ेंगे|िए|ते)\s*(ह(ूँ|ूं|ैं))?|देख(ना|ने|ते|ूँगा|ेंगे|ूंगा)\s*(है|हैं|चाह)?|कर(ना|ने|ें|ो|ते)\s*(है|हैं|चाह)?|कर\s*सकते)/;
+const WILLINGNESS_ROMAN = /\b(chah(ta|ti|unga|enge|iye|te)|dekh(na|ne|te|unga|enge)\s*(hai|chahta|chahunga)?|kar(na|ne|en|o|te)\s*(hai|chahta|sakte)?|kar\s*sakte)\b/i;
 
 // Family 3: Imperative acceptance — "book kar do", "schedule karo", "fix it"
 const IMPERATIVE_ACCEPT = /\b(book|schedule|fix|confirm|proceed|arrange)\s*(it|kar|karo|कर|करो|कर\s*दो|kr)\b/i;
@@ -83,8 +83,8 @@ const VISIT_REJECT_ROMAN = /\b(visit\s+nahi|nahi\s+.*visit|abhi\s+nahi|baad\s+me
 // User explicitly wants to visit or schedule.
 
 const VISIT_EXPLICIT = /\b(visit|schedule|book\s*(a\s+)?(visit|appointment)|come\s+(see|visit|look)|want\s+to\s+(see|visit|come)|show\s+me)\b/i;
-const VISIT_EXPLICIT_HI = /(देखना|देखने|देखेंगे|देख\s*लेते|विज़िट|विजिट|साइट\s*विज़िट|साइट\s*विजिट|site\s*visit)/;
-const VISIT_EXPLICIT_ROMAN = /\b(dekhna|dekhne|dekhenge|dekh\s*lete|site\s*visit|visit\s*(karna|karenge|karunga|karte)|chal(enge|te|o)\s*(dekhte|dekhne))\b/i;
+const VISIT_EXPLICIT_HI = /(देखना|देखने|देखेंगे|देख\s*लेते|विज़िट|विजिट|साइट\s*विज़िट|साइट\s*विजिट|site\s*visit|बुक\s*कर)/;
+const VISIT_EXPLICIT_ROMAN = /\b(dekhna|dekhne|dekhenge|dekh\s*lete|site\s*visit|visit\s*(karna|karenge|karunga|karte)|chal(enge|te|o)\s*(dekhte|dekhne)|kar\s*sakte|book\s*kar)\b/i;
 
 // ── Question Indicators ──────────────────────────────────────────────────────
 
@@ -106,10 +106,20 @@ export function classifyIntent(
     currentStep: ConversationStep;
     hasDate: boolean;
     hasTime: boolean;
+    /** A budget figure was mentioned in THIS utterance (e.g. "10 lakh"). */
+    hasBudget?: boolean;
+    /** A BHK preference was mentioned in THIS utterance (e.g. "2 BHK"). */
+    hasBhk?: boolean;
   },
 ): ClassifiedIntent {
   const trimmed = text.trim();
   const lower = trimmed.toLowerCase();
+
+  // Substantive NON-scheduling entities supplied this turn (budget / BHK).
+  // Date/time are scheduling entities and are handled as visit intent below;
+  // budget/BHK are discovery content and must outweigh a leading affirmative
+  // so "haan, budget 10 lakh" updates the budget slot instead of booking a visit.
+  const hasNonSchedulingEntity = !!context.hasBudget || !!context.hasBhk;
 
   // ── Priority 1: Visit-specific rejection (before general rejection) ────
   if (VISIT_REJECT_PAT.test(lower) || VISIT_REJECT_HI.test(trimmed) || VISIT_REJECT_ROMAN.test(lower)) {
@@ -120,6 +130,18 @@ export function classifyIntent(
   const inVisitScheduling = context.currentStep === 'ASK_VISIT_DAY' ||
     context.currentStep === 'ASK_VISIT_TIME' ||
     context.currentStep === 'VISIT_OFFER';
+
+  // When the active question is budget/BHK collection, a bare affirmative is an
+  // answer to THAT, not a visit request. Never infer visit intent from context
+  // while discovery slots are being collected (req: question-tracking sync).
+  const activeDiscoveryCollection =
+    context.lastAskedField === 'budget' || context.lastAskedField === 'bhk';
+  // Visit can be inferred from context only when we actually asked about a
+  // visit, or we're mid-scheduling — and NOT while collecting budget/BHK.
+  const visitContext =
+    (context.lastAskedField === 'site_visit_interest' || inVisitScheduling) &&
+    !activeDiscoveryCollection;
+
   if (inVisitScheduling && BARE_NEGATIVE.test(trimmed)) {
     return { intent: 'VISIT_REJECT', confidence: 0.85, reason: 'bare_negative_during_scheduling' };
   }
@@ -150,23 +172,34 @@ export function classifyIntent(
   const hasImperative = IMPERATIVE_ACCEPT.test(lower) || IMPERATIVE_HI.test(trimmed);
 
   if (hasWillingness || hasImperative) {
-    // If the text also contains question markers, the willingness verb is part
-    // of a question construction (e.g. "amenities क्या करें" = "what about
-    // amenities?"), NOT an expression of willingness for a visit.
     const hasQuestionMarker = QUESTION_MARKERS.test(lower) || trimmed.includes('?');
+    // Willingness/imperative in visit context = visit intent, even with question
+    // markers. "कितने बजे कर सकते हैं" in visit context = scheduling intent.
+    if (visitContext) {
+      // Entity priority: a budget/BHK figure this turn is discovery content.
+      // A non-imperative willingness verb ("dekhna chahta hoon") next to it is
+      // not scheduling language, so don't infer a visit from context alone.
+      if (hasNonSchedulingEntity && !hasImperative) {
+        return { intent: 'AGREEMENT', confidence: 0.7, reason: 'entity_priority_over_affirmative' };
+      }
+      return { intent: 'VISIT_INTENT', confidence: 0.9, reason: hasQuestionMarker ? 'scheduling_question_in_visit_context' : 'willingness_in_visit_context' };
+    }
+    // Outside visit context, question markers override willingness
     if (hasQuestionMarker) {
       return { intent: 'QUESTION', confidence: 0.75, reason: 'question_with_willingness_verb' };
-    }
-    // Willingness/imperative in visit context = visit intent
-    if (context.lastAskedField === 'site_visit_interest' || inVisitScheduling) {
-      return { intent: 'VISIT_INTENT', confidence: 0.9, reason: 'willingness_in_visit_context' };
     }
     return { intent: 'AGREEMENT', confidence: 0.85, reason: 'willingness_construction' };
   }
 
   if (hasAffirmParticle) {
-    // Affirmative after a visit offer/question = visit intent
-    if (context.lastAskedField === 'site_visit_interest' || inVisitScheduling) {
+    // Affirmative after a visit offer/question = visit intent...
+    if (visitContext) {
+      // ...UNLESS the same utterance carries substantive discovery content
+      // (budget/BHK). "haan, budget 10 lakh" is a budget answer prefixed with a
+      // courtesy "haan", not a request to book a visit. Entity wins.
+      if (hasNonSchedulingEntity) {
+        return { intent: 'AGREEMENT', confidence: 0.7, reason: 'entity_priority_over_affirmative' };
+      }
       return { intent: 'VISIT_INTENT', confidence: 0.85, reason: 'affirmative_to_visit_ask' };
     }
     return { intent: 'AGREEMENT', confidence: 0.8, reason: 'affirmative_particle' };

@@ -221,6 +221,108 @@ export const Env = {
     apiKey: optionalEnv('GROQ_API_KEY', ''),
   },
 
+  // ── Deepgram STT ────────────────────────────────────────────────────────
+  deepgram: {
+    apiKey: optionalEnv('DEEPGRAM_API_KEY', ''),
+    model: optionalEnv('DEEPGRAM_MODEL', 'nova-2'),
+    language: optionalEnv('DEEPGRAM_LANGUAGE', 'hi'),
+    multilingual: optionalBool('DEEPGRAM_MULTILINGUAL', true),
+    endpointingMs: optionalInt('DEEPGRAM_ENDPOINTING_MS', 500),
+    utteranceEndMs: optionalInt('DEEPGRAM_UTTERANCE_END_MS', 1200),
+    minConfidence: optionalFloat('DEEPGRAM_MIN_CONFIDENCE', 0.4),
+    stableInterimBaseMs: optionalInt('DEEPGRAM_STABLE_INTERIM_BASE_MS', 600),
+    stableInterimShortMs: optionalInt('DEEPGRAM_STABLE_INTERIM_SHORT_MS', 400),
+    stableShortCharThreshold: optionalInt('DEEPGRAM_STABLE_SHORT_CHAR_THRESHOLD', 30),
+  },
+
+  // ── Sarvam TTS ──────────────────────────────────────────────────────────
+  sarvam: {
+    apiKey: optionalEnv('SARVAM_API_KEY', ''),
+    modelId: optionalEnv('SARVAM_MODEL_ID', 'bulbul:v3'),
+    speaker: optionalEnv('SARVAM_SPEAKER', 'arjun'),
+    targetLanguageCode: optionalEnv('SARVAM_TARGET_LANGUAGE', 'hi-IN'),
+    pace: optionalFloat('SARVAM_PACE', 1.1),
+    temperature: optionalFloat('SARVAM_TEMPERATURE', 0.7),
+  },
+
+  // ── Groq LLM (Sarvam pipeline) ─────────────────────────────────────────
+  llm: {
+    groqApiKey: optionalEnv('GROQ_API_KEY', ''),
+    modelId: optionalEnv('LLM_MODEL_ID', 'llama-3.1-8b-instant'),
+    maxTokens: optionalInt('LLM_MAX_TOKENS', 150),
+    temperature: optionalFloat('LLM_TEMPERATURE', 0.7),
+    topP: optionalFloat('LLM_TOP_P', 0.9),
+    historyWindow: optionalInt('LLM_HISTORY_WINDOW', 12),
+    systemPrompt: [
+      // ── Identity ──
+      'You are Arjun — a calm, confident real-estate consultant calling for Akshay Vista by R. R. Lunkad, Pimple Gurav, Pune.',
+      'You are a real person on a phone call, not a bot or script reader.',
+      '',
+      // ── Language ──
+      'LANGUAGE: Default Hinglish (Hindi–English mix). Switch to full English or Hindi if the caller does.',
+      'Speak like an educated Indian real-estate professional — natural, warm, knowledgeable.',
+      'Preserve exactly as-is: numbers, prices, BHK, dates, days, brand/project/area names. Say numerals in English.',
+      '',
+      // ── Conversational style — the core change ──
+      'RESPONSE STYLE:',
+      '- Sound like a helpful consultant, NOT a database lookup.',
+      '- State the fact concisely, then add ONE natural follow-up question or a brief connector that moves the conversation forward.',
+      '- BAD: "Price 8 to 10 thousand per sqft hai." GOOD: "Price roughly 8 to 10 thousand per sqft hai. Aap kis budget range mein dekh rahe hain?"',
+      '- BAD: "Gym available hai." GOOD: "Gym aur clubhouse dono available hain — aur kuch specific chahiye tha amenities mein?"',
+      '- Keep it concise. Do NOT give long paragraphs or bullet-point lists.',
+      '- Do NOT add sales pitches, hype, or "excellent choice" type flattery.',
+      '- Do NOT auto-suggest site visits unless the conversation naturally leads there or [NEXT ACTION] says so.',
+      '',
+      // ── Response length targets ──
+      'RESPONSE LENGTH:',
+      '- Factual answers: 10–20 words. State fact + brief follow-up.',
+      '- Follow-up questions: 15–30 words. Natural, not interrogatory.',
+      '- Handling objections or concerns: 20–40 words. Acknowledge, address briefly, redirect.',
+      '- NEVER exceed 2 sentences per reply.',
+      '',
+      // ── Greeting ──
+      'GREETING DONE: You already said the opening greeting and asked for the caller\'s name. Never re-greet or re-introduce.',
+      '',
+      // ── Acknowledgements ──
+      'ACKNOWLEDGEMENTS: The system auto-prepends "Okay", "Got it", "Great", or "Right" when appropriate.',
+      'NEVER start your reply with any acknowledgement, filler, or opener (okay/sure/got it/right/great/haan/thik hain/accha). Jump straight into your answer.',
+      '',
+      // ── Conversation flow ──
+      'FLOW:',
+      '- One question at a time. Wait for the caller to answer before moving on.',
+      '- "Yes"/"haan" confirms only your last question — never advance two steps at once.',
+      '',
+      // ── Interruption ──
+      'INTERRUPTION: Stop mid-sentence, drop it. Answer the caller\'s new question directly. Never apologise or resume.',
+      '',
+      // ── Property facts ──
+      'PROPERTY FACTS (answer from these ONLY, never invent):',
+      'Fully residential. 2, 2.5, 3 BHK options.',
+      'Price: approximately 8,000 to 10,000 per sqft.',
+      'Location: Pimple Gurav, near Hinjewadi IT Park.',
+      'Possession: April 2027.',
+      'Amenities: gym, clubhouse, play area, jogging track, EV charging, covered parking.',
+      'Unknown answer: stay positive, suggest discussing at a visit. Never say "I don\'t know" or make up facts.',
+      '',
+      // ── Session state ──
+      'Follow [SESSION STATE] and [NEXT ACTION] directives exactly.',
+      'SILENCE: Bracketed instructions — say exactly what they ask, nothing else.',
+    ].join('\n'),
+  },
+
+  // ── Barge-in detection ──────────────────────────────────────────────────
+  bargeIn: {
+    rmsThreshold: optionalInt('BARGEIN_RMS_THRESHOLD', 700),
+    confirmMs: optionalInt('BARGEIN_CONFIRM_MS', 400),
+    cooldownMs: optionalInt('BARGEIN_COOLDOWN_MS', 1500),
+    graceMs: optionalInt('BARGEIN_GRACE_MS', 500),
+  },
+
+  // ── Humanization (acknowledgement prefixes) ─────────────────────────────
+  humanization: {
+    enabled: optionalBool('HUMANIZATION_ENABLED', true),
+  },
+
   audio: {
     telephonyCodec: optionalEnv('TELEPHONY_CODEC', 'pcmu') as 'pcmu' | 'pcma' | 'pcm16',
     telephonySampleRate: optionalInt('TELEPHONY_SAMPLE_RATE', 8000),

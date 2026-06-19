@@ -88,7 +88,12 @@ export class CallOrchestrator {
   private readonly EMPTY_FINALS_BEFORE_REPROMPT = 2;
   private readonly REPROMPT_MIN_GAP_MS = 8000;
   private readonly MAX_REPROMPTS_PER_CALL = 3;
-  private readonly REPROMPT_TEXT = "Hello? आपकी आवाज़ नहीं आ रही, क्या आप सुन रहे हैं?";
+  private readonly REPROMPT_TEXTS = [
+    'Hello? Aapki awaaz nahi aa rahi, kya aap sun rahe hain?',
+    'Hello? Lagta hai connection mein issue hai, kya aap mujhe sun pa rahe hain?',
+    'Hello? Agar aap sun rahe hain toh please bataiye, main yahan hoon.',
+  ] as const;
+  private repromptTextIndex = 0;
 
   // ─── Silence Timer ──────────────────────────────────────────────────────
 
@@ -401,18 +406,24 @@ export class CallOrchestrator {
     });
 
     // ── Speculative generation reconciliation ──────────────────────────
+    // If a scheduling slot was newly captured this turn, any in-flight
+    // speculation is stale — the deterministic template must take over.
+    const schedulingSlotCaptured =
+      (!prevDate && !!this.session.info.preferredDate) ||
+      (!prevTime && !!this.session.info.preferredTime);
+
     if (this.speculativeText !== null) {
       const specText = this.speculativeText;
       this.speculativeText = null;
       const finalText = text.trim();
 
-      if (finalText === specText) {
+      if (!schedulingSlotCaptured && finalText === specText) {
         this.latency.recordSpeculation('confirmed_exact');
         this.log.info('Speculative generation CONFIRMED (exact match)', { text: specText });
         return;
       }
 
-      if (finalText.startsWith(specText) && specText.length >= 8) {
+      if (!schedulingSlotCaptured && finalText.startsWith(specText) && specText.length >= 8) {
         this.latency.recordSpeculation('confirmed_prefix');
         this.log.info('Speculative generation CONFIRMED (prefix match)', {
           speculative: specText, final: finalText,
@@ -421,9 +432,9 @@ export class CallOrchestrator {
         return;
       }
 
-      this.latency.recordSpeculation('invalidated');
+      this.latency.recordSpeculation(schedulingSlotCaptured ? 'invalidated_scheduling' : 'invalidated');
       this.log.warn('Speculative generation INVALIDATED — aborting', {
-        speculative: specText, final: finalText,
+        speculative: specText, final: finalText, schedulingSlotCaptured,
       });
       this.generationId++;
       if (this.abortController) {
@@ -461,6 +472,18 @@ export class CallOrchestrator {
       this.conversation.pinLastUserMessage('time:' + this.session.info.preferredTime);
     }
 
+    // ── Deterministic scheduling responses (no LLM) ──────────────────
+    const cannedScheduling = this.maybeCannedSchedulingResponse(prevDate, prevTime);
+    if (cannedScheduling) {
+      this.log.info('Scheduling response (deterministic, no LLM)', {
+        template: cannedScheduling, bookingStatus: this.session.bookingStatus,
+      });
+      this.conversation.addAssistantText(cannedScheduling);
+      this.session.extractFromAssistantResponse(cannedScheduling);
+      this.speakCanned(cannedScheduling);
+      return;
+    }
+
     this.state = 'GENERATING';
 
     this.log.info('Transcript → LLM handoff', {
@@ -469,6 +492,39 @@ export class CallOrchestrator {
     });
 
     void this.generateAndSpeak();
+  }
+
+  // ─── Deterministic Scheduling Templates ─────────────────────────────────
+
+  /**
+   * If a scheduling slot was newly captured this turn, return the appropriate
+   * canned response. Returns null if no scheduling transition happened (fall
+   * through to LLM).
+   */
+  private maybeCannedSchedulingResponse(
+    prevDate: string | null,
+    prevTime: string | null,
+  ): string | null {
+    const { preferredDate, preferredTime, name } = this.session.info;
+    const status = this.session.bookingStatus;
+
+    // Both slots just completed → confirm visit
+    if (status === 'CONFIRMATION_PENDING' && preferredDate && preferredTime) {
+      const nameClause = name ? `${name} ji, ` : '';
+      return `${nameClause}aapki ${preferredDate} ko ${preferredTime} ki visit book ho gayi hai. Aapka din shubh rahe.`;
+    }
+
+    // Date was newly captured, time still missing → ask time
+    if (!prevDate && preferredDate && !preferredTime) {
+      return `${preferredDate} works. Kis time aana convenient rahega aapke liye — morning ya afternoon?`;
+    }
+
+    // Time was newly captured, date still missing → ask day
+    if (!prevTime && preferredTime && !preferredDate) {
+      return `${preferredTime} noted. Kaunsa day aapke liye convenient rahega — weekday ya weekend?`;
+    }
+
+    return null;
   }
 
   // ─── LLM + TTS Pipeline ───────────────────────────────────────────────────
@@ -707,7 +763,9 @@ export class CallOrchestrator {
       this.log.warn('Silence timer: reprompting caller', {
         repromptCount: this.repromptCount, silenceMs: this.SILENCE_TIMEOUT_MS,
       });
-      this.speakCanned(this.REPROMPT_TEXT);
+      const reprompt = this.REPROMPT_TEXTS[this.repromptTextIndex % this.REPROMPT_TEXTS.length];
+      this.repromptTextIndex++;
+      this.speakCanned(reprompt);
     }, this.SILENCE_TIMEOUT_MS);
   }
 

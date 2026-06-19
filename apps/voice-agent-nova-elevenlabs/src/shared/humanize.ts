@@ -46,8 +46,8 @@ const PREFERENCE_PATTERNS = [
 // ── Acknowledgement pools per intent ────────────────────────────────────────
 
 const ACK_INFO         = ['Got it', 'Okay'] as const;
-const ACK_CONFIRMATION = ['Great', 'Sure'] as const;
-const ACK_PREFERENCE   = ['Right', 'Thik hain'] as const;
+const ACK_CONFIRMATION = ['Great'] as const;
+const ACK_PREFERENCE   = ['Right'] as const;
 
 type UserIntent = 'question' | 'info' | 'confirmation' | 'preference' | 'other';
 

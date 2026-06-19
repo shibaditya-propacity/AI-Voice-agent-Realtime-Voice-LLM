@@ -1,14 +1,13 @@
 /**
  * Context-aware conversational acknowledgements.
  *
- * Instead of randomly prepending fillers, we classify the last user utterance
- * and add a single, natural acknowledgement only when conversationally appropriate:
- *   - User provides information  → "Got it", "Okay"
- *   - User agrees / confirms     → "Great", "Sure"
- *   - User shares a preference   → "Right", "Thik hain"
+ * Exactly four words, mapped by intent:
+ *   - User provides information  → "Okay", "Got it"
+ *   - User confirms something    → "Great"
+ *   - User shares a preference   → "Right"
  *
- * Factual questions and greetings get no acknowledgement.
- * Never more than one acknowledgement per response.
+ * No acknowledgement for factual questions or greetings.
+ * Maximum one acknowledgement per response.
  */
 
 // ── Classification patterns ──────────────────────────────────────────────────
@@ -46,8 +45,8 @@ const PREFERENCE_PATTERNS = [
 // ── Acknowledgement pools per intent ────────────────────────────────────────
 
 const ACK_INFO         = ['Got it', 'Okay'] as const;
-const ACK_CONFIRMATION = ['Great', 'Sure'] as const;
-const ACK_PREFERENCE   = ['Right', 'Thik hain'] as const;
+const ACK_CONFIRMATION = ['Great'] as const;
+const ACK_PREFERENCE   = ['Right'] as const;
 
 type UserIntent = 'question' | 'info' | 'confirmation' | 'preference' | 'other';
 

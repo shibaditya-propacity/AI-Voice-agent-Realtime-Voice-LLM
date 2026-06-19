@@ -92,7 +92,7 @@ function toOpenAIMessages(
  * Groq routing stay hot between calls — cold connections were measured
  * adding ~800ms to TTFT (1047ms vs the usual ~250ms).
  */
-const KEEP_WARM_INTERVAL_MS = 30_000;
+const KEEP_WARM_INTERVAL_MS = 300_000; // 5 minutes — saves RPD quota
 let _keepWarmTimer: ReturnType<typeof setInterval> | null = null;
 
 async function pingGroq(log: Logger): Promise<void> {

@@ -27,11 +27,13 @@ vi.mock('../config/env', () => ({
       stableInterimShortMs: 300,
       stableShortCharThreshold: 8,
       minTranscriptLength: 2,
+      minWordCount: 2,
+      singleWordBypassConfidence: 0.7,
       minSpeechDurationMs: 200,
       highConfidenceBypass: 0.85,
       confidenceShort: 0.7,
       confidenceMedium: 0.6,
-      confidenceLong: 0.5,
+      confidenceLong: 0.55,
     },
   },
 }));
@@ -206,6 +208,48 @@ describe('DeepgramSTT Transcript Validation', () => {
 
     it('accepts 3+ word transcript at 0.5+ confidence', () => {
       sendSpeechFinal('what is the price', 0.55);
+      expect(transcripts).toHaveLength(1);
+    });
+  });
+
+  // ─── Gate: Minimum Word Count (single-word fragments/noise) ────────────
+
+  describe('Minimum Word Count Gate', () => {
+    it('rejects single-word fragment below the bypass confidence', () => {
+      sendSpeechFinal('budget', 0.6);
+      expect(transcripts).toHaveLength(0);
+      expect(noSpeechCount).toBe(1);
+    });
+
+    it('accepts a single clear word at/above the bypass confidence', () => {
+      sendSpeechFinal('budget', 0.92);
+      expect(transcripts).toHaveLength(1);
+      expect(transcripts[0]!.text).toBe('budget');
+    });
+
+    it('accepts a two-word utterance at moderate confidence', () => {
+      sendSpeechFinal('budget kya', 0.65);
+      expect(transcripts).toHaveLength(1);
+    });
+  });
+
+  // ─── Regression: log CA73f9a3 garbled multi-word turns ─────────────────
+
+  describe('Garbled multi-word decode rejection (log CA73f9a3)', () => {
+    it('rejects "मैंने अपना try"@0.517 — phantom budget turn that reached the LLM', () => {
+      sendSpeechFinal('मैंने अपना try', 0.517);
+      expect(transcripts).toHaveLength(0);
+      expect(noSpeechCount).toBe(1);
+    });
+
+    it('rejects "हां budget is ten"@0.41 — garbled affirmative+budget', () => {
+      sendSpeechFinal('हां budget is ten', 0.41);
+      expect(transcripts).toHaveLength(0);
+      expect(noSpeechCount).toBe(1);
+    });
+
+    it('accepts the same utterance when it decodes cleanly', () => {
+      sendSpeechFinal('मुझे दस लाख का budget chahiye', 0.9);
       expect(transcripts).toHaveLength(1);
     });
   });

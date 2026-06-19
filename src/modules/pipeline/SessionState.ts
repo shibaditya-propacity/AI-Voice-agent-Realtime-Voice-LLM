@@ -181,34 +181,42 @@ export class SessionState {
 
     switch (this.bookingStatus) {
       case 'NONE':
-        lines.push(!this.info.name
-          ? 'YOUR NEXT ACTION: Answer user query if any, then ask name.'
-          : 'YOUR NEXT ACTION: Answer user query if any, then guide toward site visit.');
+        if (!this.info.name) {
+          lines.push('YOUR NEXT ACTION: Answer the caller\'s question naturally if they asked one, then ask for their name in a warm, professional way.');
+        } else {
+          lines.push('YOUR NEXT ACTION: Answer the caller\'s question conversationally. Add a brief, natural follow-up that keeps the conversation flowing.');
+          lines.push('  Do NOT push for a site visit — let the conversation lead there naturally.');
+        }
         break;
       case 'DATE_CAPTURED':
-        lines.push('YOUR NEXT ACTION: Answer user query if any, then ask preferred time (morning or afternoon).');
+        lines.push('YOUR NEXT ACTION: Answer the caller\'s question if they asked one. Scheduling is handled by the system — do NOT ask about time or date yourself.');
         lines.push('  DO NOT ask for date — already collected.');
         break;
       case 'TIME_CAPTURED':
-        lines.push('YOUR NEXT ACTION: Answer user query if any, then ask preferred day (weekday or weekend).');
+        lines.push('YOUR NEXT ACTION: Answer the caller\'s question if they asked one. Scheduling is handled by the system — do NOT ask about day or time yourself.');
         lines.push('  DO NOT ask for time — already collected.');
         break;
       case 'CONFIRMATION_PENDING':
-        lines.push(`YOUR NEXT ACTION: Confirm booking for ${this.info.preferredDate} ${this.info.preferredTime}.`);
-        lines.push('  Say "noted" or "booked" + Thank you. Then STOP.');
+        lines.push('YOUR NEXT ACTION: Booking confirmation is handled by the system. Do NOT confirm or say "booked" yourself. Just answer any pending question briefly.');
         break;
       case 'BOOKED':
         lines.push('BOOKING COMPLETE. Say nothing. Call is ending.');
         break;
       case 'FAILED':
-        lines.push('Booking failed. Apologize and offer to try again.');
+        lines.push('YOUR NEXT ACTION: Briefly apologize that something went wrong with the booking, and offer to try scheduling again.');
         break;
     }
 
     lines.push('');
+    lines.push('RESPONSE STYLE REMINDER:');
+    lines.push('- Sound like a helpful consultant, not a database. State fact + natural follow-up.');
+    lines.push('- Facts: 10–20 words. Follow-ups: 15–30 words. Objections: 20–40 words.');
+    lines.push('- Max 2 sentences. No sales pitches. No auto site-visit suggestions.');
+    lines.push('');
     lines.push('FORBIDDEN:');
     lines.push('- Do NOT ask for name/date/time if marked ✓ above.');
-    lines.push('- Do NOT say "booked"/"confirmed"/"noted" unless status is CONFIRMATION_PENDING.');
+    lines.push('- Do NOT say "booked"/"confirmed"/"noted"/"scheduled" — the system handles booking confirmation.');
+    lines.push('- Do NOT ask about scheduling (day, time, visit) — the system handles all scheduling prompts.');
     lines.push('- Do NOT invent dates, times, prices, or availability not in FACTS.');
     lines.push('- Do NOT continue conversation if status is BOOKED.');
     if (this.info.name) {
