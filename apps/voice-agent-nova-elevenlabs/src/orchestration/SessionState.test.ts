@@ -1,13 +1,15 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { SessionState } from './SessionState';
 
-// Mock logger — SessionState expects Logger.forCall() which needs Winston
+// Mock logger — SessionState expects Logger.forCall() which needs Winston.
+// Capture info-level log messages so tests can assert on emitted tags.
 import { vi } from 'vitest';
+const { logMessages } = vi.hoisted(() => ({ logMessages: [] as string[] }));
 vi.mock('../shared/logger', () => ({
   Logger: {
     forCall: () => ({
-      info: () => {},
-      warn: () => {},
+      info: (msg: string) => { logMessages.push(msg); },
+      warn: (msg: string) => { logMessages.push(msg); },
       debug: () => {},
       error: () => {},
     }),
@@ -18,6 +20,7 @@ describe('SessionState', () => {
   let session: SessionState;
 
   beforeEach(() => {
+    logMessages.length = 0;
     session = new SessionState('test-call-123');
   });
 
@@ -222,6 +225,30 @@ describe('SessionState', () => {
       expect(session.interested).toBe(true);
     });
 
+    // ── Entity priority over leading affirmatives ──────────────────────────
+    // Leading "haan" must NOT hijack a budget/BHK answer into visit scheduling.
+    it('"haan, budget 10 lakh" → captures budget, does NOT trigger visit', () => {
+      session.extractFromUserTranscript('haan, budget 10 lakh');
+      expect(session.budget).toBe('10 lakh');
+      expect(session.interested).toBe(true);
+      expect(session.visitAgreed).toBe(false);
+      expect(session.currentStep).not.toBe('ASK_VISIT_DAY');
+    });
+
+    it('"haan, 2 BHK dekh raha hoon" → captures BHK, does NOT trigger visit', () => {
+      session.extractFromUserTranscript('haan, 2 BHK dekh raha hoon');
+      expect(session.bhkPreference).toBe('2 BHK');
+      expect(session.interested).toBe(true);
+      expect(session.visitAgreed).toBe(false);
+      expect(session.currentStep).not.toBe('ASK_VISIT_DAY');
+    });
+
+    it('bare "haan" (no entity) still triggers visit intent', () => {
+      session.extractFromUserTranscript('haan');
+      expect(session.visitAgreed).toBe(true);
+      expect(session.currentStep).toBe('ASK_VISIT_DAY');
+    });
+
     it('explicit "not interested" with word boundary → NOT_INTERESTED', () => {
       // "nahi chahiye" is explicit rejection via IntentClassifier
       session.extractFromUserTranscript('nahi chahiye');
@@ -246,6 +273,103 @@ describe('SessionState', () => {
       // Auto-confirms: date + time → BOOKED
       expect(session.currentStep).toBe('BOOKED');
       expect(session.visitBooked).toBe(true);
+    });
+  });
+
+  // ─── Last-Asked-Field Synchronization ─────────────────────────────────────
+
+  describe('Last-Asked-Field Tracking (budget/BHK)', () => {
+    it('budget question sets lastAskedField=budget and logs LAST_ASKED_FIELD_SET', () => {
+      session.extractFromAssistantResponse('आप किस budget range में देख रहे हैं?');
+      expect(session.lastAskedField).toBe('budget');
+      expect(logMessages).toContain('LAST_ASKED_FIELD_SET');
+    });
+
+    it('BHK question sets lastAskedField=bhk', () => {
+      session.extractFromAssistantResponse('कितने BHK चाहिए आपको?');
+      expect(session.lastAskedField).toBe('bhk');
+    });
+
+    it('date question still sets lastAskedField=date', () => {
+      session.extractFromAssistantResponse('कौन सा दिन convenient रहेगा?');
+      expect(session.lastAskedField).toBe('date');
+    });
+
+    it('a non-question mentioning budget does NOT set the field', () => {
+      session.extractFromAssistantResponse('Akshay Vista में price 8 to 10 thousand per sq ft है।');
+      expect(session.lastAskedField).not.toBe('budget');
+    });
+
+    it('req #4: budget question + bare "haan" → no visit intent (VISIT_OFFER step)', () => {
+      session.interested = true; // → VISIT_OFFER step, inVisitScheduling=true
+      session.extractFromAssistantResponse('आपका budget कितना है?');
+      expect(session.lastAskedField).toBe('budget');
+      expect(session.currentStep).toBe('VISIT_OFFER');
+
+      session.extractFromUserTranscript('haan');
+      expect(session.visitAgreed).toBe(false);
+      expect(session.currentStep).not.toBe('ASK_VISIT_DAY');
+    });
+
+    it('MATCH: budget asked, budget answered → LAST_ASKED_FIELD_MATCH', () => {
+      session.extractFromAssistantResponse('आपका budget कितना है?');
+      logMessages.length = 0;
+      session.extractFromUserTranscript('mera budget 50 lakh hai');
+      expect(session.budget).toBe('50 lakh');
+      expect(logMessages).toContain('LAST_ASKED_FIELD_MATCH');
+    });
+
+    it('MISMATCH: budget asked, a day volunteered → LAST_ASKED_FIELD_MISMATCH', () => {
+      session.interested = true;
+      session.visitAgreed = true; // scheduling context so date extraction is allowed
+      session.lastAskedField = 'budget';
+      logMessages.length = 0;
+      session.extractFromUserTranscript('Saturday');
+      expect(logMessages).toContain('LAST_ASKED_FIELD_MISMATCH');
+    });
+  });
+
+  // ─── Acknowledgement-Only Guard ───────────────────────────────────────────
+
+  describe('Acknowledgement-Only Guard', () => {
+    it('detects pure acknowledgements as acknowledgement-only', () => {
+      for (const t of ['I understand.', 'Got it.', 'Okay.', 'Sure.', 'ठीक है।', 'अच्छा।',
+        'I understand you want to share your budget',
+        'मैं समझता हूँ कि आप अपना बजट बताना चाहते हैं।']) {
+        expect(session.isAcknowledgementOnly(t)).toBe(true);
+      }
+    });
+
+    it('does NOT flag substantive answers or clarifying questions', () => {
+      for (const t of ['Price 8 से 10 thousand per square feet है।',
+        'I understand the price is 80 lakh.',
+        'Gym और clubhouse दोनों available हैं।',
+        'आप किस budget range में देख रहे हैं?']) {
+        expect(session.isAcknowledgementOnly(t)).toBe(false);
+      }
+    });
+
+    it('replaces an ack-only head with a budget-specific clarifying question', () => {
+      session.lastAskedField = 'budget';
+      const out = session.sanitizeStreamingHead('मैं समझता हूँ कि आप अपना बजट बताना चाहते हैं।');
+      expect(out).toBe('आपका budget कितना है?');
+      expect(logMessages).toContain('ACK_ONLY_REJECTED');
+    });
+
+    it('replaces a generic ack-only head with a generic clarifying question', () => {
+      session.lastAskedField = null;
+      const out = session.sanitizeStreamingHead('I understand.');
+      expect(out).toContain('जानना चाहते हैं');
+    });
+
+    it('leaves substantive responses untouched', () => {
+      const text = 'Gym और clubhouse दोनों available हैं।';
+      expect(session.sanitizeStreamingHead(text)).toBe(text);
+    });
+
+    it('flags ACKNOWLEDGEMENT_ONLY in validateOutput', () => {
+      expect(session.validateOutput('Got it.')).toContain('ACKNOWLEDGEMENT_ONLY');
+      expect(session.validateOutput('Price 8 thousand है।')).not.toContain('ACKNOWLEDGEMENT_ONLY');
     });
   });
 

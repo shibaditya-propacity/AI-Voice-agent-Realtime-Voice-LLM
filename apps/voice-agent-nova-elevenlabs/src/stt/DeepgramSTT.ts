@@ -63,7 +63,7 @@ function applyDomainCorrections(text: string): string {
 /** Result of transcript validation — either valid or rejected with a reason. */
 type TranscriptValidation =
   | { valid: true }
-  | { valid: false; reason: 'EMPTY_TRANSCRIPT_REJECTED' | 'NOISE_REJECTED' | 'LOW_CONFIDENCE_REJECTED' | 'SHORT_SPEECH_REJECTED' };
+  | { valid: false; reason: 'STT_REJECTED_SHORT_FRAGMENT' | 'STT_REJECTED_LOW_CONFIDENCE' };
 
 export class DeepgramSTT {
   private ws: WebSocket | null = null;
@@ -516,28 +516,44 @@ export class DeepgramSTT {
    */
   private validateTranscript(text: string, confidence: number): TranscriptValidation {
     const trimmed = text.trim();
+    const wordCount = trimmed ? trimmed.split(/\s+/).length : 0;
 
     // Gate 1: Empty or too short (< 2 chars) — line noise, single-letter artifacts
     if (trimmed.length < Env.deepgram.minTranscriptLength) {
-      this.log.warn('EMPTY_TRANSCRIPT_REJECTED', {
+      this.log.warn('STT_REJECTED_SHORT_FRAGMENT', {
+        gate: 'min_length',
         transcript: trimmed,
         length: trimmed.length,
         threshold: Env.deepgram.minTranscriptLength,
       });
-      return { valid: false, reason: 'EMPTY_TRANSCRIPT_REJECTED' };
+      return { valid: false, reason: 'STT_REJECTED_SHORT_FRAGMENT' };
     }
 
     // Gate 2: Filler/noise-only (uh, umm, hmm, aa, huh, etc.)
     if (FILLER_NOISE_PATTERN.test(trimmed)) {
-      this.log.warn('NOISE_REJECTED', {
+      this.log.warn('STT_REJECTED_SHORT_FRAGMENT', {
+        gate: 'filler_noise',
         transcript: trimmed,
         confidence,
       });
-      return { valid: false, reason: 'NOISE_REJECTED' };
+      return { valid: false, reason: 'STT_REJECTED_SHORT_FRAGMENT' };
     }
 
-    // Gate 3: Adaptive confidence threshold based on transcript length
-    const wordCount = trimmed.split(/\s+/).length;
+    // Gate 3: Minimum word count — single-word transcripts are partial
+    // fragments / single-word noise unless they decode very cleanly.
+    if (wordCount < Env.deepgram.minWordCount && confidence < Env.deepgram.singleWordBypassConfidence) {
+      this.log.warn('STT_REJECTED_SHORT_FRAGMENT', {
+        gate: 'min_word_count',
+        transcript: trimmed,
+        confidence,
+        wordCount,
+        minWordCount: Env.deepgram.minWordCount,
+        bypassConfidence: Env.deepgram.singleWordBypassConfidence,
+      });
+      return { valid: false, reason: 'STT_REJECTED_SHORT_FRAGMENT' };
+    }
+
+    // Gate 4: Adaptive confidence threshold based on transcript length
     let requiredConfidence: number;
     if (trimmed.length <= 3) {
       // Very short (1-3 chars): likely noise artifact
@@ -546,37 +562,45 @@ export class DeepgramSTT {
       // 1-2 words: possibly filler or partial
       requiredConfidence = Env.deepgram.confidenceMedium;
     } else {
-      // 3+ words: likely real speech
+      // 3+ words: real speech — but a garbled multi-word decode still scores
+      // ~0.4-0.55, so the floor sits above the noise band, not at it.
       requiredConfidence = Env.deepgram.confidenceLong;
     }
 
     if (confidence < requiredConfidence) {
-      this.log.warn('LOW_CONFIDENCE_REJECTED', {
+      this.log.warn('STT_REJECTED_LOW_CONFIDENCE', {
         transcript: trimmed,
         confidence,
         requiredConfidence,
         wordCount,
         charLength: trimmed.length,
       });
-      return { valid: false, reason: 'LOW_CONFIDENCE_REJECTED' };
+      return { valid: false, reason: 'STT_REJECTED_LOW_CONFIDENCE' };
     }
 
-    // Gate 4: Speech segment duration — reject very short bursts (< 200ms)
+    // Gate 5: Speech segment duration — reject very short bursts (< 200ms)
     // unless confidence is very high (clear short word like "haan" or "yes")
     if (this.speechStartedAt > 0) {
       const speechDurationMs = Date.now() - this.speechStartedAt;
       if (speechDurationMs < Env.deepgram.minSpeechDurationMs && confidence < Env.deepgram.highConfidenceBypass) {
-        this.log.warn('SHORT_SPEECH_REJECTED', {
+        this.log.warn('STT_REJECTED_SHORT_FRAGMENT', {
+          gate: 'speech_duration',
           transcript: trimmed,
           confidence,
           speechDurationMs,
           minRequired: Env.deepgram.minSpeechDurationMs,
           bypassThreshold: Env.deepgram.highConfidenceBypass,
         });
-        return { valid: false, reason: 'SHORT_SPEECH_REJECTED' };
+        return { valid: false, reason: 'STT_REJECTED_SHORT_FRAGMENT' };
       }
     }
 
+    this.log.info('STT_ACCEPTED', {
+      transcript: trimmed,
+      confidence,
+      wordCount,
+      charLength: trimmed.length,
+    });
     return { valid: true };
   }
 

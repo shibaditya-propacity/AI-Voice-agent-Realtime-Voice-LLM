@@ -31,6 +31,8 @@ import { ElevenLabsTTS } from '../tts/ElevenLabsTTS';
 import { SarvamTTS } from '../tts/SarvamTTS';
 import { normalizeTTSText } from '../tts/TTSNormalizer';
 import { hasGreetingAudio, getGreetingChunks } from '../tts/GreetingCache';
+import { hasAckClips, getRandomAckClip } from '../tts/AckCache';
+import type { AckClip } from '../tts/AckCache';
 import { BargeInDetector } from '../interruption/BargeInDetector';
 import { ConversationManager } from '../llm/ConversationManager';
 import { SessionState } from './SessionState';
@@ -187,6 +189,17 @@ export class CallOrchestrator {
   /** Last time BUFFER_DEPTH_MS was logged (throttle continuous depth telemetry). */
   private lastBufferDepthLogAt = 0;
 
+  // ─── Interim Duplicate Tracking (false barge-in prevention) ────────
+  /** Last interim transcript text seen — used to reject Deepgram echoes. */
+  private lastInterimText = '';
+  /** Timestamp of the first non-duplicate interim during current SPEAKING phase. */
+  private interimBargeInAnchor = 0;
+  /** Timestamp when the last UNIQUE interim was received. */
+  private lastInterimChangedAt = 0;
+  /** Minimum age (ms) of an interim before it can trigger barge-in.
+   *  Deepgram often emits the same interim 2-3 times within 500ms of echo. */
+  private static readonly MIN_INTERIM_AGE_FOR_BARGEIN_MS = 1000;
+
   // ─── Minimum Audio Buffer (underrun prevention) ───────────────────
   // Buffer initial TTS chunks until we have enough audio depth to survive
   // gaps between TTS chunks. Once the threshold is met, drain the buffer
@@ -227,6 +240,22 @@ export class CallOrchestrator {
   private speculativeDonePending = false;
   /** Safety release: if speech_final never arrives, play held audio anyway. */
   private speculativeReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ─── Latency Masking ──────────────────────────────────────────────────
+  // When LLM+TTS takes >1.5s, play a short ack clip to mask silence.
+  private static readonly LATENCY_MASK_DELAY_MS = 1500;
+  /** Timer that fires the ack clip if no TTS audio arrives in time. */
+  private latencyMaskTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True while an ack clip is playing (holds real TTS audio). */
+  private ackPlaying = false;
+  /** Estimated end time of the ack clip (for gating real response). */
+  private ackEndsAt = 0;
+  /** Real TTS audio chunks that arrived while ack was playing. */
+  private ackHeldAudio: string[] = [];
+  /** Whether real TTS completed while ack was still playing. */
+  private ackHeldDonePending = false;
+  /** Generation ID that the held audio belongs to. */
+  private ackHeldGenId = 0;
 
   // ─── STT Watchdog ─────────────────────────────────────────────────────
   // If SpeechStarted fires but no valid transcript arrives within
@@ -279,12 +308,15 @@ export class CallOrchestrator {
     void this.tts.open().catch(() => { /* logged inside TTS provider */ });
     this.log.info('Call orchestrator ready', { state: this.state });
 
-    // Fixed greeting via TTS — no LLM needed. Reliable and fast.
-    // Outbound sales opener: short — name, company, project, then check interest.
-    // Deliberately does NOT ask for the name yet (first goal is to gauge interest).
-    this.speakCanned(
-      'Hi, मैं Arjun, R.R. Lunkad की Akshay Vista से। Site visit में interested होंगे?',
-    );
+    // Greeting: use pre-cached audio if available (zero TTS latency),
+    // otherwise fall back to live TTS synthesis.
+    if (hasGreetingAudio()) {
+      this.sendCachedGreeting();
+    } else {
+      this.speakCanned(
+        'Hi, मैं Arjun, R.R. Lunkad की Akshay Vista से। Site visit में interested होंगे?',
+      );
+    }
   }
 
   /**
@@ -293,10 +325,20 @@ export class CallOrchestrator {
    */
   private sendCachedGreeting(): void {
     const chunks = getGreetingChunks();
+    const greetingText = 'Hi, मैं Arjun, R.R. Lunkad की Akshay Vista से। Site visit में interested होंगे?';
     this.log.info('Playing pre-recorded greeting', { chunks: chunks.length });
     this.latency.mark('greeting_start');
+
+    this.generationId++;
+    this.activeResponseText = greetingText;
     this.state = 'SPEAKING';
     this.suppressBargeInArm = true; // No barge-in during greeting
+
+    // Add greeting to conversation history
+    this.conversation.addAssistantText(greetingText);
+
+    // Mute STT during echo burst
+    this.muteSTTForEchoBurst();
 
     // Stream all chunks to Twilio immediately — Twilio buffers and plays in order
     for (const chunk of chunks) {
@@ -314,7 +356,9 @@ export class CallOrchestrator {
       if (this.state === 'SPEAKING' || this.state === 'IDLE') {
         this.state = 'LISTENING';
         this.lastTTSCompleteAt = Date.now();
+        this.ensureSTTUnmuted();
         this.log.info('Greeting playback complete, now LISTENING', { playbackMs });
+        this.startSilenceTimer();
       }
     }, playbackMs);
   }
@@ -369,6 +413,8 @@ export class CallOrchestrator {
       this.sttUnmuteTimer = null;
     }
     this.discardSpeculativeAudio();
+    this.cancelLatencyMaskTimer();
+    this.resetAckState();
     this.clearSilenceTimer();
     this.clearSTTWatchdog();
 
@@ -587,6 +633,9 @@ export class CallOrchestrator {
     this.ttsGenerationDone = false;
     this.audioPreBuffer.length = 0;
     this.audioBufferPrimed = false;
+    this.lastInterimText = '';
+    this.lastInterimChangedAt = 0;
+    this.interimBargeInAnchor = 0;
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
@@ -655,33 +704,96 @@ export class CallOrchestrator {
     if (this.suppressBargeInArm) return; // greeting — no barge-in
 
     const trimmed = text.trim();
+    const now = Date.now();
 
-    // Filter out filler/echo words — PSTN echo of agent TTS is often
-    // transcribed as "Mhmm mhmm mhmm" by Deepgram. Not real speech.
+    // ── Duplicate interim rejection ─────────────────────────────────
+    // Deepgram often emits the same interim 2–3 times as PSTN echo of
+    // the agent's own TTS is decoded. These are NOT new user speech.
+    if (trimmed === this.lastInterimText) {
+      this.log.debug('DUPLICATE_INTERIM_IGNORED', { text: trimmed, msSinceLast: now - this.lastInterimChangedAt });
+      return;
+    }
+
+    // ── Track change ────────────────────────────────────────────────
+    const previousText = this.lastInterimText;
+    const previousWords = previousText ? previousText.split(/\s+/) : [];
+    const currentWords = trimmed.split(/\s+/);
+
+    // Count genuinely NEW words (not in the previous interim)
+    const previousWordSet = new Set(previousWords.map(w => w.toLowerCase()));
+    const newWords = currentWords.filter(w => !previousWordSet.has(w.toLowerCase()));
+
+    // ── Filter out filler/echo words ────────────────────────────────
     if (CallOrchestrator.ECHO_FILLER_PATTERN.test(trimmed)) {
       this.log.warn('FALSE_BARGEIN_REJECTED: interim is echo/filler during SPEAKING', { text });
+      this.lastInterimText = trimmed;
+      this.lastInterimChangedAt = now;
       return;
     }
 
-    // Reject short interims — single-word transcripts during SPEAKING are
-    // overwhelmingly PSTN echo decoded as a word, not real user speech.
-    const wordCount = trimmed.split(/\s+/).length;
+    // ── Reject short interims ───────────────────────────────────────
+    const wordCount = currentWords.length;
     if (wordCount < CallOrchestrator.MIN_BARGEIN_WORDS) {
       this.log.warn('FALSE_BARGEIN_REJECTED: too few words for interim barge-in', { text, wordCount });
+      this.lastInterimText = trimmed;
+      this.lastInterimChangedAt = now;
       return;
     }
 
-    // Reject interims that arrive too early after TTS started playing —
-    // the first ~800ms of playback creates strong PSTN echo.
+    // ── Reject interims too early after TTS start ───────────────────
     if (this.firstTTSAudioSentAt > 0) {
-      const msSinceTTSStart = Date.now() - this.firstTTSAudioSentAt;
+      const msSinceTTSStart = now - this.firstTTSAudioSentAt;
       if (msSinceTTSStart < CallOrchestrator.MIN_TTS_PLAY_BEFORE_BARGEIN_MS) {
         this.log.warn('FALSE_BARGEIN_REJECTED: too early after TTS start', { text, msSinceTTSStart });
+        this.lastInterimText = trimmed;
+        this.lastInterimChangedAt = now;
         return;
       }
     }
 
-    this.log.info('BargeInDetected (interim words during agent speech)', { text, wordCount });
+    // ── Require meaningful change: at least 2 new words ─────────────
+    // If the interim just reworded/reordered existing text with < 2 new
+    // words, it's a Deepgram refinement of the same echo, not new speech.
+    if (newWords.length < 2) {
+      this.log.debug('FALSE_BARGEIN_REJECTED: insufficient new words', {
+        text: trimmed, newWords, newWordCount: newWords.length, previousText,
+      });
+      this.lastInterimText = trimmed;
+      this.lastInterimChangedAt = now;
+      return;
+    }
+
+    // ── Require minimum interim age ─────────────────────────────────
+    // The first non-duplicate interim sets the anchor. Only accept barge-in
+    // once meaningful interims have been arriving for ≥1000ms, proving
+    // sustained, evolving real speech (not a burst of echo refinements).
+    if (this.interimBargeInAnchor === 0) {
+      // First meaningful interim — set anchor, don't fire yet.
+      this.interimBargeInAnchor = now;
+      this.lastInterimText = trimmed;
+      this.lastInterimChangedAt = now;
+      this.log.debug('FALSE_BARGEIN_REJECTED: first meaningful interim, anchor set', {
+        text: trimmed, threshold: CallOrchestrator.MIN_INTERIM_AGE_FOR_BARGEIN_MS,
+      });
+      return;
+    }
+    const interimAge = now - this.interimBargeInAnchor;
+    if (interimAge < CallOrchestrator.MIN_INTERIM_AGE_FOR_BARGEIN_MS) {
+      this.lastInterimText = trimmed;
+      this.lastInterimChangedAt = now;
+      this.log.debug('FALSE_BARGEIN_REJECTED: interim too young', {
+        text: trimmed, interimAge, threshold: CallOrchestrator.MIN_INTERIM_AGE_FOR_BARGEIN_MS,
+      });
+      return;
+    }
+
+    // Update tracking AFTER all checks pass
+    this.lastInterimText = trimmed;
+    this.lastInterimChangedAt = now;
+
+    this.log.info('REAL_BARGEIN_ACCEPTED (interim words during agent speech)', {
+      text: trimmed, wordCount, newWords, interimAge,
+    });
     this.handleInterruption();
   }
 
@@ -1156,6 +1268,16 @@ export class CallOrchestrator {
     this.ttsGenerationDone = false;
     this.audioPreBuffer.length = 0;
     this.audioBufferPrimed = false;
+
+    // Reset latency mask state from any previous generation
+    this.cancelLatencyMaskTimer();
+    this.resetAckState();
+
+    // Reset interim barge-in tracking so stale state from previous turns
+    // doesn't suppress legitimate barge-in on this new response.
+    this.lastInterimText = '';
+    this.lastInterimChangedAt = 0;
+    this.interimBargeInAnchor = 0;
     this.lastBufferDepthLogAt = 0;
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
@@ -1189,6 +1311,9 @@ export class CallOrchestrator {
     // Mute STT during echo burst — unmutes after barge-in grace period
     this.muteSTTForEchoBurst();
 
+    // Start latency mask timer — plays a short ack clip if LLM+TTS
+    // takes longer than 1.5s (only for LLM-generated responses).
+    this.startLatencyMaskTimer(myGenId);
 
     // Socket should already be open (persistent from call start).
     // If it dropped unexpectedly, streamText() queues and startTurn() reconnects.
@@ -1479,6 +1604,16 @@ export class CallOrchestrator {
       return;
     }
 
+    // Cancel latency mask timer — real audio arrived in time.
+    this.cancelLatencyMaskTimer();
+
+    // Ack clip gating: if an ack clip is playing, hold real audio until
+    // the ack finishes to avoid overlapping audio.
+    if (this.ackPlaying) {
+      this.ackHeldAudio.push(audioBase64);
+      return;
+    }
+
     const now = Date.now();
 
     if (!this.latency.hasMarked('tts_first_audio')) {
@@ -1587,6 +1722,12 @@ export class CallOrchestrator {
     // don't compute playback timers / transition to LISTENING on zero bytes.
     if (this.holdSpeculativeAudio) {
       this.speculativeDonePending = true;
+      return;
+    }
+
+    // Ack clip still playing — defer until ack finishes and releases held audio.
+    if (this.ackPlaying) {
+      this.ackHeldDonePending = true;
       return;
     }
 
@@ -1708,6 +1849,106 @@ export class CallOrchestrator {
       time: this.session.info.preferredTime,
       bookingStatus: this.session.bookingStatus,
     });
+  }
+
+  // ─── Latency Masking ──────────────────────────────────────────────────────
+
+  /**
+   * Start the latency mask timer. If no TTS audio reaches Twilio within
+   * LATENCY_MASK_DELAY_MS, a pre-cached ack clip plays to fill silence.
+   * Called from generateAndSpeak() — NOT from speakCanned/fact-router/scheduling.
+   */
+  private startLatencyMaskTimer(genId: number): void {
+    this.cancelLatencyMaskTimer();
+    if (!hasAckClips()) {
+      this.log.debug('LATENCY_MASK_SKIPPED', { reason: 'no ack clips loaded' });
+      return;
+    }
+    this.latencyMaskTimer = setTimeout(() => {
+      this.latencyMaskTimer = null;
+      if (genId !== this.generationId) return;
+      // Only fire if no real TTS audio has been sent to Twilio yet
+      if (this.firstTTSAudioSentAt > 0) {
+        this.log.debug('LATENCY_MASK_SKIPPED', { reason: 'TTS audio already playing' });
+        return;
+      }
+      this.playAckClip(genId);
+    }, CallOrchestrator.LATENCY_MASK_DELAY_MS);
+  }
+
+  private cancelLatencyMaskTimer(): void {
+    if (this.latencyMaskTimer) {
+      clearTimeout(this.latencyMaskTimer);
+      this.latencyMaskTimer = null;
+    }
+  }
+
+  /**
+   * Play a random ack clip directly to Twilio. Real TTS audio arriving
+   * while the ack plays is held and released when the ack finishes.
+   */
+  private playAckClip(genId: number): void {
+    const clip = getRandomAckClip();
+    if (!clip) return;
+
+    this.log.info('LATENCY_MASK_TRIGGERED', { clip: clip.name, durationMs: clip.durationMs });
+    this.ackPlaying = true;
+    this.ackHeldGenId = genId;
+    this.ackHeldAudio = [];
+    this.ackHeldDonePending = false;
+
+    // Stream clip chunks directly to Twilio (bypass TTS pipeline)
+    for (const chunk of clip.chunks) {
+      this.twilioService.sendAudio(this.callSid, chunk);
+    }
+    this.log.info('ACK_AUDIO_STARTED', { clip: clip.name, chunks: clip.chunks.length });
+
+    // Schedule ack completion
+    this.ackEndsAt = Date.now() + clip.durationMs;
+    setTimeout(() => {
+      if (genId !== this.generationId) {
+        // Generation was cancelled (barge-in) — discard held audio
+        this.resetAckState();
+        return;
+      }
+      this.log.info('ACK_AUDIO_COMPLETED', { clip: clip.name });
+      this.ackPlaying = false;
+      this.releaseAckHeldAudio(genId);
+    }, clip.durationMs);
+  }
+
+  /**
+   * Release any real TTS audio that was held while the ack clip played.
+   * Re-feeds it into the normal handleTTSAudio path.
+   */
+  private releaseAckHeldAudio(genId: number): void {
+    if (genId !== this.generationId) {
+      this.resetAckState();
+      return;
+    }
+
+    const held = this.ackHeldAudio;
+    const donePending = this.ackHeldDonePending;
+    this.resetAckState();
+
+    if (held.length > 0) {
+      this.log.info('RESPONSE_READY_DURING_ACK', { heldChunks: held.length, donePending });
+      for (const chunk of held) {
+        this.handleTTSAudio(chunk, genId);
+      }
+    }
+
+    if (donePending) {
+      this.handleTTSDone(genId);
+    }
+  }
+
+  private resetAckState(): void {
+    this.ackPlaying = false;
+    this.ackEndsAt = 0;
+    this.ackHeldAudio = [];
+    this.ackHeldDonePending = false;
+    this.ackHeldGenId = 0;
   }
 
   /**
@@ -1841,6 +2082,10 @@ export class CallOrchestrator {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
     }
+
+    // Cancel latency mask and discard any held ack audio
+    this.cancelLatencyMaskTimer();
+    this.resetAckState();
 
     // Bump generation ID — marks all in-flight audio/text as stale
     this.generationId++;

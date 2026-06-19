@@ -1,3 +1,5 @@
+
+
 /**
  * SessionState: structured per-call state that tracks collected user info
  * and booking progress.
@@ -44,6 +46,8 @@ export type BookingStatus =
 export type LastAskedField =
   | 'date'
   | 'time'
+  | 'budget'
+  | 'bhk'
   | 'site_visit_interest'
   | null;
 
@@ -112,6 +116,16 @@ const FILLER_CLOSING = /[\s,।.!-]*(aur\s+kuch(\s+(poochh?na|puuchna|puchna|poo
 // the actual answer (the preceding sentence) is preserved.
 const VISIT_PITCH = /[\s,।.!-]*[^।.!?]*?\b(site\s*visit|साइट\s*विज़िट|साइट\s*विजिट|विज़िट|विजिट|visit\s*(कर|पर|करेंगे|karenge|karke|kar\s*l(ein|ijiye|o)|chal(ein|enge)|चल(ें|ेंगे))|(actual\s+)?site\s+(देखकर|देख\s*कर|dekh\s*kar|dekhkar)|project\s+(देख|dekh)\w*|better\s+idea\s+(मिलेगा|milega))[^।.!?]*[?।.!]*\s*$/i;
 
+// Acknowledgement-only responses — a reply that merely acknowledges/reflects
+// the user without answering anything or asking a specific question. These
+// waste a conversational turn ("I understand.", "Got it.", "Okay.",
+// "मैं समझता हूँ कि आप अपना बजट बताना चाहते हैं।"). The pattern is FULL-MATCH
+// (anchored): a real answer or question after the ack means it won't match, so
+// substantive replies like "I understand the price is 80 lakh" are NOT caught.
+// The English reflective tail is restricted to "you want/ask/know…" forms so a
+// factual continuation does not get absorbed.
+const ACK_ONLY_PATTERN = /^[\s,।.!-]*(i\s+understand(\s+(that\s+)?you[\w\s'’]*?(want|wanted|asking|ask|looking|trying|interested|need|like|tell|telling|share|sharing|know|knowing|give|provide)[\w\s'’]*)?|i\s+see|i\s+hear\s+you|got\s+it|okay|ok|alright|all\s+right|sure|noted|understood|makes\s+sense|मैं\s+समझत[ाी]\s+हूँ([ऀ-ॿ\s]*(हैं|है))?|समझ\s+गय[ाी]|समझ\s+गया|ठीक\s+है|अच्छा|जी(\s+ह(ाँ|ां))?|samajh\s+gaya|theek\s+hai|accha)\s*[।.!?]*\s*$/i;
+
 // Day/time scheduling offer. Forbidden after a visit rejection (problem #3:
 // "Kal 7 baje chalega?" after the caller declined a visit).
 const SCHEDULING_OFFER = /\b(kal|aaj|parson|कल|आज|परसों|monday|tuesday|wednesday|thursday|friday|saturday|sunday|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|\d{1,2}\s*(am|pm|बजे|baje|o'?\s*clock)|morning|afternoon|evening|सुबह|दोपहर|शाम)\b[^?।.!]*\b(chalega|चलेगा|chal(ein|enge)|theek|ठीक|fit|suits?|आएंगे|aayenge|aa\s*sak|visit|schedule|book)\b|\b(which\s+day|what\s+time|kaunsa\s+din|कौनसा\s+दिन|kab\s+aa|कब\s+आ)\b/i;
@@ -159,6 +173,17 @@ export class SessionState {
   /** Whether the USER's transcript this turn explicitly mentions visits/site.
    *  When true, the visit-pitch guard is relaxed — the user asked about it. */
   private _userMentionedVisitThisTurn = false;
+
+  /** Whether a budget figure was mentioned in THIS turn's transcript.
+   *  Feeds IntentClassifier entity-priority so a leading "haan" doesn't get
+   *  read as a visit request when the user is actually stating a budget. */
+  private _budgetMentionedThisTurn = false;
+  /** Whether a BHK preference was mentioned in THIS turn's transcript. */
+  private _bhkMentionedThisTurn = false;
+  /** Whether a date was mentioned in THIS turn's transcript. */
+  private _dateMentionedThisTurn = false;
+  /** Whether a time was mentioned in THIS turn's transcript. */
+  private _timeMentionedThisTurn = false;
 
   /**
    * Check if the given text mentions a visit/site, and set the guard flag.
@@ -407,12 +432,37 @@ export class SessionState {
   updateLastAskedField(text: string): void {
     const lower = text.toLowerCase();
 
-    if (/\b(day|date|din|weekday|weekend)\b/i.test(lower) || /दिन|कब|कौनसा/.test(lower)) {
-      this.lastAskedField = 'date';
+    // Interrogative markers — budget/BHK keywords appear in answers too, so
+    // those fields are only tracked when the line actually poses a question.
+    const isQuestion = /\?/.test(text) ||
+      /\b(what|which|how\s+much|how\s+many|kya|kaun|kis|kitn[ae])\b/i.test(lower) ||
+      /(क्या|कौन|किस|कितन[ेा]|बताइए|बताएं)/.test(text);
+
+    let field: LastAskedField = null;
+
+    // Order matters: BHK before date (Hindi "कौनसा" appears in both a
+    // "which day" and a "which BHK" question), budget/BHK before visit.
+    if (isQuestion && (/\bbhk\b/i.test(lower) || /बीएचके/.test(text))) {
+      field = 'bhk';
+    } else if (isQuestion && (/\bbudget\b/i.test(lower) || /बजट/.test(text) ||
+        /\b(kitne|kitna)\s+(ka|tak|mein|का|तक|में)\b/i.test(lower) || /कितने\s*(का|तक|में)/.test(text))) {
+      field = 'budget';
+    } else if (/\b(day|date|din|weekday|weekend)\b/i.test(lower) || /दिन|कब|कौनसा/.test(lower)) {
+      field = 'date';
     } else if (/\b(time|samay|morning|afternoon|evening)\b/i.test(lower) || /समय|बजे|सुबह|दोपहर|शाम/.test(lower)) {
-      this.lastAskedField = 'time';
+      field = 'time';
     } else if (/\b(visit|schedule|book)\b/i.test(lower) || /देखना|देखेंगे|चाहेंगे/.test(lower)) {
-      this.lastAskedField = 'site_visit_interest';
+      field = 'site_visit_interest';
+    }
+
+    if (field && field !== this.lastAskedField) {
+      const previous = this.lastAskedField;
+      this.lastAskedField = field;
+      this.log.info('LAST_ASKED_FIELD_SET', {
+        field,
+        previous,
+        text: text.substring(0, 60),
+      });
     }
   }
 
@@ -502,16 +552,16 @@ export class SessionState {
     switch (this.currentStep) {
       case 'ASK_VISIT_DAY':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_DAY_REQUESTED', step: this.currentStep });
-        return 'बहुत अच्छा! आपको कौन सा दिन सही रहेगा — आज, कल, या weekend?';
+        return 'ज़रूर, आपको कौन सा दिन convenient रहेगा — आज, कल, या इस weekend?';
       case 'ASK_VISIT_TIME':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_TIME_REQUESTED', step: this.currentStep, day: this.info.preferredDate });
-        return `${this.info.preferredDate} बिल्कुल ठीक है। कितने बजे आना चाहेंगे — सुबह, दोपहर, या शाम?`;
+        return `${this.info.preferredDate} बिल्कुल चलेगा। किस time आना comfortable रहेगा — morning, afternoon, या evening?`;
       case 'CONFIRM_VISIT':
       case 'BOOKED':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_CONFIRMED', step: this.currentStep, day: this.info.preferredDate, time: this.info.preferredTime });
-        return `बहुत अच्छा! ${this.info.preferredDate} को ${this.info.preferredTime} site visit fix है। आपसे मिलकर खुशी होगी। धन्यवाद, आपका दिन शुभ हो!`;
+        return `Perfect, आपकी ${this.info.preferredDate} को ${this.info.preferredTime} की site visit book हो गई है। आपसे मिलकर अच्छा लगेगा, आपका दिन शुभ हो!`;
       case 'NOT_INTERESTED':
-        return 'ठीक है, कोई बात नहीं। आपका समय देने के लिए बहुत धन्यवाद, आपका दिन शुभ हो!';
+        return 'कोई बात नहीं, आपका समय देने के लिए शुक्रिया। कभी भी interest हो तो बेझिझक call कीजिएगा। आपका दिन शुभ हो!';
       default:
         return null;
     }
@@ -671,6 +721,11 @@ export class SessionState {
     // 6. Banned filler closing ("aur kuch", "anything else", …).
     if (FILLER_CLOSING.test(text)) issues.push('FILLER_CLOSING');
 
+    // 6b. Acknowledgement-only reply (no answer, no question). The streaming
+    //     head guard replaces these before TTS; this flags any that slip past
+    //     for monitoring/prompt-tuning.
+    if (this.isAcknowledgementOnly(text)) issues.push('ACKNOWLEDGEMENT_ONLY');
+
     // 7. Unsolicited site-visit pitch (not requested by the controller this turn
     //    AND the user didn't ask about visits themselves).
     if (!this._visitSuggestedThisTurn && !this._userMentionedVisitThisTurn && VISIT_PITCH.test(text)) {
@@ -756,7 +811,40 @@ export class SessionState {
       return 'ठीक है, कोई बात नहीं।';
     }
 
+    // Acknowledgement-only guard: a reply that just acknowledges/reflects the
+    // user ("I understand.", "ठीक है।", "मैं समझता हूँ कि आप budget बताना चाहते
+    // हैं।") wastes the turn. Replace it with ONE specific clarifying question so
+    // the conversation always moves forward. (Runs AFTER the post-rejection
+    // neutral return above so that closing line is never overridden.)
+    if (out && this.isAcknowledgementOnly(out)) {
+      const clarifier = this.getClarifyingQuestion();
+      this.log.warn('ACK_ONLY_REJECTED', {
+        original: text.substring(0, 80),
+        replacement: clarifier,
+        lastAskedField: this.lastAskedField,
+      });
+      return clarifier;
+    }
+
     return out;
+  }
+
+  /** True when the entire text is just an acknowledgement/reflection with no
+   *  answer and no specific question. */
+  isAcknowledgementOnly(text: string): boolean {
+    return ACK_ONLY_PATTERN.test(text.trim());
+  }
+
+  /** One specific clarifying question, steered by the field we last asked
+   *  about so the replacement re-engages on the right slot. */
+  private getClarifyingQuestion(): string {
+    switch (this.lastAskedField) {
+      case 'budget': return 'आपका budget कितना है?';
+      case 'bhk':    return 'आपको कितने BHK का घर चाहिए?';
+      case 'date':   return 'आप किस दिन visit करना चाहेंगे?';
+      case 'time':   return 'आपके लिए कौन सा समय ठीक रहेगा?';
+      default:       return 'आप किस बारे में जानना चाहते हैं — price, location, या amenities?';
+    }
   }
 
   // ─── Extraction from Transcripts ─────────────────────────────────────────
@@ -768,7 +856,16 @@ export class SessionState {
     const lower = text.toLowerCase().trim();
     const trimmed = text.trim();
 
-    // ── BHK + budget extraction ──────────────────────────────────────────
+    // ── Entity extraction FIRST (before intent classification) ───────────
+    // Reset per-turn entity flags, then extract. The flags record whether a
+    // budget/BHK/date/time entity appeared in THIS utterance (not persisted
+    // state) so the intent classifier can prioritize entity handling over a
+    // leading affirmative, and so the answer can be reconciled against the
+    // field we last asked about.
+    this._budgetMentionedThisTurn = false;
+    this._bhkMentionedThisTurn = false;
+    this._dateMentionedThisTurn = false;
+    this._timeMentionedThisTurn = false;
     this.extractBhk(lower);
     this.extractBudget(lower);
 
@@ -807,13 +904,37 @@ export class SessionState {
       currentStep: this.currentStep,
       hasDate: !!this.info.preferredDate,
       hasTime: !!this.info.preferredTime,
+      hasBudget: this._budgetMentionedThisTurn,
+      hasBhk: this._bhkMentionedThisTurn,
     });
+
+    // Entity priority: substantive budget/BHK content outweighed a leading
+    // affirmative — the user is answering discovery, not requesting a visit.
+    if (visitIntent.reason === 'entity_priority_over_affirmative') {
+      this.log.info('ENTITY_PRIORITY_APPLIED', {
+        budgetThisTurn: this._budgetMentionedThisTurn,
+        bhkThisTurn: this._bhkMentionedThisTurn,
+        budget: this.info.budgetMentioned,
+        bhk: this.info.bhkPreference,
+        text: trimmed.substring(0, 50),
+      });
+      this.log.info('VISIT_INTENT_REJECTED', {
+        reason: 'entity_priority_over_affirmative',
+        lastAskedField: this.lastAskedField,
+        text: trimmed.substring(0, 50),
+      });
+    }
 
     const wantsVisit = visitIntent.intent === 'VISIT_INTENT';
     if (wantsVisit && !this.notInterested && !this.visitRejected) {
       this.interested = true;
       if (!this.visitAgreed) {
         this.visitAgreed = true;
+        this.log.info('VISIT_INTENT_ACCEPTED', {
+          reason: visitIntent.reason,
+          confidence: visitIntent.confidence,
+          text: trimmed.substring(0, 50),
+        });
         this.log.info('site_visit_agreed', { text: trimmed.substring(0, 50), reason: visitIntent.reason });
       }
     }
@@ -826,8 +947,52 @@ export class SessionState {
       this.confirmBooking();
     }
 
+    // ── Reconcile the answer against the field we last asked about ────────
+    this.reconcileAskedField(trimmed);
+
     // Log session state after extraction
     this.log.info('session_state', this.getStateSnapshot());
+  }
+
+  /**
+   * Compare what the user provided THIS turn against lastAskedField and emit
+   * a MATCH / MISMATCH signal. Keeps question tracking observably synchronized
+   * with conversation flow: a MISMATCH means the user answered a different slot
+   * than the one we asked (or the tracker is stale).
+   */
+  private reconcileAskedField(trimmed: string): void {
+    const asked = this.lastAskedField;
+    // site_visit_interest is resolved via intent (affirm/visit), not a slot —
+    // its match/mismatch is covered by VISIT_INTENT_* logging.
+    if (!asked || asked === 'site_visit_interest') return;
+
+    const answered: Record<'budget' | 'bhk' | 'date' | 'time', boolean> = {
+      budget: this._budgetMentionedThisTurn,
+      bhk: this._bhkMentionedThisTurn,
+      date: this._dateMentionedThisTurn,
+      time: this._timeMentionedThisTurn,
+    };
+
+    if (answered[asked]) {
+      this.log.info('LAST_ASKED_FIELD_MATCH', {
+        field: asked,
+        text: trimmed.substring(0, 50),
+      });
+      return;
+    }
+
+    // Only a desync worth flagging when the user volunteered a DIFFERENT slot
+    // than the one asked (e.g. asked budget, got a day). A pure unrelated
+    // question is handled by the router, not a tracking mismatch.
+    const otherFields = (Object.keys(answered) as Array<keyof typeof answered>)
+      .filter((k) => answered[k]);
+    if (otherFields.length > 0) {
+      this.log.info('LAST_ASKED_FIELD_MISMATCH', {
+        askedField: asked,
+        answeredFields: otherFields,
+        text: trimmed.substring(0, 50),
+      });
+    }
   }
 
   /**
@@ -843,6 +1008,8 @@ export class SessionState {
       currentStep: this.currentStep,
       hasDate: !!this.info.preferredDate,
       hasTime: !!this.info.preferredTime,
+      hasBudget: this._budgetMentionedThisTurn,
+      hasBhk: this._bhkMentionedThisTurn,
     });
 
     this.log.debug('intent_classification', {
@@ -889,6 +1056,8 @@ export class SessionState {
       currentStep: this.currentStep,
       hasDate: !!this.info.preferredDate,
       hasTime: !!this.info.preferredTime,
+      hasBudget: this._budgetMentionedThisTurn,
+      hasBhk: this._bhkMentionedThisTurn,
     });
 
     if (intent.intent === 'VISIT_REJECT') {
@@ -944,16 +1113,17 @@ export class SessionState {
   /** Extract BHK preference: "2 bhk", "2.5 BHK", "3bhk", "two bhk". */
   private extractBhk(lower: string): void {
     const m = lower.match(/\b(2\.5|2|3)\s*bhk\b/);
-    if (m) { this.setBhkPreference(`${m[1]} BHK`); return; }
+    if (m) { this._bhkMentionedThisTurn = true; this.setBhkPreference(`${m[1]} BHK`); return; }
     const words: Record<string, string> = { two: '2', 'two and half': '2.5', three: '3' };
     const w = lower.match(/\b(two and half|two|three)\s*bhk\b/);
-    if (w && words[w[1]]) this.setBhkPreference(`${words[w[1]]} BHK`);
+    if (w && words[w[1]]) { this._bhkMentionedThisTurn = true; this.setBhkPreference(`${words[w[1]]} BHK`); }
   }
 
   /** Extract a mentioned budget: "50 lakh", "1 crore", "80 lakhs", "1.2 cr". */
   private extractBudget(lower: string): void {
     const m = lower.match(/\b(\d{1,3}(?:\.\d{1,2})?)\s*(lakh|lakhs|lac|crore|cr|करोड़|लाख)\b/);
     if (m) {
+      this._budgetMentionedThisTurn = true;
       const unit = /cr|crore|करोड़/.test(m[2]) ? 'crore' : 'lakh';
       this.setBudgetMentioned(`${m[1]} ${unit}`);
     }
@@ -1026,6 +1196,7 @@ export class SessionState {
       const m = trimmed.match(pat);
       if (m) {
         const date = replacement.replace(/\$(\d)/g, (_, i) => m[parseInt(i)] || '');
+        this._dateMentionedThisTurn = true;
         this.setPreferredDate(date);
         return;
       }
@@ -1035,7 +1206,7 @@ export class SessionState {
     if (!this.info.preferredDate && this.lastAskedField === 'date') {
       const bareDate = /^(weekday|weekend|this week|next week|इस हफ्ते|अगले हफ्ते)\s*$/i;
       const m = trimmed.match(bareDate);
-      if (m) this.setPreferredDate(m[1]);
+      if (m) { this._dateMentionedThisTurn = true; this.setPreferredDate(m[1]); }
     }
   }
 
@@ -1072,6 +1243,7 @@ export class SessionState {
         if (hindiNum && SessionState.HINDI_NUMBERS[hindiNum[1].toLowerCase()]) {
           time = `${SessionState.HINDI_NUMBERS[hindiNum[1].toLowerCase()]} बजे`;
         }
+        this._timeMentionedThisTurn = true;
         this.setPreferredTime(time);
         return;
       }
@@ -1081,7 +1253,7 @@ export class SessionState {
     if (!this.info.preferredTime && this.lastAskedField === 'time') {
       const bareTime = /^(morning|afternoon|evening|सुबह|दोपहर|शाम|(\d{1,2})\s*(am|pm|बजे))\s*$/i;
       const m = trimmed.match(bareTime);
-      if (m) this.setPreferredTime(m[1]);
+      if (m) { this._timeMentionedThisTurn = true; this.setPreferredTime(m[1]); }
     }
   }
 
