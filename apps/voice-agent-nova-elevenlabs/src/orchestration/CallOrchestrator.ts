@@ -34,6 +34,7 @@ import { hasGreetingAudio, getGreetingChunks } from '../tts/GreetingCache';
 import { hasAckClips, getRandomAckClip } from '../tts/AckCache';
 import type { AckClip } from '../tts/AckCache';
 import { BargeInDetector } from '../interruption/BargeInDetector';
+import { evaluateInterimBargeIn } from '../interruption/interimBargeInDecision';
 import { ConversationManager } from '../llm/ConversationManager';
 import { SessionState } from './SessionState';
 import { LatencyTracker } from '../metrics/LatencyTracker';
@@ -200,6 +201,16 @@ export class CallOrchestrator {
    *  Deepgram often emits the same interim 2-3 times within 500ms of echo. */
   private static readonly MIN_INTERIM_AGE_FOR_BARGEIN_MS = 1000;
 
+  // ─── Barge-in Metrics (per call) ─────────────────────────────────────
+  /** Interim/transcript signals that were rejected as false barge-ins. */
+  private bargeInFalseRejected = 0;
+  /** Signals confirmed as real new speech that interrupted the agent. */
+  private bargeInRealAccepted = 0;
+  /** Barge-ins that aborted an in-flight LLM generation. */
+  private bargeInGenerationCancelled = 0;
+  /** Barge-ins that cut off audio already playing to the caller. */
+  private bargeInPlaybackInterrupted = 0;
+
   // ─── Minimum Audio Buffer (underrun prevention) ───────────────────
   // Buffer initial TTS chunks until we have enough audio depth to survive
   // gaps between TTS chunks. Once the threshold is met, drain the buffer
@@ -288,7 +299,7 @@ export class CallOrchestrator {
     // Wire STT events
     this.stt
       .onSpeech(()               => this.handleSpeechStarted())
-      .onInterim((text)          => this.handleInterimTranscript(text))
+      .onInterim((text, conf)    => this.handleInterimTranscript(text, conf))
       .onStableInterim((text, conf) => this.handleStableInterim(text, conf))
       .onTranscript((text, conf) => this.handleFinalTranscript(text, conf))
       .onNoSpeech(()             => this.handleNoSpeech())
@@ -429,6 +440,8 @@ export class CallOrchestrator {
     this.stt.close();
 
     this.latency.logCallSummary();
+    this.session.logResponseQualitySummary();
+    this.logBargeInSummary();
     this.log.info('Call orchestrator ended');
 
     // Hang up the Twilio call so the line disconnects cleanly.
@@ -570,6 +583,25 @@ export class CallOrchestrator {
    * the agent goes permanently silent (no transcript, no timer, no recovery).
    */
   private handleNoSpeech(): void {
+    // ── Speculative audio release on rejected final ─────────────────────
+    // If a speculative generation is pending (stable interim triggered LLM+TTS)
+    // but speech_final was rejected by confidence/word-count gates, the audio
+    // is still held. Release it now — the user clearly spoke (we got a stable
+    // interim with real words), and waiting 4.5s for the safety timeout creates
+    // unacceptable latency. The response was already generated for the interim
+    // text; releasing it immediately is correct.
+    // NOTE: This check runs BEFORE the state guard because during speculative
+    // generation the state is GENERATING (not LISTENING). The state guard would
+    // exit early and leave the held audio waiting for the 4500ms safety timeout.
+    if (this.holdSpeculativeAudio && this.speculativeText !== null) {
+      this.log.info('Releasing speculative audio on rejected speech_final', {
+        speculativeText: this.speculativeText,
+        state: this.state,
+      });
+      this.releaseSpeculativeAudio('rejected_final_release');
+      return;
+    }
+
     if (this.state !== 'LISTENING') return;
 
     // Conversation is ending (booking confirmed / caller declined) — never
@@ -682,7 +714,7 @@ export class CallOrchestrator {
    */
   private static readonly MIN_TTS_PLAY_BEFORE_BARGEIN_MS = 800;
 
-  private handleInterimTranscript(text: string): void {
+  private handleInterimTranscript(text: string, confidence = 0): void {
     if (!text.trim()) return;
 
     // Track first interim for latency measurement (VAD → first words)
@@ -705,94 +737,77 @@ export class CallOrchestrator {
 
     const trimmed = text.trim();
     const now = Date.now();
-
-    // ── Duplicate interim rejection ─────────────────────────────────
-    // Deepgram often emits the same interim 2–3 times as PSTN echo of
-    // the agent's own TTS is decoded. These are NOT new user speech.
-    if (trimmed === this.lastInterimText) {
-      this.log.debug('DUPLICATE_INTERIM_IGNORED', { text: trimmed, msSinceLast: now - this.lastInterimChangedAt });
-      return;
-    }
-
-    // ── Track change ────────────────────────────────────────────────
+    const msSinceTTSStart = this.firstTTSAudioSentAt > 0 ? now - this.firstTTSAudioSentAt : null;
     const previousText = this.lastInterimText;
-    const previousWords = previousText ? previousText.split(/\s+/) : [];
-    const currentWords = trimmed.split(/\s+/);
+    const hasAnchor = this.interimBargeInAnchor > 0;
+    const interimAge = hasAnchor ? now - this.interimBargeInAnchor : 0;
 
-    // Count genuinely NEW words (not in the previous interim)
-    const previousWordSet = new Set(previousWords.map(w => w.toLowerCase()));
-    const newWords = currentWords.filter(w => !previousWordSet.has(w.toLowerCase()));
+    // Delegate the accept/reject/defer decision to the pure gate so the
+    // false-barge logic is testable and the ordering is explicit.
+    const result = evaluateInterimBargeIn({
+      trimmed,
+      previousText,
+      confidence,
+      msSinceTTSStart,
+      interimAnchorAge: hasAnchor ? interimAge : null,
+      config: {
+        minWords: CallOrchestrator.MIN_BARGEIN_WORDS,
+        minNewWords: Env.bargeIn.minNewWords,
+        minConfidence: Env.bargeIn.minInterimConfidence,
+        minTtsPlayMs: CallOrchestrator.MIN_TTS_PLAY_BEFORE_BARGEIN_MS,
+        minInterimAgeMs: CallOrchestrator.MIN_INTERIM_AGE_FOR_BARGEIN_MS,
+        echoFillerPattern: CallOrchestrator.ECHO_FILLER_PATTERN,
+      },
+    });
 
-    // ── Filter out filler/echo words ────────────────────────────────
-    if (CallOrchestrator.ECHO_FILLER_PATTERN.test(trimmed)) {
-      this.log.warn('FALSE_BARGEIN_REJECTED: interim is echo/filler during SPEAKING', { text });
-      this.lastInterimText = trimmed;
-      this.lastInterimChangedAt = now;
-      return;
-    }
+    // Correlated decision context attached to EVERY accept/reject/defer log —
+    // ties the decision to transcript delta, confidence, generation state, and
+    // playback state (req: barge-in decisions must be explainable).
+    const decisionContext = {
+      reason: result.reason,
+      text: trimmed,
+      confidence,
+      transcript_delta: {
+        previousText,
+        newWords: result.delta.newWords,
+        newWordCount: result.delta.newWordCount,
+        wordCount: result.delta.wordCount,
+      },
+      generation_active: !!this.abortController,
+      audio_bytes_played: this.ttsAudioBytesSent,
+      ms_since_tts_start: msSinceTTSStart,
+      interim_age_ms: interimAge,
+    };
 
-    // ── Reject short interims ───────────────────────────────────────
-    const wordCount = currentWords.length;
-    if (wordCount < CallOrchestrator.MIN_BARGEIN_WORDS) {
-      this.log.warn('FALSE_BARGEIN_REJECTED: too few words for interim barge-in', { text, wordCount });
-      this.lastInterimText = trimmed;
-      this.lastInterimChangedAt = now;
-      return;
-    }
-
-    // ── Reject interims too early after TTS start ───────────────────
-    if (this.firstTTSAudioSentAt > 0) {
-      const msSinceTTSStart = now - this.firstTTSAudioSentAt;
-      if (msSinceTTSStart < CallOrchestrator.MIN_TTS_PLAY_BEFORE_BARGEIN_MS) {
-        this.log.warn('FALSE_BARGEIN_REJECTED: too early after TTS start', { text, msSinceTTSStart });
-        this.lastInterimText = trimmed;
-        this.lastInterimChangedAt = now;
-        return;
-      }
-    }
-
-    // ── Require meaningful change: at least 2 new words ─────────────
-    // If the interim just reworded/reordered existing text with < 2 new
-    // words, it's a Deepgram refinement of the same echo, not new speech.
-    if (newWords.length < 2) {
-      this.log.debug('FALSE_BARGEIN_REJECTED: insufficient new words', {
-        text: trimmed, newWords, newWordCount: newWords.length, previousText,
-      });
-      this.lastInterimText = trimmed;
-      this.lastInterimChangedAt = now;
-      return;
-    }
-
-    // ── Require minimum interim age ─────────────────────────────────
-    // The first non-duplicate interim sets the anchor. Only accept barge-in
-    // once meaningful interims have been arriving for ≥1000ms, proving
-    // sustained, evolving real speech (not a burst of echo refinements).
-    if (this.interimBargeInAnchor === 0) {
-      // First meaningful interim — set anchor, don't fire yet.
-      this.interimBargeInAnchor = now;
-      this.lastInterimText = trimmed;
-      this.lastInterimChangedAt = now;
-      this.log.debug('FALSE_BARGEIN_REJECTED: first meaningful interim, anchor set', {
-        text: trimmed, threshold: CallOrchestrator.MIN_INTERIM_AGE_FOR_BARGEIN_MS,
-      });
-      return;
-    }
-    const interimAge = now - this.interimBargeInAnchor;
-    if (interimAge < CallOrchestrator.MIN_INTERIM_AGE_FOR_BARGEIN_MS) {
-      this.lastInterimText = trimmed;
-      this.lastInterimChangedAt = now;
-      this.log.debug('FALSE_BARGEIN_REJECTED: interim too young', {
-        text: trimmed, interimAge, threshold: CallOrchestrator.MIN_INTERIM_AGE_FOR_BARGEIN_MS,
-      });
-      return;
-    }
-
-    // Update tracking AFTER all checks pass
+    // Always advance the interim tracking (the next delta is measured from here).
     this.lastInterimText = trimmed;
     this.lastInterimChangedAt = now;
 
-    this.log.info('REAL_BARGEIN_ACCEPTED (interim words during agent speech)', {
-      text: trimmed, wordCount, newWords, interimAge,
+    if (result.decision === 'reject') {
+      // Genuine false positive (echo / noise / low-quality) — a tracked metric.
+      this.bargeInFalseRejected++;
+      this.log.warn('FALSE_BARGEIN_REJECTED', {
+        ...decisionContext, false_rejected_count: this.bargeInFalseRejected,
+      });
+      return;
+    }
+
+    if (result.decision === 'defer') {
+      // Legitimate speech still being confirmed — NOT a false positive. Set the
+      // anchor on the first meaningful interim; otherwise just keep waiting.
+      if (result.reason === 'anchor_set_awaiting_sustained_speech') {
+        this.interimBargeInAnchor = now;
+      }
+      this.log.debug('BARGEIN_DEFERRED', decisionContext);
+      return;
+    }
+
+    // accept — high-confidence, sustained, growing new speech.
+    this.bargeInRealAccepted++;
+    this.log.info('REAL_BARGEIN_ACCEPTED', {
+      source: 'interim_words_during_speech',
+      ...decisionContext,
+      real_accepted_count: this.bargeInRealAccepted,
     });
     this.handleInterruption();
   }
@@ -928,6 +943,16 @@ export class CallOrchestrator {
     // reprompting "आपकी आवाज़ नहीं आ रही".
     const conversationEndingThisTurn = this.session.shouldEndCall;
 
+    // Did extraction just populate scheduling info (day/time/visit-agreed)?
+    // Speculative generation ran WITHOUT extraction (handleStableInterim skips
+    // extractFromUserTranscript), so the LLM responded without knowing the day/
+    // time the user just provided. The deterministic trySchedulingResponse() path
+    // must handle this instead — invalidate the speculation.
+    const schedulingInfoExtracted =
+      this.session.getSchedulingResponse() !== null ||
+      (this.session.info.preferredDate && !prevDate) ||
+      (this.session.info.preferredTime && !prevTime);
+
     // ── Reset noise tracking — real speech confirmed ────────────────────
     this.consecutiveEmptyVADs = 0;
     this.emptyFinalStreak = 0;
@@ -958,7 +983,7 @@ export class CallOrchestrator {
       this.speculativeText = null;
       const finalText = text.trim();
 
-      if (finalText === specText && !conversationEndingThisTurn) {
+      if (finalText === specText && !conversationEndingThisTurn && !schedulingInfoExtracted) {
         // Exact match — generation already running, release its held audio.
         this.latency.recordSpeculation('confirmed_exact');
         this.log.info('Speculative generation CONFIRMED (exact match)', {
@@ -976,7 +1001,11 @@ export class CallOrchestrator {
       // LLM is already answering is unchanged, so keep the generation running
       // instead of aborting into mid-sentence silence. (Prefix-only matching
       // missed the prepend case and needlessly invalidated.)
-      if (specText.length >= 8 && finalText.includes(specText) && !conversationEndingThisTurn) {
+      // Also check stemmed containment: "facility" should match "facilities".
+      const stemNorm = (s: string) => s.toLowerCase().replace(/ies\b/g, 'y').replace(/es\b/g, '').replace(/s\b/g, '');
+      const containsRaw = finalText.includes(specText);
+      const containsStemmed = !containsRaw && stemNorm(finalText).includes(stemNorm(specText));
+      if (specText.length >= 8 && (containsRaw || containsStemmed) && !conversationEndingThisTurn && !schedulingInfoExtracted) {
         this.latency.recordSpeculation('confirmed_prefix');
         this.log.info('Speculative generation CONFIRMED (containment match)', {
           speculative: specText,
@@ -1019,6 +1048,9 @@ export class CallOrchestrator {
       }
       this.tts.abort();
       this.twilioService.clearAudio(this.callSid);
+      // Reset router intent so the real final can hit the same fact route
+      // (speculative set lastHandledIntent but its response was discarded)
+      resetLastRouterIntent();
       // Remove the speculative user message from conversation history
       this.conversation.discardLastUserMessage();
       this.conversation.discardLastAssistantMessage();
@@ -1057,9 +1089,15 @@ export class CallOrchestrator {
         this.state = 'LISTENING';
         this.ensureSTTUnmuted();
       } else {
-        this.log.info('Transcript-gated barge-in: real speech confirmed during agent speech', {
+        this.bargeInRealAccepted++;
+        this.log.info('REAL_BARGEIN_ACCEPTED', {
+          source: 'final_transcript_during_speech',
           text,
+          confidence,
           state: this.state,
+          audio_bytes_played: this.ttsAudioBytesSent,
+          generation_active: !!this.abortController,
+          real_accepted_count: this.bargeInRealAccepted,
         });
         this.handleInterruption();
       }
@@ -1137,6 +1175,18 @@ export class CallOrchestrator {
     this.ttsGenerationDone = false;
     this.audioPreBuffer.length = 0;
     this.audioBufferPrimed = false;
+
+    // Reset interim barge-in tracking so stale interims from the previous
+    // turn don't trigger false barge-ins on this new response.
+    this.lastInterimText = '';
+    this.lastInterimChangedAt = 0;
+    this.interimBargeInAnchor = 0;
+
+    // Reset latency mask state
+    this.cancelLatencyMaskTimer();
+    this.resetAckState();
+
+    this.lastBufferDepthLogAt = 0;
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
@@ -1203,6 +1253,16 @@ export class CallOrchestrator {
     this.ttsGenerationDone = false;
     this.audioPreBuffer.length = 0;
     this.audioBufferPrimed = false;
+
+    // Reset interim barge-in tracking so stale interims from the previous
+    // turn don't trigger false barge-ins on this new response.
+    this.lastInterimText = '';
+    this.lastInterimChangedAt = 0;
+    this.interimBargeInAnchor = 0;
+
+    this.cancelLatencyMaskTimer();
+    this.resetAckState();
+    this.lastBufferDepthLogAt = 0;
     if (this.playbackCompleteTimer) {
       clearTimeout(this.playbackCompleteTimer);
       this.playbackCompleteTimer = null;
@@ -2087,6 +2147,10 @@ export class CallOrchestrator {
     this.cancelLatencyMaskTimer();
     this.resetAckState();
 
+    // Snapshot what this barge-in is actually cancelling, for metrics.
+    const generationWasActive = !!this.abortController;
+    const playbackWasActive = this.ttsAudioBytesSent > 0;
+
     // Bump generation ID — marks all in-flight audio/text as stale
     this.generationId++;
 
@@ -2095,12 +2159,26 @@ export class CallOrchestrator {
       this.abortController.abort();
       this.abortController = null;
       this.latency.mark('llm_cancelled');
+      this.bargeInGenerationCancelled++;
+      this.log.info('GENERATION_CANCELLED_BY_BARGEIN', {
+        generationId: this.generationId,
+        generation_cancelled_count: this.bargeInGenerationCancelled,
+      });
     }
 
     // Close the active TTS context (socket stays open) and clear Twilio's
     // jitter buffer so queued audio stops playing immediately.
     this.tts.abort();
     this.latency.mark('tts_cancelled');
+
+    if (playbackWasActive) {
+      this.bargeInPlaybackInterrupted++;
+      this.log.info('PLAYBACK_INTERRUPTED_BY_BARGEIN', {
+        audio_bytes_played: this.ttsAudioBytesSent,
+        generation_was_active: generationWasActive,
+        playback_interrupted_count: this.bargeInPlaybackInterrupted,
+      });
+    }
 
     this.twilioService.clearAudio(this.callSid);
     this.bargeIn.disarm();
@@ -2146,4 +2224,33 @@ export class CallOrchestrator {
   //   3. Fire without checking if required info was actually collected
 
   get currentState(): CallState { return this.state; }
+
+  /** Per-call barge-in metrics — exposed for the end-of-call summary + tests. */
+  get bargeInMetrics(): {
+    falseRejected: number;
+    realAccepted: number;
+    generationCancelled: number;
+    playbackInterrupted: number;
+  } {
+    return {
+      falseRejected: this.bargeInFalseRejected,
+      realAccepted: this.bargeInRealAccepted,
+      generationCancelled: this.bargeInGenerationCancelled,
+      playbackInterrupted: this.bargeInPlaybackInterrupted,
+    };
+  }
+
+  /** Emit the per-call barge-in summary (accept/reject/cancel correlation). */
+  private logBargeInSummary(): void {
+    const m = this.bargeInMetrics;
+    const attempts = m.falseRejected + m.realAccepted;
+    this.log.info('BARGE_IN_SUMMARY', {
+      false_rejected: m.falseRejected,
+      real_accepted: m.realAccepted,
+      generation_cancelled_by_bargein: m.generationCancelled,
+      playback_interrupted_by_bargein: m.playbackInterrupted,
+      total_signals: attempts,
+      false_rejection_rate_pct: attempts > 0 ? Math.round((m.falseRejected / attempts) * 100) : 0,
+    });
+  }
 }

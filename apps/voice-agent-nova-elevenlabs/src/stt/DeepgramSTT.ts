@@ -185,7 +185,12 @@ export class DeepgramSTT {
     //     approximated but at least produce usable transcripts. Post-STT domain
     //     corrections handle known misrecognitions (e.g. "certificate" → "site visit").
     //   - 'detect_language' returns HTTP 400 on streaming WS
-    // When multilingual=true, force 'hi' for Hindi/Hinglish callers.
+    // Use 'hi' for Hindi/Hinglish callers. Nova-3 with language=hi handles
+    // Hinglish (mixed Hindi+English) well — common English nouns (price,
+    // budget, location, BHK) are recognized correctly within Hindi speech.
+    // language=multi was tested but fails to recognize pure Hindi speech on
+    // PSTN audio quality (produces empty transcripts). English property terms
+    // that get garbled are handled by post-STT domain corrections.
     const effectiveLanguage = Env.deepgram.multilingual ? 'hi' : Env.deepgram.language;
 
     const params = new URLSearchParams({
@@ -201,11 +206,11 @@ export class DeepgramSTT {
     });
 
     // ── Keyword boosting ──────────────────────────────────────────────────
-    // NOTE: Deepgram's streaming WS with language=hi does not support the
-    // `keywords` param (returns 400). Keyword boosting is only available
-    // on pre-recorded and certain English models. Domain term corrections
-    // are handled post-STT via transcript replacement instead.
-    const parsedKeywords: string[] = [];
+    // Deepgram's streaming WS with language=multi and language=hi does NOT
+    // support the `keywords` param (returns 400). Keyword boosting is only
+    // available on English-only models. Domain term corrections are handled
+    // post-STT via transcript replacement instead.
+    const rawKeywords = Env.deepgram.keywords;
 
     const url = `${DEEPGRAM_WS_URL}?${params.toString()}`;
 
@@ -215,7 +220,7 @@ export class DeepgramSTT {
       multilingual: Env.deepgram.multilingual,
       endpointing:  Env.deepgram.endpointingMs,
       utteranceEnd: Env.deepgram.utteranceEndMs,
-      keywords:     parsedKeywords,
+      keywords:     rawKeywords,
     });
 
     const ws = new WebSocket(url, {

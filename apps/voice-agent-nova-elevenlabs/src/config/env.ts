@@ -99,7 +99,7 @@ export const Env = {
     // noise from reaching the conversation layer.
     minWordCount: optionalInt('DEEPGRAM_MIN_WORD_COUNT', 2),
     // A single word must score at least this to bypass the word-count gate.
-    singleWordBypassConfidence: optionalFloat('DEEPGRAM_SINGLE_WORD_BYPASS_CONFIDENCE', 0.7),
+    singleWordBypassConfidence: optionalFloat('DEEPGRAM_SINGLE_WORD_BYPASS_CONFIDENCE', 0.55),
     // Minimum speech segment duration (ms) to accept a transcript.
     // Shorter segments are rejected unless confidence exceeds highConfidenceBypass.
     minSpeechDurationMs: optionalInt('DEEPGRAM_MIN_SPEECH_DURATION_MS', 200),
@@ -115,7 +115,7 @@ export const Env = {
     //     like "मैंने अपना try"@0.517 through as a phantom user turn.)
     confidenceShort: optionalFloat('DEEPGRAM_CONFIDENCE_SHORT', 0.65),
     confidenceMedium: optionalFloat('DEEPGRAM_CONFIDENCE_MEDIUM', 0.5),
-    confidenceLong: optionalFloat('DEEPGRAM_CONFIDENCE_LONG', 0.55),
+    confidenceLong: optionalFloat('DEEPGRAM_CONFIDENCE_LONG', 0.50),
   },
 
   llm: {
@@ -198,6 +198,8 @@ export const Env = {
         '[FACTS] Answer from [PROPERTY_FACTS] only — one key fact, never invent prices/sizes/dates/amenities. Answer exactly what was asked (budget→price, location→location).',
         'If unclear/garbled, ask them to repeat. If the answer is NOT in [PROPERTY_FACTS] (financing, loans, legal, paperwork), say you do not have that detail and warmly invite them to visit where the team will help. Never make up facts.',
         '',
+        '[OFF-TOPIC] If the caller asks something completely unrelated to Akshay Vista or real estate (e.g. general knowledge, personal questions, "can you speak", "am I audible", weather, politics), reply: "मैं सिर्फ़ Akshay Vista property के बारे में जानकारी दे सकता हूँ। Property से related कोई सवाल हो तो ज़रूर बताइए।" Do NOT answer off-topic questions. Do NOT invent facts about connectivity, environment, surroundings, nearby landmarks, or anything not explicitly listed in [PROPERTY_FACTS].',
+        '',
         '[SCHEDULING] Scheduling (day, time, confirmation) is handled by the system with fixed responses. Do NOT ask about scheduling yourself. Do NOT say "booked"/"confirmed"/"noted".',
         'Mention a site visit ONLY when [NEXT_ACTION] says so. For visit timing use only "today"/"tomorrow"/"this weekend"; never a specific calendar date or clock time.',
         '',
@@ -266,6 +268,16 @@ export const Env = {
     // the response short in the first 2.5s; real interruptions still register
     // after that. (Also gates STT echo-unmute — see muteSTTForEchoBurst.)
     graceMs: optionalInt('BARGEIN_GRACE_MS', 2500),
+    // Minimum Deepgram confidence for an interim to be eligible to barge in.
+    // PSTN echo of the agent's own TTS decodes at LOW confidence; real caller
+    // speech that warrants an interrupt scores higher. This is an ADDITIONAL
+    // gate on top of new-word-growth + sustained-age, so it can stay modest
+    // without blocking genuine Hinglish barge-ins (which run ~0.5-0.7).
+    minInterimConfidence: optionalFloat('BARGEIN_MIN_INTERIM_CONFIDENCE', 0.5),
+    // Minimum count of genuinely NEW words (vs. the previous interim) required
+    // to treat an evolving interim as real new speech rather than a Deepgram
+    // refinement/echo of the same words.
+    minNewWords: optionalInt('BARGEIN_MIN_NEW_WORDS', 2),
   },
 
   sttWatchdog: {
