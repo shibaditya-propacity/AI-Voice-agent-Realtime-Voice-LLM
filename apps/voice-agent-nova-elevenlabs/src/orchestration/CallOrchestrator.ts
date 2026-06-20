@@ -662,25 +662,17 @@ export class CallOrchestrator {
         return;
       }
 
-      // Containment match: the final transcript fully CONTAINS the speculative
-      // text (prefix, suffix, or interior). ASR routinely revises the leading
-      // words it had not finalized — e.g. interim "location क्या रहेगी" becomes
-      // final "और location क्या रहेगी" (a prepended word). The core intent the
-      // LLM is already answering is unchanged, so keep the generation running
-      // instead of aborting into mid-sentence silence. (Prefix-only matching
-      // missed the prepend case and needlessly invalidated.)
-      // Also check stemmed containment: "facility" should match "facilities".
-      const stemNorm = (s: string) => s.toLowerCase().replace(/ies\b/g, 'y').replace(/es\b/g, '').replace(/s\b/g, '');
-      const containsRaw = finalText.includes(specText);
-      const containsStemmed = !containsRaw && stemNorm(finalText).includes(stemNorm(specText));
-      // Require speculative text to be at least 40% of final length to avoid
-      // false containment matches on very short interims (e.g. "what are" matching anything)
-      const lengthRatio = specText.length / Math.max(finalText.length, 1);
-      if (specText.length >= 8 && lengthRatio >= 0.4 && (containsRaw || containsStemmed)) {
+      // Prefix match: final text starts with the speculative text.
+      // The LLM already received the core intent — extra trailing words
+      // (like "project" after "what are the amenities of the") rarely
+      // change the response meaningfully. Keep the generation running.
+      if (finalText.startsWith(specText) && specText.length >= 8) {
+        const extraWords = finalText.slice(specText.length).trim();
         this.latency.recordSpeculation('confirmed_prefix');
-        this.log.info('Speculative generation CONFIRMED (containment match)', {
+        this.log.info('Speculative generation CONFIRMED (prefix match)', {
           speculative: specText,
           final: finalText,
+          extraWords,
           savedMs: Date.now() - transcriptAt,
         });
         // Update the user message in history to reflect the complete text

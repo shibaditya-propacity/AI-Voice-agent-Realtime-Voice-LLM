@@ -1,4 +1,3 @@
-
 /**
  * DeepgramSTT: per-call streaming speech-to-text via Deepgram WebSocket API.
  *
@@ -24,49 +23,6 @@ const DEEPGRAM_WS_URL = 'wss://api.deepgram.com/v1/listen';
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_MS = 500;
 
-/**
- * Filler and noise-only patterns that should never reach the LLM.
- * Covers English fillers, Hindi fillers, and single-letter noise artifacts.
- * Matched case-insensitively against the trimmed transcript.
- */
-const FILLER_NOISE_PATTERN = /^(uh+|um+|umm+|hmm*|mhm+|ah+|huh|oh+|ee+|aa+|ha+|mm+|hm+|uhh+|aah+|ooh+|shh+|tch|haan|haa+|na+h?|ji+|acha+|अच्छा|हां+|ना+|जी+|हम्म+)(\s+(uh+|um+|umm+|hmm*|mhm+|ah+|huh|oh+|ee+|aa+|ha+|mm+|hm+|uhh+|aah+|ooh+|shh+|tch|haan|haa+|na+h?|ji+|acha+|अच्छा|हां+|ना+|जी+|हम्म+))*$/i;
-
-/**
- * Post-STT domain correction: the Hindi acoustic model (language=hi)
- * systematically misrecognizes certain English terms through phonetic
- * confusion. These replacements are built from observed call logs, not
- * guesses — each entry has a documented misrecognition source.
- *
- * The corrections are case-insensitive and applied to the full transcript
- * before it reaches the orchestrator / LLM.
- */
-const DOMAIN_CORRECTIONS: Array<{ pattern: RegExp; replacement: string }> = [
-  // "site visit" → "certificate" (Hindi phonetic: /saɪt vɪzɪt/ ≈ /sɜːtɪfɪkət/)
-  { pattern: /\bcertificate\b/gi, replacement: 'site visit' },
-  // "site visit" → "certify" (shorter variant of same confusion)
-  { pattern: /\bcertify\b/gi, replacement: 'site visit' },
-  // "site visit" → "five visits" (CA53523e: /saɪt vɪzɪt/ ≈ /faɪv vɪzɪts/)
-  { pattern: /\bfive\s+visits?\b/gi, replacement: 'site visit' },
-  // "site visit" → "five digit" (CA53523e: /saɪt vɪzɪt/ ≈ /faɪv dɪdʒɪt/)
-  { pattern: /\bfive\s+digit\b/gi, replacement: 'site visit' },
-  // "site visit" → "sir five" (CA53523e: partial recognition)
-  { pattern: /\bsir\s+five\b/gi, replacement: 'site visit' },
-  // "site visit" → "side visit" (CAf2550706: /saɪt/ ≈ /saɪd/)
-  { pattern: /\bside\s+visit\b/gi, replacement: 'site visit' },
-];
-
-function applyDomainCorrections(text: string): string {
-  let corrected = text;
-  for (const { pattern, replacement } of DOMAIN_CORRECTIONS) {
-    corrected = corrected.replace(pattern, replacement);
-  }
-  return corrected;
-}
-
-/** Result of transcript validation — either valid or rejected with a reason. */
-type TranscriptValidation =
-  | { valid: true }
-  | { valid: false; reason: 'STT_REJECTED_SHORT_FRAGMENT' | 'STT_REJECTED_LOW_CONFIDENCE' };
 export class DeepgramSTT {
   private ws: WebSocket | null = null;
   private readonly callSid: string;
