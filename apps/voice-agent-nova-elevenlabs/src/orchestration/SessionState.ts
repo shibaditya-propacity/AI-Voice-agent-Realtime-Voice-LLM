@@ -229,6 +229,20 @@ export class SessionState {
   /** Turn counter for fact provenance tracking. */
   private turnCount = 0;
 
+  /** How many times the pre-TTS guard replaced an acknowledgement-only reply
+   *  with a clarifying question this call. Surfaced per-turn (in the warn log)
+   *  and per-call (RESPONSE_QUALITY_SUMMARY) to track how often the model
+   *  produces wasted turns. */
+  private _ackReplacementCount = 0;
+  /** Total assistant turns whose head passed through the guard — denominator
+   *  for the ack-replacement rate. */
+  private _guardedResponseCount = 0;
+
+  /** Per-call count of acknowledgement-only replacements. */
+  get ackReplacementCount(): number { return this._ackReplacementCount; }
+  /** Per-call count of responses screened by the streaming-head guard. */
+  get guardedResponseCount(): number { return this._guardedResponseCount; }
+
   constructor(callSid: string) {
     this.callSid = callSid;
     this.log = Logger.forCall(callSid, 'SessionState');
@@ -776,6 +790,9 @@ export class SessionState {
    *   - day/time scheduling offers                                — after rejection
    */
   sanitizeStreamingHead(text: string): string {
+    // Count every assistant head screened by the guard — the denominator for
+    // the ack-replacement rate reported at call end.
+    this._guardedResponseCount++;
     let out = text;
     let strippedScheduling = false;
 
@@ -818,10 +835,13 @@ export class SessionState {
     // neutral return above so that closing line is never overridden.)
     if (out && this.isAcknowledgementOnly(out)) {
       const clarifier = this.getClarifyingQuestion();
+      this._ackReplacementCount++;
       this.log.warn('ACK_ONLY_REJECTED', {
         original: text.substring(0, 80),
         replacement: clarifier,
         lastAskedField: this.lastAskedField,
+        ackReplacementCount: this._ackReplacementCount,
+        guardedResponses: this._guardedResponseCount,
       });
       return clarifier;
     }
@@ -1292,6 +1312,27 @@ export class SessionState {
       lastAskedField: this.lastAskedField,
       turn: this.turnCount,
       shouldEndCall: this.shouldEndCall,
+      ackReplacements: this._ackReplacementCount,
     };
+  }
+
+  /**
+   * Emit a per-call response-quality summary. Called once at call end so we can
+   * track — across calls — how often the model produced acknowledgement-only
+   * replies that the pre-TTS guard had to replace. A non-zero rate here is the
+   * signal to revisit prompt tuning (or a gated buffering mode).
+   */
+  logResponseQualitySummary(): void {
+    const guarded = this._guardedResponseCount;
+    const rate = guarded > 0
+      ? Math.round((this._ackReplacementCount / guarded) * 100)
+      : 0;
+    this.log.info('RESPONSE_QUALITY_SUMMARY', {
+      callSid: this.callSid,
+      ack_replacements: this._ackReplacementCount,
+      guarded_responses: guarded,
+      ack_replacement_rate_pct: rate,
+      turns: this.turnCount,
+    });
   }
 }

@@ -371,6 +371,27 @@ describe('SessionState', () => {
       expect(session.validateOutput('Got it.')).toContain('ACKNOWLEDGEMENT_ONLY');
       expect(session.validateOutput('Price 8 thousand है।')).not.toContain('ACKNOWLEDGEMENT_ONLY');
     });
+
+    it('counts replacements and guarded responses for metrics', () => {
+      session.sanitizeStreamingHead('I understand.');             // replaced
+      session.sanitizeStreamingHead('Gym available है।');         // passed through
+      session.sanitizeStreamingHead('Okay.');                     // replaced
+      expect(session.ackReplacementCount).toBe(2);
+      expect(session.guardedResponseCount).toBe(3);
+    });
+
+    it('logs RESPONSE_QUALITY_SUMMARY with the replacement rate at call end', () => {
+      session.sanitizeStreamingHead('Got it.');                   // replaced (1/1)
+      logMessages.length = 0;
+      session.logResponseQualitySummary();
+      expect(logMessages).toContain('RESPONSE_QUALITY_SUMMARY');
+    });
+
+    it('does not count substantive responses as replacements', () => {
+      session.sanitizeStreamingHead('Price 8 से 10 thousand है।');
+      expect(session.ackReplacementCount).toBe(0);
+      expect(session.guardedResponseCount).toBe(1);
+    });
   });
 
   // ─── Deterministic Scheduling Responses ───────────────────────────────────
