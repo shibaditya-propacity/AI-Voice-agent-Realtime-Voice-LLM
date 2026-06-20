@@ -1,3 +1,4 @@
+
 /**
  * DeepgramSTT: per-call streaming speech-to-text via Deepgram WebSocket API.
  *
@@ -50,6 +51,8 @@ const DOMAIN_CORRECTIONS: Array<{ pattern: RegExp; replacement: string }> = [
   { pattern: /\bfive\s+digit\b/gi, replacement: 'site visit' },
   // "site visit" → "sir five" (CA53523e: partial recognition)
   { pattern: /\bsir\s+five\b/gi, replacement: 'site visit' },
+  // "site visit" → "side visit" (CAf2550706: /saɪt/ ≈ /saɪd/)
+  { pattern: /\bside\s+visit\b/gi, replacement: 'site visit' },
 ];
 
 function applyDomainCorrections(text: string): string {

@@ -1005,7 +1005,10 @@ export class CallOrchestrator {
       const stemNorm = (s: string) => s.toLowerCase().replace(/ies\b/g, 'y').replace(/es\b/g, '').replace(/s\b/g, '');
       const containsRaw = finalText.includes(specText);
       const containsStemmed = !containsRaw && stemNorm(finalText).includes(stemNorm(specText));
-      if (specText.length >= 8 && (containsRaw || containsStemmed) && !conversationEndingThisTurn && !schedulingInfoExtracted) {
+      // Require speculative text to be at least 40% of final length to avoid
+      // false containment matches on very short interims (e.g. "what are" matching anything)
+      const lengthRatio = specText.length / Math.max(finalText.length, 1);
+      if (specText.length >= 8 && lengthRatio >= 0.4 && (containsRaw || containsStemmed) && !conversationEndingThisTurn && !schedulingInfoExtracted) {
         this.latency.recordSpeculation('confirmed_prefix');
         this.log.info('Speculative generation CONFIRMED (containment match)', {
           speculative: specText,
