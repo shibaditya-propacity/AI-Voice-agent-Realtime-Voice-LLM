@@ -130,6 +130,11 @@ const ACK_ONLY_PATTERN = /^[\s,।.!-]*(i\s+understand(\s+(that\s+)?you[\w\s'’
 // "Kal 7 baje chalega?" after the caller declined a visit).
 const SCHEDULING_OFFER = /\b(kal|aaj|parson|कल|आज|परसों|monday|tuesday|wednesday|thursday|friday|saturday|sunday|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|\d{1,2}\s*(am|pm|बजे|baje|o'?\s*clock)|morning|afternoon|evening|सुबह|दोपहर|शाम)\b[^?।.!]*\b(chalega|चलेगा|chal(ein|enge)|theek|ठीक|fit|suits?|आएंगे|aayenge|aa\s*sak|visit|schedule|book)\b|\b(which\s+day|what\s+time|kaunsa\s+din|कौनसा\s+दिन|kab\s+aa|कब\s+आ)\b/i;
 
+// Hallucinated booking claim — the LLM claims it's booking/confirming a visit
+// when the application hasn't reached CONFIRMATION_PENDING. Catches phrases like
+// "kal 10 baje ka book kar raha hun", "book ho gaya", "noted for tomorrow".
+const HALLUCINATED_BOOKING = /\b(book\s*(kar|ho|kart[aei]|kiy[aei]|kr)\w*|booked|confirmed|scheduled|noted|पक्का|बुक\s*(कर|हो)|book\s+हो\s+गय[ाी]|done\s+है|fix\s+(kar|ho)\w*)\b/i;
+
 
 export class SessionState {
   private readonly log: Logger;
@@ -812,6 +817,29 @@ export class SessionState {
       this.log.warn('guard_stripped_scheduling_after_rejection', { text: text.substring(0, 80) });
     }
 
+    // Hallucinated booking claim: the LLM claims it's booking/confirming when
+    // the state machine hasn't reached CONFIRMATION_PENDING. Strip the claim
+    // and replace with the appropriate deterministic scheduling question so the
+    // caller is guided to the correct flow instead of hearing a false booking.
+    let strippedHallucination = false;
+    if (this.bookingStatus !== 'CONFIRMATION_PENDING' && this.bookingStatus !== 'BOOKED' &&
+        HALLUCINATED_BOOKING.test(out)) {
+      this.log.warn('guard_stripped_hallucinated_booking', {
+        text: text.substring(0, 80),
+        bookingStatus: this.bookingStatus,
+        step: this.currentStep,
+      });
+      strippedHallucination = true;
+      // Replace the entire hallucinated response with the correct deterministic
+      // scheduling question for the current step.
+      const schedulingResponse = this.getSchedulingResponse();
+      if (schedulingResponse) {
+        return schedulingResponse;
+      }
+      // Not in a scheduling step — strip the booking claim in-place.
+      out = out.replace(HALLUCINATED_BOOKING, '');
+    }
+
     // Clean up orphaned/duplicated punctuation left by the strips.
     out = out
       .replace(/\s{2,}/g, ' ')
@@ -820,11 +848,11 @@ export class SessionState {
       .replace(/^[\s?।.!,-]+/, '')
       .trim();
 
-    // If a critical strip (post-rejection scheduling) removed the entire
-    // segment, emit a brief neutral acknowledgement instead of bare punctuation
-    // so the caller never hears a fragment like "?" — and never a rescheduling.
+    // If a critical strip (post-rejection scheduling or hallucinated booking)
+    // removed the entire segment, emit a brief neutral acknowledgement instead
+    // of bare punctuation so the caller never hears a fragment like "?".
     const hasLetters = /[a-zA-Zऀ-ॿ]/.test(out);
-    if (strippedScheduling && !hasLetters) {
+    if ((strippedScheduling || strippedHallucination) && !hasLetters) {
       return 'ठीक है, कोई बात नहीं।';
     }
 
@@ -1241,6 +1269,21 @@ export class SessionState {
   };
 
   private extractTime(text: string, trimmed: string): void {
+    // ── Guard: only extract times in scheduling context ──────────────
+    // Same rationale as extractDate: a stray "10 baje" in general speech
+    // (e.g. "site visit karna hai 10 baje") should NOT populate the time
+    // slot before the visit is agreed and a date is captured. Only extract
+    // when we are actively collecting scheduling info.
+    const step = this.currentStep;
+    const inSchedulingContext =
+      this.visitAgreed ||
+      step === 'ASK_VISIT_DAY' || step === 'ASK_VISIT_TIME' || step === 'CONFIRM_VISIT' ||
+      this.lastAskedField === 'time' ||
+      !!this.info.preferredTime;
+    if (!inSchedulingContext) {
+      return;
+    }
+
     const timePatterns: Array<[RegExp, string]> = [
       [/\b(\d{1,2})\s*(am|pm|AM|PM)\b/, '$1 $2'],
       [/\b(\d{1,2})\s*o'?\s*clock\b/i, '$1 o\'clock'],
