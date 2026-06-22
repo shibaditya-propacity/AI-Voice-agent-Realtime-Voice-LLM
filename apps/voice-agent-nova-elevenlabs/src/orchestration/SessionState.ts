@@ -52,6 +52,7 @@ export type LastAskedField =
   | null;
 
 export interface CollectedInfo {
+  callerName: string | null;
   preferredDate: string | null;
   preferredTime: string | null;
   projectInterest: string | null;
@@ -142,6 +143,7 @@ export class SessionState {
 
   /** User information collected during the call. */
   readonly info: CollectedInfo = {
+    callerName: null,
     preferredDate: null,
     preferredTime: null,
     projectInterest: null,
@@ -359,6 +361,15 @@ export class SessionState {
     this.log.info('slot_update', { field: 'bhk', value: this.info.bhkPreference, turn: this.turnCount });
   }
 
+  setCallerName(name: string): void {
+    if (!name.trim()) return;
+    // Capitalize first letter of each word
+    const cleaned = name.trim().replace(/\b\w/g, c => c.toUpperCase());
+    if (this.info.callerName === cleaned) return;
+    this.info.callerName = cleaned;
+    this.log.info('slot_update', { field: 'callerName', value: cleaned, turn: this.turnCount });
+  }
+
   // ─── Booking Status Transitions ──────────────────────────────────────────
 
   /**
@@ -514,8 +525,12 @@ export class SessionState {
 
   toPromptBlock(): string {
     const f = (v: string | null) => (v ? `${v} ✓` : '—');
+    const nameLine = this.info.callerName
+      ? `Caller: ${this.info.callerName} ✓ (use their name naturally, e.g. "${this.info.callerName} ji")`
+      : 'Caller: — (name not yet known)';
     return [
       '[SESSION_STATE] (ground truth — use ✓ values, never re-ask them)',
+      nameLine,
       `BHK: ${f(this.info.bhkPreference)} | Budget: ${f(this.info.budgetMentioned)}`,
       `Visit day: ${f(this.info.preferredDate)} | Visit time: ${f(this.info.preferredTime)} | Booked: ${this.visitBooked ? 'yes' : 'no'}`,
       `[NEXT_ACTION] ${this.nextAction()}`,
@@ -568,22 +583,43 @@ export class SessionState {
    * Returns null if the current step is not a scheduling step (LLM needed).
    */
   getSchedulingResponse(): string | null {
+    const n = this.info.callerName ? `${this.info.callerName} ji, ` : '';
+    const dayHindi = this.dayToHindi(this.info.preferredDate);
     switch (this.currentStep) {
       case 'ASK_VISIT_DAY':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_DAY_REQUESTED', step: this.currentStep });
-        return 'ज़रूर, आपको कौन सा दिन convenient रहेगा — आज, कल, या इस weekend?';
+        return `${n}ज़रूर, आपको कौन सा दिन convenient रहेगा — आज, कल, या इस weekend?`;
       case 'ASK_VISIT_TIME':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_TIME_REQUESTED', step: this.currentStep, day: this.info.preferredDate });
-        return `${this.info.preferredDate} बिल्कुल चलेगा। किस time आना comfortable रहेगा — morning, afternoon, या evening?`;
+        return `${n}${dayHindi} बिल्कुल चलेगा। किस time आना comfortable रहेगा — morning, afternoon, या evening?`;
       case 'CONFIRM_VISIT':
       case 'BOOKED':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_CONFIRMED', step: this.currentStep, day: this.info.preferredDate, time: this.info.preferredTime });
-        return `Perfect, आपकी ${this.info.preferredDate} को ${this.info.preferredTime} की site visit book हो गई है। आपसे मिलकर अच्छा लगेगा, आपका दिन शुभ हो!`;
+        return `Perfect, ${n}आपकी site visit ${dayHindi} को ${this.info.preferredTime} के लिए book हो गई है। Location है Akshay Vista, Pimple Gurav, near Dmart, Pune। हमारी team आपको visit से पहले reminder call करेगी। आपका बहुत बहुत धन्यवाद, आपका दिन शुभ हो!`;
       case 'NOT_INTERESTED':
-        return 'कोई बात नहीं, आपका समय देने के लिए शुक्रिया। कभी भी interest हो तो बेझिझक call कीजिएगा। आपका दिन शुभ हो!';
+        return `${n}कोई बात नहीं, आपका समय देने के लिए शुक्रिया। कभी भी interest हो तो बेझिझक call कीजिएगा। आपका दिन शुभ हो!`;
       default:
         return null;
     }
+  }
+
+  /** Convert common English day references to Hindi-friendly spoken form. */
+  private dayToHindi(day: string | null): string {
+    if (!day) return '';
+    const d = day.toLowerCase().trim();
+    const map: Record<string, string> = {
+      'today': 'आज',
+      'tomorrow': 'कल',
+      'day after tomorrow': 'परसों',
+      'monday': 'Monday',
+      'tuesday': 'Tuesday',
+      'wednesday': 'Wednesday',
+      'thursday': 'Thursday',
+      'friday': 'Friday',
+      'saturday': 'Saturday',
+      'sunday': 'Sunday',
+    };
+    return map[d] ?? day;
   }
 
   // ─── Adaptive Token Budget ──────────────────────────────────────────────
@@ -914,6 +950,12 @@ export class SessionState {
     this._bhkMentionedThisTurn = false;
     this._dateMentionedThisTurn = false;
     this._timeMentionedThisTurn = false;
+
+    // ── Name extraction (only on early turns when name not yet captured) ──
+    if (!this.info.callerName) {
+      this.extractName(trimmed);
+    }
+
     this.extractBhk(lower);
     this.extractBudget(lower);
 
@@ -984,6 +1026,13 @@ export class SessionState {
           text: trimmed.substring(0, 50),
         });
         this.log.info('site_visit_agreed', { text: trimmed.substring(0, 50), reason: visitIntent.reason });
+
+        // Re-run date/time extraction now that visitAgreed is true.
+        // The initial extraction was skipped because inSchedulingContext was
+        // false. The user may have volunteered "kal 7 baje book karo" — both
+        // date and time in the same utterance that triggered visit agreement.
+        if (!this.info.preferredDate) this.extractDate(lower, trimmed);
+        if (!this.info.preferredTime) this.extractTime(text, trimmed);
       }
     }
 
@@ -1177,6 +1226,71 @@ export class SessionState {
     }
   }
 
+  /**
+   * Extract the caller's name from early-turn responses. Handles patterns like:
+   *   "mera naam Rahul hai", "my name is Priya", "I am Vikram",
+   *   "Rahul bol raha hun", "main Rahul", bare "Rahul" (when name was asked).
+   *
+   * Only runs when callerName is null (first 1-3 turns typically). Avoids
+   * false positives by requiring name-introduction patterns or a bare single/
+   * double-word response right after the greeting (lastAskedField = site_visit_interest,
+   * turnCount ≤ 2).
+   */
+  private extractName(trimmed: string): void {
+    // Words that are NOT names — common fillers, greetings, and short responses
+    // that a bare-word extractor would incorrectly capture as names.
+    const NOT_A_NAME = /^(yes|no|yeah|ok|okay|haan|ha|ji|nahi|hello|hi|hey|namaste|good|fine|thanks|thank|sure|right|hmm|hm|bye|theek|thik|acha|accha|bilkul|nahin|nhi|mat|kya|haa|sir|madam|ma'am|suno|suniye|bolo|boliye|batao|bataiye|कुछ|मैंने|नहीं|बहुत|यह|वह|क्या|कौन|कहाँ|कैसे|कब|कितना|कितने|कितनी|मुझे|हमें|उसे|इसे|अभी|पहले|बाद|ठीक|चलो|देखो|बोलो|सुनो|अच्छा|पसंद|चाहिए|ज़रूर|बताओ|दीजिए|करो|करना|जाना|आना|लेना|देना|रहा|रही|property|budget|price|flat|visit|site|book|token|loan|emi|rera|parking)$/i;
+
+    let name: string | null = null;
+
+    // Pattern 1: "mera naam X hai", "my name is X", "naam X hai"
+    const nameIs = trimmed.match(
+      /\b(?:my\s+name\s+is|i\s+am|i'm|mera\s+naam|naam)\s+([A-Z\u0900-\u097F][a-zA-Z\u0900-\u097F]+(?:\s+[A-Z\u0900-\u097F][a-zA-Z\u0900-\u097F]+)?)/i
+    );
+    if (nameIs) { name = nameIs[1]; }
+
+    // Pattern 2: "X bol raha hun", "X speaking", "main X"
+    if (!name) {
+      const speaking = trimmed.match(
+        /^(?:main\s+|मैं\s+)?([A-Z\u0900-\u097F][a-zA-Z\u0900-\u097F]+(?:\s+[A-Z\u0900-\u097F][a-zA-Z\u0900-\u097F]+)?)\s+(?:bol\s+raha|bol\s+rahi|speaking|बोल\s+रह[ाी])/i
+      );
+      if (speaking) { name = speaking[1]; }
+    }
+
+    // Pattern 3: "main X hun", "I'm X" — require trailing hun/hoon to avoid
+    // matching "main kuch" / "मैं कुछ" as a name. Only match "मैं" as exact
+    // whole word (not "मैंने" which is a different word).
+    if (!name) {
+      const mainX = trimmed.match(
+        /(?:^|\s)(?:main|मैं)(?=\s)\s+([A-Z\u0900-\u097F][a-zA-Z\u0900-\u097F]+(?:\s+[A-Z\u0900-\u097F][a-zA-Z\u0900-\u097F]+)?)\s+(?:hun|hoon|hu|हूँ|हूं|हू)\s*$/i
+      );
+      if (mainX) { name = mainX[1]; }
+    }
+
+    // Pattern 4: Bare name response — only when it's one of the first turns
+    // and the greeting just asked for the name (very short response = likely a name).
+    if (!name && this.turnCount <= 2) {
+      const words = trimmed.split(/\s+/).filter(w => w.length > 0);
+      // Accept 1-3 word responses where each word starts with uppercase or Devanagari
+      if (words.length >= 1 && words.length <= 3) {
+        const allNameLike = words.every(w =>
+          /^[A-Z\u0900-\u097F]/.test(w) && w.length >= 2 && !NOT_A_NAME.test(w)
+        );
+        if (allNameLike) {
+          name = words.join(' ');
+        }
+      }
+    }
+
+    if (name) {
+      // Final validation: reject if it looks like a common word, not a name
+      const cleaned = name.trim();
+      if (cleaned.length >= 2 && !NOT_A_NAME.test(cleaned.split(/\s+/)[0])) {
+        this.setCallerName(cleaned);
+      }
+    }
+  }
+
   private extractDate(lower: string, trimmed: string): void {
     // ── Guard: only extract dates in scheduling context ──────────────
     // Day names like "saturday" appear in Deepgram hallucinations of general
@@ -1340,6 +1454,7 @@ export class SessionState {
   getStateSnapshot(): Record<string, unknown> {
     return {
       step: this.currentStep,
+      callerName: this.info.callerName,
       bhkPreference: this.info.bhkPreference,
       budget: this.info.budgetMentioned,
       siteVisitDay: this.info.preferredDate,

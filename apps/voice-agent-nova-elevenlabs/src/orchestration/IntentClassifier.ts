@@ -88,7 +88,10 @@ const VISIT_EXPLICIT_ROMAN = /\b(dekhna|dekhne|dekhenge|dekh\s*lete|site\s*visit
 
 // ── Question Indicators ──────────────────────────────────────────────────────
 
-const QUESTION_MARKERS = /\b(what|how|where|when|which|why|who|can|does|is\s+there|tell\s+me|kya|kaise|kahan|kab|kaun|kitna|kitne|क्या|कैसे|कहाँ|कहां|कब|कौन|कितना|कितने)\b/i;
+// \b doesn't work with Devanagari (non-\w chars), so split into two patterns:
+// Latin words use \b; Devanagari words are position-flexible (like AFFIRM_HINDI).
+const QUESTION_MARKERS_LATIN = /\b(what|how|where|when|which|why|who|can|does|is\s+there|tell\s+me|kya|kaise|kahan|kab|kaun|kitna|kitne)\b/i;
+const QUESTION_MARKERS_HINDI = /(क्या|कैसे|कहाँ|कहां|कब|कौन|कितना|कितने)/;
 
 // ─── Classifier ──────────────────────────────────────────────────────────────
 
@@ -172,7 +175,7 @@ export function classifyIntent(
   const hasImperative = IMPERATIVE_ACCEPT.test(lower) || IMPERATIVE_HI.test(trimmed);
 
   if (hasWillingness || hasImperative) {
-    const hasQuestionMarker = QUESTION_MARKERS.test(lower) || trimmed.includes('?');
+    const hasQuestionMarker = QUESTION_MARKERS_LATIN.test(lower) || QUESTION_MARKERS_HINDI.test(trimmed) || trimmed.includes('?');
     // Willingness/imperative in visit context = visit intent, even with question
     // markers. "कितने बजे कर सकते हैं" in visit context = scheduling intent.
     if (visitContext) {
@@ -200,13 +203,21 @@ export function classifyIntent(
       if (hasNonSchedulingEntity) {
         return { intent: 'AGREEMENT', confidence: 0.7, reason: 'entity_priority_over_affirmative' };
       }
+      // ...UNLESS the utterance also contains a factual question.
+      // "हां property और facilities क्या क्या होंगे" = question with courtesy
+      // "हां" prefix, NOT visit agreement. Only treat bare affirmatives (short
+      // responses without question markers) as visit intent.
+      const hasQuestion = QUESTION_MARKERS_LATIN.test(lower) || QUESTION_MARKERS_HINDI.test(trimmed) || trimmed.includes('?');
+      if (hasQuestion) {
+        return { intent: 'QUESTION', confidence: 0.75, reason: 'question_overrides_affirmative_in_visit_context' };
+      }
       return { intent: 'VISIT_INTENT', confidence: 0.85, reason: 'affirmative_to_visit_ask' };
     }
     return { intent: 'AGREEMENT', confidence: 0.8, reason: 'affirmative_particle' };
   }
 
   // ── Priority 5: Question ───────────────────────────────────────────────
-  if (QUESTION_MARKERS.test(lower) || trimmed.includes('?')) {
+  if (QUESTION_MARKERS_LATIN.test(lower) || QUESTION_MARKERS_HINDI.test(trimmed) || trimmed.includes('?')) {
     return { intent: 'QUESTION', confidence: 0.7, reason: 'question_markers' };
   }
 

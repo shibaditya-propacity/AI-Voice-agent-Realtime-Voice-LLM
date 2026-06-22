@@ -40,6 +40,9 @@ const GENERIC_EXPANSIONS: [RegExp, string][] = [
   // Common numeric magnitude abbreviation (₹3 Cr → "3 crore").
   [/\bCr\b/g, 'crore'],
 
+  // "24x7" / "24X7" / "24×7" → "24 by 7" (Sarvam reads "x" as "ex").
+  [/\b24\s*[xX×]\s*7\b/g, '24 by 7'],
+
   // Domain acronyms Sarvam spells out wrong — render as Hindi phonetics.
   [/\bBHK\b/g,            'बी एच के'],
   [/\bRK\b/g,             'आर के'],

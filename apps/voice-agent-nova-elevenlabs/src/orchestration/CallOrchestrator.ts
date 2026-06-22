@@ -43,7 +43,7 @@ import { globalToolRegistry } from '../tools/ToolRegistry';
 import { maybeGetOpener } from '../shared/humanize';
 import { Env } from '../config/env';
 import { Logger, closeCallLogger } from '../shared/logger';
-import { routeQuery, resetLastRouterIntent } from '../llm/KnowledgeRouter';
+import { routeQuery, resetLastRouterIntent, probeFactIntent } from '../llm/KnowledgeRouter';
 import type { StreamEvent } from '../llm/types';
 
 type CallState =
@@ -160,6 +160,13 @@ export class CallOrchestrator {
   /** Timer that fires if caller is silent for SILENCE_TIMEOUT_MS after agent speaks. */
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly SILENCE_TIMEOUT_MS = 7000;
+
+  // ─── SPEAKING State Watchdog ──────────────────────────────────────────
+  // Safety net: if the bot is stuck in SPEAKING for too long without TTS
+  // completing (e.g. due to race conditions between rapid transcript events
+  // that cancel TTS), force transition back to LISTENING with a reprompt.
+  private speakingWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly SPEAKING_WATCHDOG_MS = 10000;
 
   // ─── Playback Duration Tracking ──────────────────────────────────────
   // ElevenLabs generates all audio in ~200ms but Twilio plays it over 3-5s.
@@ -343,6 +350,7 @@ export class CallOrchestrator {
     this.generationId++;
     this.activeResponseText = greetingText;
     this.state = 'SPEAKING';
+    this.startSpeakingWatchdog();
     this.suppressBargeInArm = true; // No barge-in during greeting
 
     // Add greeting to conversation history
@@ -359,6 +367,14 @@ export class CallOrchestrator {
 
     // Pre-warm TTS connection while greeting plays — hides ~300-500ms
     this.prewarmTTS();
+
+    // Warmup Sarvam's synthesis engine — first synthesis on a new WS takes
+    // ~3-4s (cold start). Sending a tiny text+flush now (during greeting
+    // playback) means the engine is hot when the first real response arrives.
+    // Audio from warmup is discarded (contextId "__warmup__" → genId -1).
+    if (this.tts instanceof SarvamTTS) {
+      this.tts.warmup();
+    }
 
     // Greeting is ~3-4s of audio. Estimate playback duration and transition to LISTENING.
     // 160 bytes per chunk at 8kHz = 20ms per chunk.
@@ -427,6 +443,7 @@ export class CallOrchestrator {
     this.cancelLatencyMaskTimer();
     this.resetAckState();
     this.clearSilenceTimer();
+    this.clearSpeakingWatchdog();
     this.clearSTTWatchdog();
 
     // Abort any active generation
@@ -674,6 +691,7 @@ export class CallOrchestrator {
     }
 
     this.state = 'SPEAKING';
+    this.startSpeakingWatchdog();
     this.suppressBargeInArm = false;
 
     // Mute STT during echo burst — unmutes after barge-in grace period
@@ -928,6 +946,7 @@ export class CallOrchestrator {
     }
 
     // ── Track previous state for pin detection ─────────────────────────
+    const prevName = this.session.info.callerName;
     const prevDate = this.session.info.preferredDate;
     const prevTime = this.session.info.preferredTime;
 
@@ -1009,16 +1028,31 @@ export class CallOrchestrator {
       // false containment matches on very short interims (e.g. "what are" matching anything)
       const lengthRatio = specText.length / Math.max(finalText.length, 1);
       if (specText.length >= 8 && lengthRatio >= 0.4 && (containsRaw || containsStemmed) && !conversationEndingThisTurn && !schedulingInfoExtracted) {
-        this.latency.recordSpeculation('confirmed_prefix');
-        this.log.info('Speculative generation CONFIRMED (containment match)', {
-          speculative: specText,
-          final: finalText,
-          savedMs: Date.now() - transcriptAt,
-        });
-        // Update the user message in history to reflect the complete text
-        this.conversation.updateLastUserMessage(finalText);
-        this.releaseSpeculativeAudio('confirmed_containment');
-        return;
+        // Probe the router intent for both texts WITHOUT side effects.
+        // routeQuery() mutates lastHandledIntent and can trigger
+        // markVisitSuggested() — probeFactIntent() is pure.
+        const specIntent = probeFactIntent(specText);
+        const finalIntent = probeFactIntent(finalText);
+        if (finalIntent && !specIntent) {
+          this.log.warn('Speculative containment OVERRIDDEN — final text has new intent', {
+            speculative: specText,
+            final: finalText,
+            specIntent,
+            finalIntent,
+          });
+          // Fall through to invalidation below
+        } else {
+          this.latency.recordSpeculation('confirmed_prefix');
+          this.log.info('Speculative generation CONFIRMED (containment match)', {
+            speculative: specText,
+            final: finalText,
+            savedMs: Date.now() - transcriptAt,
+          });
+          // Update the user message in history to reflect the complete text
+          this.conversation.updateLastUserMessage(finalText);
+          this.releaseSpeculativeAudio('confirmed_containment');
+          return;
+        }
       }
 
       // Text genuinely differs — abort the wrong speculation and regenerate.
@@ -1112,6 +1146,9 @@ export class CallOrchestrator {
     this.conversation.addUserMessage(text);
 
     // ── Pin message if it contained critical info extraction ──────────
+    if (!prevName && this.session.info.callerName) {
+      this.conversation.pinLastUserMessage('name:' + this.session.info.callerName);
+    }
     if (!prevDate && this.session.info.preferredDate) {
       this.conversation.pinLastUserMessage('date:' + this.session.info.preferredDate);
     }
@@ -1202,6 +1239,7 @@ export class CallOrchestrator {
     tts.startTurn(`g${myGenId}`);
 
     this.state = 'SPEAKING';
+    this.startSpeakingWatchdog();
     this.suppressBargeInArm = false;
 
     // Mute STT during echo burst
@@ -1277,6 +1315,7 @@ export class CallOrchestrator {
     tts.startTurn(`g${myGenId}`);
 
     this.state = 'SPEAKING';
+    this.startSpeakingWatchdog();
     this.suppressBargeInArm = false;
     this.muteSTTForEchoBurst();
 
@@ -1364,6 +1403,7 @@ export class CallOrchestrator {
     tts.startTurn(`g${myGenId}`);
 
     this.state = 'SPEAKING';
+    this.startSpeakingWatchdog();
     // Record whether barge-in should be armed for this generation.
     // We do NOT arm here — arm() is deferred to the first TTS audio chunk
     // so that trailing audio frames from the user's own speech (still
@@ -1780,6 +1820,7 @@ export class CallOrchestrator {
 
   private handleTTSDone(genId: number): void {
     if (genId !== this.generationId) return;
+    this.clearSpeakingWatchdog();
 
     // Still holding speculative audio — defer completion until release so we
     // don't compute playback timers / transition to LISTENING on zero bytes.
@@ -1885,6 +1926,7 @@ export class CallOrchestrator {
     }
 
     this.state = 'LISTENING';
+    this.clearSpeakingWatchdog();
     this.ensureSTTUnmuted();
     // Reset noise counter — any empty VADs from during TTS are echo, not ambient noise.
     this.consecutiveEmptyVADs = 0;
@@ -2085,6 +2127,45 @@ export class CallOrchestrator {
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer);
       this.silenceTimer = null;
+    }
+  }
+
+  // ─── SPEAKING Watchdog ─────────────────────────────────────────────────────
+  // Safety net: if the bot is in SPEAKING for SPEAKING_WATCHDOG_MS without
+  // TTS completing (e.g. race condition cancelled TTS), force back to LISTENING.
+
+  private startSpeakingWatchdog(): void {
+    this.clearSpeakingWatchdog();
+    this.speakingWatchdogTimer = setTimeout(() => {
+      this.speakingWatchdogTimer = null;
+      if (this.state !== 'SPEAKING') return;
+      if (this.session.shouldEndCall || this.conversationComplete) return;
+
+      this.log.warn('SPEAKING_WATCHDOG: stuck in SPEAKING — forcing LISTENING', {
+        ttsAudioBytes: this.ttsAudioBytesSent,
+        ttsGenerationDone: this.ttsGenerationDone,
+        watchdogMs: this.SPEAKING_WATCHDOG_MS,
+      });
+
+      // Cancel any in-flight generation
+      this.generationId++;
+      if (this.abortController) {
+        this.abortController.abort();
+        this.abortController = null;
+      }
+      this.tts.abort();
+      this.twilioService.clearAudio(this.callSid);
+
+      this.state = 'LISTENING';
+      this.ensureSTTUnmuted();
+      this.startSilenceTimer();
+    }, this.SPEAKING_WATCHDOG_MS);
+  }
+
+  private clearSpeakingWatchdog(): void {
+    if (this.speakingWatchdogTimer) {
+      clearTimeout(this.speakingWatchdogTimer);
+      this.speakingWatchdogTimer = null;
     }
   }
 

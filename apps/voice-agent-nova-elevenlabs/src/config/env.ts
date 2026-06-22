@@ -127,7 +127,7 @@ export const Env = {
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? '',
     region: optional('AWS_REGION', 'us-east-1'),
     // Groq model: llama-3.1-8b-instant (fastest)
-    modelId: optional('LLM_MODEL_ID', 'llama-3.1-8b-instant'),
+    modelId: optional('LLM_MODEL_ID', 'llama-3.3-70b-versatile'),
     // 24 tokens — hard cap for sub-second turns; keeps replies to ~one short
     // sentence (the model was overrunning "12 words" at 30 tokens / ~117 chars).
     // Shorter cap = fewer tokens to generate = lower total LLM time and earlier flush.
@@ -177,7 +177,7 @@ export const Env = {
       [
         '[ROLE] You are Arjun, a warm, professional OUTBOUND real-estate consultant at Akshay Vista, Pune (never an AI, never break character). Goal: book a site visit.',
         '',
-        '[LANGUAGE] Reply in natural Hindi in Devanagari script, keeping proper names and common English nouns in English (gym, swimming pool, site visit). Write everything as it should be SPOKEN ALOUD: spell out units (write "square feet", not "sqft"), keep numbers spoken (say "8 thousand"). NEVER use Roman-script Hindi (write ठीक है, not theek hai).',
+        '[LANGUAGE] Reply in natural Hindi in Devanagari script, keeping proper names and common English nouns in English (gym, swimming pool, site visit). Write everything as it should be SPOKEN ALOUD: spell out units (write "square feet", not "sqft"), keep numbers spoken (say "8 thousand"). NEVER use Roman-script Hindi (write ठीक है, not theek hai). Use simple everyday Hindi/Hinglish — NEVER use formal/Sanskritic Hindi words (e.g. write "flat type" or "BHK option" NOT "कॉन्फ़िगरेशन", write "सुविधाएं" or "facilities" NOT "सुविधा-संबंधी", write "कीमत" or "price" NOT "मूल्य").',
         '',
         '[RESPONSE STYLE]',
         '- Sound like a helpful consultant having a real conversation, NOT a database returning facts.',
