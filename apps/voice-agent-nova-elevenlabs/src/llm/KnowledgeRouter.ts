@@ -1,10 +1,10 @@
 /**
  * KnowledgeRouter: deterministic zero-LLM-token fact answering layer.
  *
- * Intercepts factual questions about the property (price, location, amenities,
- * possession, BHK, builder, units) and returns pre-built responses directly —
- * bypassing LLM entirely. This eliminates token usage, removes hallucination
- * risk, and cuts latency to near-zero for ~60% of inbound questions.
+ * Intercepts factual questions about the property and returns pre-built
+ * conversational responses directly — bypassing LLM entirely. This eliminates
+ * token usage, removes hallucination risk, and cuts latency to near-zero for
+ * ~80% of inbound questions.
  *
  * The LLM is only invoked for:
  *   - Open-ended / conversational questions
@@ -18,34 +18,78 @@ import { Logger } from '../shared/logger';
 import type { SessionState } from '../orchestration/SessionState';
 
 // ─── Fact Intent Classification ──────────────────────────────────────────────
-// Each intent maps a set of regex patterns to a response-builder function.
-// Patterns are tested in order; first match wins. All patterns are
-// case-insensitive. Hindi (Devanagari) keywords use direct matching since
-// \b doesn't work with non-ASCII word boundaries.
 
 export type FactIntent =
   | 'PRICE'
+  | 'PRICE_BHK'
   | 'LOCATION'
+  | 'LANDMARKS'
   | 'AMENITIES'
   | 'BHK'
+  | 'CARPET_AREA'
   | 'POSSESSION'
+  | 'CONSTRUCTION_STATUS'
   | 'BUILDER'
   | 'UNITS'
-  | 'PROJECT_NAME';
+  | 'PROJECT_NAME'
+  | 'PAYMENT_PLAN'
+  | 'BOOKING_AMOUNT'
+  | 'LOAN'
+  | 'PARKING'
+  | 'RERA'
+  | 'STAMP_DUTY'
+  | 'USP'
+  | 'SITE_VISIT_INFO'
+  | 'SECURITY'
+  | 'FLOOR_TOWER';
 
 interface IntentRule {
   intent: FactIntent;
   patterns: RegExp[];
 }
 
+// Rules are tested in order — more specific intents must appear before generic ones.
 const INTENT_RULES: IntentRule[] = [
+  // ── Booking Amount (before PRICE — "booking amount" must not match generic PRICE) ─
+  {
+    intent: 'BOOKING_AMOUNT',
+    patterns: [
+      /\b(booking\s*amount|token|token\s*money|advance|kitna\s*dena|कितना\s*देना|initial\s*amount|upfront)\b/i,
+    ],
+  },
+  // ── Price by BHK (must be before generic PRICE) ──────────────────────
+  {
+    intent: 'PRICE_BHK',
+    patterns: [
+      /\b(2\.?5?|3|two|three)\s*bhk\b[^?]*\b(price|cost|kitna|kitne|कितना|कितने|कीमत|दाम|rate|budget|amount)\b/i,
+      /\b(price|cost|kitna|kitne|कितना|कितने|कीमत|दाम|rate)\b[^?]*\b(2\.?5?|3|two|three)\s*bhk\b/i,
+      /\b(2\.?5?|3|two|three)\s*bhk\b[^?]*\b(ka|ki|ke|का|की|के)\b/i,
+    ],
+  },
+  // ── Generic Price ────────────────────────────────────────────────────
   {
     intent: 'PRICE',
     patterns: [
-      /\b(price|pricing|cost|rate|budget|kitna|kitne|कितना|कितने|कीमत|दाम|amount|paisa|पैसा|per\s*sq\s*ft|sqft|square\s*feet|वर्ग\s*फ़ीट|वर्गफीट|वर्गफुट)\b/i,
+      /\b(price|pricing|cost|rate|budget|kitna|kitne|कितना|कितने|कीमत|दाम|paisa|पैसा|per\s*sq\s*ft|sqft|square\s*feet|वर्ग\s*फ़ीट|वर्गफीट|वर्गफुट)\b/i,
       /(?:कितने|kitne|kitna|कितना)\s*(?:का|ki|में|mein|me)/i,
     ],
   },
+  // ── Carpet Area / Size ──────────────────────────────────────────────
+  {
+    intent: 'CARPET_AREA',
+    patterns: [
+      /\b(carpet\s*area|built\s*up|super\s*built|size|area|kitna\s*bada|कितना\s*बड़ा|sq\s*ft|sqft|square\s*feet|kitne\s*sq|flat\s*size|apartment\s*size)\b/i,
+    ],
+  },
+  // ── Landmarks / Nearby ──────────────────────────────────────────────
+  {
+    intent: 'LANDMARKS',
+    patterns: [
+      /\b(nearby|near|around|paas|पास|aas\s*paas|आसपास|landmark|school|hospital|metro|station|highway|expressway|mall|market|college|connectivity|connect|transport|commute|IT\s*park|hinjewadi)\b/i,
+      /\b(kya\s*hai\s*nearby|आसपास\s*क्या\s*है|paas\s*mein\s*kya)\b/i,
+    ],
+  },
+  // ── Location ────────────────────────────────────────────────────────
   {
     intent: 'LOCATION',
     patterns: [
@@ -53,15 +97,28 @@ const INTENT_RULES: IntentRule[] = [
       /(?:project|property)\s+(?:kahan|kidhar|where|कहाँ|कहां)/i,
     ],
   },
+  // ── Amenities ──────────────────────────────────────────────────────
   {
     intent: 'AMENITIES',
     patterns: [
-      /\b(ameniti|amenity|amenities|facilities|facility|features?|suvidha|सुविधा|सुविधाएं|सुविधाएँ|gym|pool|swimming|parking|garden|club\s*house|ev\s*charg|kids?\s*zone|play\s*area)\b/i,
-      // NOTE: The old catch-all "kya hai" pattern was removed — it matched ANY
-      // "क्या है" question (e.g. "configuration का क्या है" → AMENITIES instead of BHK).
-      // Amenity-specific keywords in the first pattern are sufficient.
+      /\b(ameniti|amenity|amenities|facilities|facility|features?|suvidha|सुविधा|सुविधाएं|सुविधाएँ|gym|pool|swimming|garden|club\s*house|ev\s*charg|kids?\s*zone|play\s*area|joggin|walking\s*track)\b/i,
     ],
   },
+  // ── Parking ────────────────────────────────────────────────────────
+  {
+    intent: 'PARKING',
+    patterns: [
+      /\b(parking|car\s*park|gaadi|गाड़ी|two\s*wheeler|bike\s*park|covered\s*park|open\s*park|basement)\b/i,
+    ],
+  },
+  // ── Security ──────────────────────────────────────────────────────
+  {
+    intent: 'SECURITY',
+    patterns: [
+      /\b(security|safe|safety|cctv|guard|suraksha|सुरक्षा|watchman|surveillance)\b/i,
+    ],
+  },
+  // ── BHK / Configuration ────────────────────────────────────────────
   {
     intent: 'BHK',
     patterns: [
@@ -69,6 +126,21 @@ const INTENT_RULES: IntentRule[] = [
       /(?:kaun|कौन)\s*(?:se|से)\s*(?:bhk|flat|apartment)/i,
     ],
   },
+  // ── Floor / Tower ─────────────────────────────────────────────────
+  {
+    intent: 'FLOOR_TOWER',
+    patterns: [
+      /\b(floor|tower|manzil|मंज़िल|kitne\s*floor|कितने\s*floor|how\s*many\s*floor|storey|story|building)\b/i,
+    ],
+  },
+  // ── Construction Status ───────────────────────────────────────────
+  {
+    intent: 'CONSTRUCTION_STATUS',
+    patterns: [
+      /\b(construction|kahan\s*tak\s*ban|कहाँ\s*तक\s*बन|kitna\s*ban|कितना\s*बन|progress|status|slab|work\s*start|kaam\s*shuru|काम\s*शुरू)\b/i,
+    ],
+  },
+  // ── Possession ────────────────────────────────────────────────────
   {
     intent: 'POSSESSION',
     patterns: [
@@ -76,49 +148,128 @@ const INTENT_RULES: IntentRule[] = [
       /(?:kab|कब)\s+(?:tak|तक|ready|milega|मिलेगा|complete|banega|बनेगा)/i,
     ],
   },
+  // ── Payment Plan ──────────────────────────────────────────────────
+  {
+    intent: 'PAYMENT_PLAN',
+    patterns: [
+      /\b(payment\s*plan|payment\s*schedule|kaise\s*pay|कैसे\s*pay|instalment|installment|emi\s*plan|construction\s*linked|milestone|20.*80|down\s*payment)\b/i,
+    ],
+  },
+  // ── Loan / Finance ────────────────────────────────────────────────
+  {
+    intent: 'LOAN',
+    patterns: [
+      /\b(loan|home\s*loan|finance|emi|bank\s*loan|sbi|hdfc|icici|axis|bank\s*se|बैंक\s*से|pre\s*approved|loan\s*available|loan\s*milega)\b/i,
+    ],
+  },
+  // ── RERA ──────────────────────────────────────────────────────────
+  {
+    intent: 'RERA',
+    patterns: [
+      /\b(rera|registration\s*number|registered|legal|approval|permission|govt\s*approv|सरकारी\s*मंज़ूरी)\b/i,
+    ],
+  },
+  // ── Stamp Duty / Registration / GST / Taxes ──────────────────────
+  {
+    intent: 'STAMP_DUTY',
+    patterns: [
+      /\b(stamp\s*duty|registration\s*charge|gst|tax|government\s*charge|extra\s*charge|hidden\s*charge|additional\s*cost|other\s*charge|total\s*cost|kitna\s*extra|कितना\s*extra|sarkari|सरकारी)\b/i,
+    ],
+  },
+  // ── Builder ───────────────────────────────────────────────────────
   {
     intent: 'BUILDER',
     patterns: [
-      /\b(builder|developer|company|firm|kisne\s*banaya|किसने\s*बनाया|kaun\s*sa\s*builder|कौन\s*सा\s*builder|group|promoter)\b/i,
+      /\b(builder|developer|company|firm|kisne\s*banaya|किसने\s*बनाया|kaun\s*sa\s*builder|कौन\s*सा\s*builder|group|promoter|lunkad)\b/i,
     ],
   },
+  // ── Units ─────────────────────────────────────────────────────────
   {
     intent: 'UNITS',
     patterns: [
       /\b(units?|total\s*flats?|kitne\s*flat|कितने\s*flat|how\s*many\s*flat|apartments?\s*available|flats?\s*available|total\s*apartments?)\b/i,
     ],
   },
+  // ── Project Name ──────────────────────────────────────────────────
   {
     intent: 'PROJECT_NAME',
     patterns: [
       /\b(project\s*name|naam|नाम|konsa\s*project|कौनसा\s*project|which\s*project|project\s*ka\s*naam)\b/i,
     ],
   },
+  // ── USP / Why This Project ────────────────────────────────────────
+  {
+    intent: 'USP',
+    patterns: [
+      /\b(usp|special|kya\s*khaas|क्या\s*ख़ास|क्या\s*खास|unique|different|alag|अलग|why\s*this|best\s*thing|highlight|advantage|fayda|फ़ायदा|फायदा|vastu)\b/i,
+    ],
+  },
+  // ── Site Visit Info ───────────────────────────────────────────────
+  {
+    intent: 'SITE_VISIT_INFO',
+    patterns: [
+      /\b(site\s*visit\s*address|kahan\s*aana|कहाँ\s*आना|office\s*address|site\s*address|timing|kab\s*aa\s*sakte|कब\s*आ\s*सकते|open\s*on\s*sunday|sunday\s*open|sample\s*flat|model\s*flat)\b/i,
+    ],
+  },
 ];
 
 // ─── Response Templates ──────────────────────────────────────────────────────
-// Pre-built Hindi/Hinglish responses for each fact intent. These are spoken
-// directly by TTS without LLM involvement. The name suffix is appended by
-// the router when the caller's name is known.
+// Conversational Hindi/Hinglish responses — fact + natural follow-up.
 
 function buildResponse(intent: FactIntent): string {
   switch (intent) {
     case 'PRICE':
-      return `${PROPERTY_FACTS.project} में price ${PROPERTY_FACTS.pricePerSqft} है।`;
+      return `${PROPERTY_FACTS.project} में price roughly ${PROPERTY_FACTS.pricePerSqft} है, overall range ${PROPERTY_FACTS.priceRange} तक है। आप किस budget range में देख रहे हैं?`;
+    case 'PRICE_BHK': {
+      const lines = Object.entries(PROPERTY_FACTS.configs)
+        .map(([bhk, c]) => `${bhk} starting ${c.startingPrice} से`)
+        .join(', ');
+      return `${lines} — ये carpet area और floor के हिसाब से vary करता है।`;
+    }
+    case 'CARPET_AREA': {
+      const lines = Object.entries(PROPERTY_FACTS.configs)
+        .map(([bhk, c]) => `${bhk}: ${c.carpetArea}`)
+        .join(', ');
+      return `Carpet area — ${lines}। सब RERA carpet area है, no hidden super built-up।`;
+    }
     case 'LOCATION':
-      return `${PROPERTY_FACTS.project} ${PROPERTY_FACTS.location} में है।`;
+      return `${PROPERTY_FACTS.project} ${PROPERTY_FACTS.location} में है — Pimple Gurav Metro Station से बस 5 minute walk।`;
+    case 'LANDMARKS':
+      return `${PROPERTY_FACTS.landmarks.slice(0, 4).join(', ')} — connectivity काफ़ी अच्छी है। Hinjewadi IT Park भी 20 minute में पहुँच जाओगे।`;
     case 'AMENITIES':
-      return `${PROPERTY_FACTS.project} में ${PROPERTY_FACTS.amenities.join(', ')} available हैं।`;
+      return `Gym, स्विमिंग पूल, क्लबहाउस, किड्स ज़ोन, ई वी चार्जिंग, जॉगिंग ट्रैक, लैंडस्केप्ड गार्डन — सब कुछ available है। क्लबहाउस अकेला 5000 square feet का है।`;
+    case 'PARKING':
+      return `One covered parking हर flat के साथ included है price में। Additional open parking ${PROPERTY_FACTS.parking.additional} में available है, और two-wheeler parking free।`;
+    case 'SECURITY':
+      return `${PROPERTY_FACTS.amenitiesDetailed.security} — plus intercom facility हर flat में।`;
     case 'BHK':
-      return `${PROPERTY_FACTS.project} में ${PROPERTY_FACTS.bhk.join(', ')} BHK options available हैं।`;
+      return `${PROPERTY_FACTS.project} में ${PROPERTY_FACTS.bhk.join(', ')} BHK options available हैं। आप किस configuration में interested हैं?`;
+    case 'FLOOR_TOWER':
+      return `Total ${PROPERTY_FACTS.towers} towers हैं, हर tower ${PROPERTY_FACTS.totalFloors} floors का। हर tower में 2 high-speed lifts हैं।`;
+    case 'CONSTRUCTION_STATUS':
+      return `${PROPERTY_FACTS.constructionStatus}। काम तेज़ी से चल रहा है, possession ${PROPERTY_FACTS.possession} में expected है।`;
     case 'POSSESSION':
-      return `Possession ${PROPERTY_FACTS.possession} में expected है।`;
+      return `Possession ${PROPERTY_FACTS.possession} में expected है। Project RERA registered है और सब approvals पहले से हैं।`;
+    case 'PAYMENT_PLAN':
+      return `${PROPERTY_FACTS.paymentPlan}। इसका मतलब booking पर सिर्फ 20% देना होगा, बाकी possession के time।`;
+    case 'BOOKING_AMOUNT':
+      return `Booking amount सिर्फ ${PROPERTY_FACTS.bookingAmount} है — इससे flat lock हो जाएगा। बाकी construction-linked plan पर आएगा।`;
+    case 'LOAN':
+      return `Home loan pre-approved है ${PROPERTY_FACTS.preApprovedBanks.join(', ')} से — documentation में हमारी team full help करेगी। Site visit पे आओगे तो loan details भी discuss कर लेंगे।`;
+    case 'RERA':
+      return `Project RERA registered है — number ${PROPERTY_FACTS.reraNumber}। सब government approvals पहले से in place हैं।`;
+    case 'STAMP_DUTY':
+      return `Stamp duty ${PROPERTY_FACTS.stampDuty}, registration ${PROPERTY_FACTS.registration}, और GST ${PROPERTY_FACTS.gst} — ये flat price के ऊपर additional है।`;
     case 'BUILDER':
-      return `${PROPERTY_FACTS.project} ${PROPERTY_FACTS.developer} group का project है।`;
+      return `${PROPERTY_FACTS.project} ${PROPERTY_FACTS.developer} group का project है — ${PROPERTY_FACTS.developerTrackRecord}। Pune में काफ़ी trusted name है।`;
     case 'UNITS':
-      return `${PROPERTY_FACTS.project} में total ${PROPERTY_FACTS.units} units हैं।`;
+      return `${PROPERTY_FACTS.project} में total ${PROPERTY_FACTS.units} units हैं ${PROPERTY_FACTS.towers} towers में। Limited inventory है, तो जल्दी decide करना better रहेगा।`;
     case 'PROJECT_NAME':
-      return `Project का नाम ${PROPERTY_FACTS.project} है, ${PROPERTY_FACTS.location} में।`;
+      return `Project का नाम ${PROPERTY_FACTS.project} है, ${PROPERTY_FACTS.developer} group का, ${PROPERTY_FACTS.location} में।`;
+    case 'USP':
+      return `Metro station 5 minute walk, Vastu compliant design, no common wall between flats यानी complete privacy, और R.R. Lunkad का 30 साल का trust — ये सब cheezein इसको special बनाती हैं।`;
+    case 'SITE_VISIT_INFO':
+      return `Site visit ${PROPERTY_FACTS.siteVisitTimings} — Sunday भी open है। Address: ${PROPERTY_FACTS.siteVisitAddress}।`;
   }
 }
 
@@ -152,20 +303,30 @@ export interface RouterResult {
   reason: string;
 }
 
-/**
- * Classify user transcript and return a direct fact response if possible.
- *
- * @param text  - User's transcript (raw from STT)
- * @param session - Current session state (for name, step context)
- * @param log   - Logger instance for the call
- * @returns RouterResult indicating whether the query was handled
- */
 /** Last intent handled by the router — used to prevent identical repeated responses. */
 let lastHandledIntent: FactIntent | null = null;
 
 /** Reset after LLM handles a turn, so the next same-intent question gets the canned response. */
 export function resetLastRouterIntent(): void {
   lastHandledIntent = null;
+}
+
+/**
+ * Side-effect-free probe: does this text match a fact intent?
+ * Used by speculative containment to compare spec vs final intent without
+ * mutating lastHandledIntent or triggering markVisitSuggested().
+ */
+export function probeFactIntent(text: string): FactIntent | null {
+  const trimmed = text.trim();
+  for (const pat of NEEDS_LLM) {
+    if (pat.test(trimmed)) return null;
+  }
+  for (const rule of INTENT_RULES) {
+    for (const pat of rule.patterns) {
+      if (pat.test(trimmed)) return rule.intent;
+    }
+  }
+  return null;
 }
 
 export function routeQuery(

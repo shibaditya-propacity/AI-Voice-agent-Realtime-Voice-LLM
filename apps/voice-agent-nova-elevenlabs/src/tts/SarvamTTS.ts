@@ -173,6 +173,38 @@ export class SarvamTTS {
     return this.openPromise;
   }
 
+  // ─── Warmup ───────────────────────────────────────────────────────────────
+
+  /** Whether a warmup has been performed (once per connection). */
+  private warmedUp = false;
+
+  /**
+   * Pre-warm Sarvam's synthesis engine by sending a tiny text + flush.
+   * Sarvam's first synthesis on a new WS takes ~3-4s (cold start); subsequent
+   * ones take ~200-700ms. This warmup runs during greeting playback so the
+   * first real response is fast. Audio is silently discarded.
+   */
+  warmup(): void {
+    if (this.destroyed || this.warmedUp) return;
+    if (this.state !== 'open') {
+      // Queue warmup for after connection opens
+      void this.open().then(() => this.warmup()).catch(() => {});
+      return;
+    }
+    this.warmedUp = true;
+    // Use a special context id so handleMessage discards audio
+    this.activeContextId = '__warmup__';
+    this.textSentThisTurn = true;
+    this.firstAudioReceived = false;
+    this.turnStartTime = Date.now();
+    this.hindiInjectedThisTurn = false;
+    this.preSendBuffer = '';
+    // Short Hindi text — cheap to synthesize, satisfies Devanagari requirement
+    this.send({ type: 'text', data: { text: 'नमस्ते।' } });
+    this.sendFlush();
+    this.log.info('TTS warmup sent');
+  }
+
   // ─── Turn Lifecycle ───────────────────────────────────────────────────────
 
   /** Begin a new turn. Each turn streams text then flushes on the shared WS. */
