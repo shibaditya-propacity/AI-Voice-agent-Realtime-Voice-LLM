@@ -31,8 +31,12 @@ import { TwilioService } from '../twilio/TwilioService';
 import { Env } from '../../config';
 import { Logger, closeCallLogger } from '../../shared/Logger';
 import type { StreamEvent } from './LLMTypes';
-import { classifyIntent, isLocallyRoutable, buildLocalResponse, IntentMetrics } from '../intent';
+import { classifyIntent, isLocallyRoutable, buildLocalResponse, IntentMetrics, Intent } from '../intent';
 import { PROPERTY_FACTS } from '../conversation/PropertyFacts';
+import { handleObjection, detectObjection } from '../sales/CommonObjections';
+import { ConversationMemory } from '../sales/ConversationMemory';
+import { Humanizer } from '../sales/Humanizer';
+import { getVisitPitch } from '../sales/VisitPitches';
 
 type CallState =
   | 'IDLE'
@@ -54,6 +58,8 @@ export class CallOrchestrator {
   private readonly latency: LatencyTracker;
   private readonly bargeIn: BargeInDetector;
   private readonly intentMetrics: IntentMetrics;
+  private readonly memory: ConversationMemory;
+  private readonly humanizer: Humanizer;
   private readonly log: Logger;
 
   private generationId = 0;
@@ -122,6 +128,8 @@ export class CallOrchestrator {
     this.latency        = new LatencyTracker(callSid);
     this.bargeIn        = new BargeInDetector(callSid);
     this.intentMetrics  = new IntentMetrics(callSid);
+    this.memory         = new ConversationMemory();
+    this.humanizer      = new Humanizer();
     this.log            = Logger.forCall(callSid, 'CallOrchestrator');
   }
 
@@ -199,6 +207,7 @@ export class CallOrchestrator {
 
     this.latency.logCallSummary();
     this.intentMetrics.logCallSummary();
+    this.log.info('ConversationMemorySummary', this.memory.getSnapshot() as Record<string, unknown>);
     this.log.info('Call orchestrator ended');
 
     closeCallLogger(this.callSid);
@@ -490,15 +499,15 @@ export class CallOrchestrator {
     }
 
     // ── Intent-based local routing (no LLM) ─────────────────────────
-    const localResponse = this.maybeLocalIntentResponse(text);
-    if (localResponse) {
+    const localResult = this.maybeLocalIntentResponse(text);
+    if (localResult) {
       this.log.info('Intent routed locally (no LLM)', {
-        response: localResponse, transcriptToResponseMs: Date.now() - transcriptAt,
+        response: localResult.response,
+        intent: localResult.intent,
+        transcriptToResponseMs: Date.now() - transcriptAt,
       });
-      const humanPrefix = Env.humanization.enabled
-        ? maybeGetOpener(text)
-        : '';
-      const fullResponse = humanPrefix ? humanPrefix + localResponse : localResponse;
+      const humanPrefix = this.humanizer.maybeAcknowledge(text);
+      const fullResponse = humanPrefix + localResult.response;
       this.conversation.addAssistantText(fullResponse);
       this.session.extractFromAssistantResponse(fullResponse);
       this.speakCanned(fullResponse);
@@ -550,19 +559,9 @@ export class CallOrchestrator {
 
   // ─── Intent-Based Local Routing ─────────────────────────────────────────
 
-  /**
-   * Classify the user utterance and return a deterministic response if the
-   * intent is a property-information query. Returns null to fall through to LLM.
-   *
-   * Skipped when:
-   *  - Name hasn't been collected yet (GET_NAME flow needs LLM personality)
-   *  - Booking is in progress (scheduling flow handles these)
-   */
-  private maybeLocalIntentResponse(userText: string): string | null {
-    // Don't short-circuit LLM during name collection — needs conversational handling
-    if (!this.session.info.name) {
-      return null;
-    }
+  private maybeLocalIntentResponse(userText: string): { response: string; intent: string } | null {
+    // Don't short-circuit LLM during name collection
+    if (!this.session.info.name) return null;
 
     // Don't route locally during active scheduling
     const status = this.session.bookingStatus;
@@ -572,23 +571,91 @@ export class CallOrchestrator {
     }
 
     const classification = classifyIntent(userText);
+    const turn = this.session.currentTurn;
 
+    // ── 1. Property-information intents → deterministic response ─────
     if (isLocallyRoutable(classification.intent)) {
+      this.memory.recordQuestion(classification.intent);
+
       const response = buildLocalResponse(
         classification.intent,
         PROPERTY_FACTS,
-        this.session.currentTurn,
+        turn,
       );
 
       if (response) {
+        this.memory.recordAnswered(classification.intent);
         this.intentMetrics.record(classification.intent, 'local', classification.classificationTimeUs);
-        return response;
+
+        // Maybe append a visit invitation if interest threshold is met
+        const withVisit = this.maybeAppendVisitInvite(response);
+        return { response: withVisit, intent: classification.intent };
       }
     }
 
-    // Not locally routable — record as LLM-bound
+    // ── 2. Objections → deterministic playbook ──────────────────────
+    if (classification.intent === Intent.OBJECTION) {
+      const objection = detectObjection(userText);
+      if (objection) {
+        const alreadyHandled = this.memory.hasHandledObjection(objection);
+        this.memory.recordObjection(objection);
+
+        if (!alreadyHandled) {
+          const response = handleObjection(userText, turn);
+          if (response) {
+            this.intentMetrics.record(classification.intent, 'local', classification.classificationTimeUs);
+            this.log.info('Objection handled locally', { objection });
+            return { response, intent: `OBJECTION:${objection}` };
+          }
+        }
+        // Repeated objection or no playbook → fall through to LLM
+      }
+    }
+
+    // ── 3. Visit interest → acknowledge (scheduling state machine handles the rest)
+    if (classification.intent === Intent.VISIT_INTEREST) {
+      this.memory.recordQuestion(Intent.VISIT_INTEREST);
+      // Don't handle locally — let the scheduling state machine + LLM handle it
+      // (the scheduling canned responses cover day/time collection)
+    }
+
+    // ── 4. Visit rejection → deterministic response ─────────────────
+    if (classification.intent === Intent.VISIT_REJECTION) {
+      this.memory.recordQuestion(Intent.VISIT_REJECTION);
+      this.intentMetrics.record(classification.intent, 'local', classification.classificationTimeUs);
+      return {
+        response: 'Koi baat nahi. Koi sawaal ho toh kabhi bhi pooch sakte hain.',
+        intent: 'VISIT_REJECTION',
+      };
+    }
+
+    // Not locally routable → LLM
     this.intentMetrics.record(classification.intent, 'llm', classification.classificationTimeUs);
     return null;
+  }
+
+  /**
+   * Append a visit invitation to a response if interest score threshold
+   * is met and no invite has been shown yet.
+   */
+  private maybeAppendVisitInvite(response: string): string {
+    if (!this.memory.isReadyForVisitInvite()) return response;
+
+    const pitch = getVisitPitch(
+      PROPERTY_FACTS,
+      this.session.currentTurn,
+      this.session.info.name || undefined,
+    );
+
+    this.memory.recordVisitInvite();
+    this.intentMetrics.recordVisitInvite();
+
+    this.log.info('Visit invite triggered', {
+      interestScore: this.memory.interestScore,
+      questionsAsked: this.memory.uniqueQuestionsCount,
+    });
+
+    return `${response} ${pitch}`;
   }
 
   // ─── LLM + TTS Pipeline ───────────────────────────────────────────────────

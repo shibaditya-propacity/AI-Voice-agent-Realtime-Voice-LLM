@@ -30,6 +30,8 @@ export class IntentMetrics {
 
   private routedLocal = 0;
   private routedLLM = 0;
+  private objectionPlaybooksUsed = 0;
+  private visitInvitesTriggered = 0;
   private classificationTimesUs: number[] = [];
   private readonly distribution: Map<Intent, number> = new Map();
 
@@ -54,6 +56,10 @@ export class IntentMetrics {
   record(intent: Intent, routed: 'local' | 'llm', classificationTimeUs: number): void {
     if (routed === 'local') {
       this.routedLocal++;
+      // Count objection playbooks
+      if (intent === Intent.OBJECTION) {
+        this.objectionPlaybooksUsed++;
+      }
     } else {
       this.routedLLM++;
     }
@@ -66,6 +72,11 @@ export class IntentMetrics {
       routed,
       classificationTimeUs,
     });
+  }
+
+  /** Record a visit invite trigger. */
+  recordVisitInvite(): void {
+    this.visitInvitesTriggered++;
   }
 
   /** Log call-level summary. */
@@ -90,7 +101,9 @@ export class IntentMetrics {
       INTENT_LOCAL_PCT: localPct,
       INTENT_CLASSIFICATION_TIME_AVG_US: avgClassificationUs,
       INTENT_DISTRIBUTION: dist,
-      latencySavedEstimateMs: this.routedLocal * 150, // ~150ms avg LLM TTFT saved per local route
+      OBJECTION_PLAYBOOK_USED: this.objectionPlaybooksUsed,
+      VISIT_INVITE_TRIGGERED: this.visitInvitesTriggered,
+      latencySavedEstimateMs: this.routedLocal * 150,
     });
   }
 
@@ -98,12 +111,20 @@ export class IntentMetrics {
   getStats(): {
     routedLocal: number;
     routedLLM: number;
+    objectionPlaybooksUsed: number;
+    visitInvitesTriggered: number;
     distribution: Record<string, number>;
   } {
     const dist: Record<string, number> = {};
     for (const [intent, count] of this.distribution) {
       dist[intent] = count;
     }
-    return { routedLocal: this.routedLocal, routedLLM: this.routedLLM, distribution: dist };
+    return {
+      routedLocal: this.routedLocal,
+      routedLLM: this.routedLLM,
+      objectionPlaybooksUsed: this.objectionPlaybooksUsed,
+      visitInvitesTriggered: this.visitInvitesTriggered,
+      distribution: dist,
+    };
   }
 }
