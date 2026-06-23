@@ -34,6 +34,7 @@ import { hasGreetingAudio, getGreetingChunks } from '../tts/GreetingCache';
 import { hasAckClips, getRandomAckClip } from '../tts/AckCache';
 import type { AckClip } from '../tts/AckCache';
 import { BargeInDetector } from '../interruption/BargeInDetector';
+import { BargeInValidator } from '../interruption/BargeInValidator';
 import { evaluateInterimBargeIn } from '../interruption/interimBargeInDecision';
 import { ConversationManager } from '../llm/ConversationManager';
 import { SessionState } from './SessionState';
@@ -44,6 +45,11 @@ import { maybeGetOpener } from '../shared/humanize';
 import { Env } from '../config/env';
 import { Logger, closeCallLogger } from '../shared/logger';
 import { routeQuery, resetLastRouterIntent, probeFactIntent } from '../llm/KnowledgeRouter';
+import { ConversationMemory } from '../sales/ConversationMemory';
+import { Humanizer as SalesHumanizer } from '../sales/Humanizer';
+import { handleObjection } from '../sales/CommonObjections';
+import { getVisitPitch } from '../sales/VisitPitches';
+import { IntentMetrics } from '../metrics/IntentMetrics';
 import type { StreamEvent } from '../llm/types';
 
 type CallState =
@@ -65,6 +71,13 @@ export class CallOrchestrator {
   private readonly session: SessionState;
   private readonly latency: LatencyTracker;
   private readonly bargeIn: BargeInDetector;
+  private readonly bargeInValidator: BargeInValidator;
+  /** Sales context: interest scoring, objection tracking, visit-invite gating. */
+  private readonly memory: ConversationMemory;
+  /** Controlled conversational fillers for objection responses (Phase 6). */
+  private readonly salesHumanizer: SalesHumanizer;
+  /** Intent-routing analytics: local vs LLM, objection playbooks, visit invites. */
+  private readonly intentMetrics: IntentMetrics;
   private readonly log: Logger;
 
   /** Bumped on every new LLM generation; used to discard stale audio. */
@@ -293,6 +306,10 @@ export class CallOrchestrator {
     this.session        = new SessionState(callSid);
     this.latency        = new LatencyTracker(callSid);
     this.bargeIn        = new BargeInDetector(callSid);
+    this.bargeInValidator = new BargeInValidator();
+    this.memory         = new ConversationMemory();
+    this.salesHumanizer = new SalesHumanizer();
+    this.intentMetrics  = new IntentMetrics(callSid);
     this.log            = Logger.forCall(callSid, 'CallOrchestrator');
   }
 
@@ -459,6 +476,9 @@ export class CallOrchestrator {
     this.latency.logCallSummary();
     this.session.logResponseQualitySummary();
     this.logBargeInSummary();
+    this.log.info('BargeInValidatorMetrics', this.bargeInValidator.getMetrics() as Record<string, unknown>);
+    this.intentMetrics.logCallSummary();
+    this.log.info('ConversationMemorySummary', this.memory.toSummary() as Record<string, unknown>);
     this.log.info('Call orchestrator ended');
 
     // Hang up the Twilio call so the line disconnects cleanly.
@@ -694,6 +714,10 @@ export class CallOrchestrator {
     this.startSpeakingWatchdog();
     this.suppressBargeInArm = false;
 
+    // Update barge-in validator with TTS and agent response state
+    this.bargeInValidator.onTTSStarted();
+    this.bargeInValidator.onAgentResponseStarted(text);
+
     // Mute STT during echo burst — unmutes after barge-in grace period
     this.muteSTTForEchoBurst();
 
@@ -820,7 +844,23 @@ export class CallOrchestrator {
       return;
     }
 
-    // accept — high-confidence, sustained, growing new speech.
+    // accept from word-growth gate — now check semantic echo detection.
+    // evaluateInterimBargeIn catches duplicate text and filler, but Deepgram
+    // can decode agent TTS echo as genuinely-new, growing words that pass all
+    // word-growth checks. Jaccard similarity catches this.
+    const echoDecision = this.bargeInValidator.validateInterimEcho(trimmed);
+    if (!echoDecision.accepted) {
+      this.bargeInFalseRejected++;
+      this.log.warn('FALSE_BARGEIN_REJECTED (echo similarity)', {
+        ...decisionContext,
+        echo_reason: echoDecision.reason,
+        echo_details: echoDecision.details,
+        false_rejected_count: this.bargeInFalseRejected,
+      });
+      return;
+    }
+
+    // accept — high-confidence, sustained, growing new speech, not echo.
     this.bargeInRealAccepted++;
     this.log.info('REAL_BARGEIN_ACCEPTED', {
       source: 'interim_words_during_speech',
@@ -1126,22 +1166,36 @@ export class CallOrchestrator {
         this.state = 'LISTENING';
         this.ensureSTTUnmuted();
       } else {
-        this.bargeInRealAccepted++;
-        this.log.info('REAL_BARGEIN_ACCEPTED', {
-          source: 'final_transcript_during_speech',
-          text,
-          confidence,
-          state: this.state,
-          audio_bytes_played: this.ttsAudioBytesSent,
-          generation_active: !!this.abortController,
-          real_accepted_count: this.bargeInRealAccepted,
-        });
-        this.handleInterruption();
+        // Validate final transcript for echo before barge-in
+        const finalDecision = this.bargeInValidator.validateFinal(text, confidence);
+        if (finalDecision.accepted) {
+          this.bargeInRealAccepted++;
+          this.log.info('REAL_BARGEIN_ACCEPTED', {
+            source: 'final_transcript_during_speech',
+            text,
+            confidence,
+            state: this.state,
+            audio_bytes_played: this.ttsAudioBytesSent,
+            generation_active: !!this.abortController,
+            real_accepted_count: this.bargeInRealAccepted,
+          });
+          this.handleInterruption();
+        } else {
+          this.bargeInFalseRejected++;
+          this.log.warn('FALSE_BARGEIN_REJECTED (final echo/filler)', {
+            reason: finalDecision.reason,
+            ...finalDecision.details,
+            false_rejected_count: this.bargeInFalseRejected,
+          });
+        }
       }
     }
 
     // handleInterruption or end() may have changed state
     if ((this.state as string) === 'ENDED') return;
+
+    // Update barge-in validator with final user transcript (for echo detection)
+    this.bargeInValidator.onUserTranscript(text);
 
     this.conversation.addUserMessage(text);
 
@@ -1176,6 +1230,16 @@ export class CallOrchestrator {
       return;
     }
 
+    // Try deterministic objection playbook (zero tokens) — acknowledge +
+    // value + soft-guide without an LLM round-trip. Only fires for a
+    // first-time objection outside the scheduling steps.
+    if (this.tryObjectionResponse(text)) {
+      return;
+    }
+
+    // Falling through to the LLM — record the routing decision for analytics.
+    this.intentMetrics.record('UNKNOWN', 'llm', 0);
+
     // Non-blocking — errors are caught inside
     void this.generateAndSpeak({ maxTokens: this.session.selectTokenBudget(text) });
   }
@@ -1206,8 +1270,24 @@ export class CallOrchestrator {
       text: text.substring(0, 50),
     });
 
+    // ── Sales context: interest scoring + routing analytics ──────────────
+    if (result.intent) {
+      this.memory.recordQuestion(result.intent);
+      this.intentMetrics.record(result.intent, 'local', 0);
+    }
+
+    // ── Interest-gated visit invite (Phase 5) ────────────────────────────
+    // Append a site-visit suggestion ONLY when the caller has shown enough
+    // engagement (interest score ≥ threshold) and we're in the open Q&A
+    // phase. Routed through session.markVisitSuggested() so it counts as a
+    // sanctioned suggestion and isn't stripped as an unsolicited pitch.
+    const visitInvite = this.maybeBuildVisitInvite();
+    const responseText = visitInvite
+      ? `${result.response} ${visitInvite}`
+      : result.response;
+
     const myGenId = ++this.generationId;
-    this.activeResponseText = result.response;
+    this.activeResponseText = responseText;
 
     // Reset playback tracking
     this.ttsAudioBytesSent = 0;
@@ -1242,6 +1322,10 @@ export class CallOrchestrator {
     this.startSpeakingWatchdog();
     this.suppressBargeInArm = false;
 
+    // Update barge-in validator with TTS and agent response state
+    this.bargeInValidator.onTTSStarted();
+    this.bargeInValidator.onAgentResponseStarted(responseText);
+
     // Mute STT during echo burst
     this.muteSTTForEchoBurst();
 
@@ -1250,15 +1334,16 @@ export class CallOrchestrator {
       ? maybeGetOpener(this.conversation.getLastUserText())
       : '';
     if (humanPrefix) tts.streamText(humanPrefix);
-    tts.streamText(result.response);
+    tts.streamText(responseText);
 
     // Track in conversation history so context is preserved
-    this.session.extractFromAssistantResponse(result.response);
-    this.conversation.addAssistantText(result.response);
+    this.session.extractFromAssistantResponse(responseText);
+    this.conversation.addAssistantText(responseText);
 
     this.log.info('LLM generation complete', {
-      responseLength: result.response.length,
-      response: result.response,
+      responseLength: responseText.length,
+      response: responseText,
+      visitInviteAppended: !!visitInvite,
     });
 
     // Check for conversation-ending state
@@ -1266,6 +1351,155 @@ export class CallOrchestrator {
 
     tts.flush();
     return true;
+  }
+
+  // ─── Interest-Gated Visit Invite (Phase 5) ───────────────────────────────
+
+  /**
+   * Decide whether to attach a site-visit suggestion to this turn's response.
+   *
+   * Fires ONLY when:
+   *   - the caller's interest score has crossed the threshold,
+   *   - we haven't already exhausted the visit-invite budget,
+   *   - the conversation is in open Q&A (not already in a visit/scheduling
+   *     step, and the caller hasn't declined a visit).
+   *
+   * When it fires, it routes through session.markVisitSuggested() so the pitch
+   * is treated as a sanctioned suggestion (not stripped as an unsolicited one)
+   * and is counted toward the once-per-call discipline.
+   *
+   * Returns the pitch string to append, or null to add nothing.
+   */
+  private maybeBuildVisitInvite(): string | null {
+    if (!this.memory.shouldSuggestVisit()) return null;
+    // Exactly one interest-driven invite per call — the SessionState VISIT_OFFER
+    // flow owns the explicit ask. Re-pitching every fact turn is the robotic
+    // "visit? visit? visit?" behaviour Phase 5 exists to eliminate.
+    if (this.memory.visitInvitesShown > 0) return null;
+    if (this.session.visitRejected) return null;
+
+    // Only suggest during open Q&A — once we're offering/collecting a visit,
+    // the SessionState step machine owns the flow.
+    if (this.session.currentStep !== 'QUESTION_HANDLING') return null;
+
+    this.session.markVisitSuggested();
+    this.memory.recordVisitInvite();
+    this.intentMetrics.recordVisitInvite();
+
+    const pitch = getVisitPitch(this.session.info.callerName ?? undefined);
+    this.log.info('VISIT_INVITE_TRIGGERED', {
+      interestScore: this.memory.interestScore,
+      visitInvitesShown: this.memory.visitInvitesShown,
+      questionsAsked: [...this.memory.questionsAsked],
+    });
+    return pitch;
+  }
+
+  // ─── Objection Playbook (Phase 4) ─────────────────────────────────────────
+
+  /**
+   * Try to answer a sales objection deterministically (zero LLM tokens).
+   *
+   * Objection responses already follow acknowledge → value → soft-guide and
+   * carry their own visit nudge, so they are self-contained. A light filler is
+   * prepended occasionally for warmth (Phase 6). Returns true if handled
+   * (response is streaming to TTS), false if no objection matched.
+   */
+  private tryObjectionResponse(text: string): boolean {
+    // Don't intercept objections mid-scheduling — the step machine owns those
+    // turns (e.g. "kal nahi" is a reschedule, not a PRICE_HIGH objection).
+    const step = this.session.currentStep;
+    if (step === 'ASK_VISIT_DAY' || step === 'ASK_VISIT_TIME' ||
+        step === 'CONFIRM_VISIT' || step === 'BOOKED') {
+      return false;
+    }
+
+    const objection = handleObjection(text);
+    if (!objection) return false;
+
+    // Skip the canned playbook if this exact objection was already handled —
+    // repeating the same scripted line sounds robotic. Let the LLM vary it.
+    if (this.memory.objectionsRaised.has(objection.type)) {
+      this.log.info('OBJECTION_REPEAT_SKIP', { type: objection.type });
+      return false;
+    }
+
+    this.memory.recordObjection(objection.type);
+    this.intentMetrics.record('OBJECTION', 'local', 0);
+
+    // ~50% of the time, prepend a single light filler for warmth (Phase 6:
+    // never every turn, one filler max). The response already acknowledges.
+    const response = Math.random() < 0.5
+      ? `${this.salesHumanizer.getFiller()} ${objection.response}`
+      : objection.response;
+
+    this.log.info('OBJECTION_PLAYBOOK_USED', {
+      type: objection.type,
+      response,
+      text: text.substring(0, 50),
+    });
+
+    this.streamDeterministicResponse(response);
+    return true;
+  }
+
+  /**
+   * Stream a fully-formed canned response straight to TTS — no LLM involved.
+   * Mirrors the playback/barge-in bookkeeping of trySchedulingResponse() so
+   * deterministic paths behave identically downstream.
+   */
+  private streamDeterministicResponse(response: string): void {
+    const myGenId = ++this.generationId;
+    this.activeResponseText = response;
+
+    // Reset playback tracking
+    this.ttsAudioBytesSent = 0;
+    this.firstTTSAudioSentAt = 0;
+    this.ttsGenerationDone = false;
+    this.audioPreBuffer.length = 0;
+    this.audioBufferPrimed = false;
+
+    // Reset interim barge-in tracking so stale interims from the previous
+    // turn don't trigger false barge-ins on this new response.
+    this.lastInterimText = '';
+    this.lastInterimChangedAt = 0;
+    this.interimBargeInAnchor = 0;
+
+    this.cancelLatencyMaskTimer();
+    this.resetAckState();
+    this.lastBufferDepthLogAt = 0;
+    if (this.playbackCompleteTimer) {
+      clearTimeout(this.playbackCompleteTimer);
+      this.playbackCompleteTimer = null;
+    }
+
+    this.abortController = null;
+
+    const tts = this.tts;
+    tts.startTurn(`g${myGenId}`);
+
+    this.state = 'SPEAKING';
+    this.startSpeakingWatchdog();
+    this.suppressBargeInArm = false;
+
+    this.bargeInValidator.onTTSStarted();
+    this.bargeInValidator.onAgentResponseStarted(response);
+
+    this.muteSTTForEchoBurst();
+
+    tts.streamText(response);
+
+    this.session.extractFromAssistantResponse(response);
+    this.conversation.addAssistantText(response);
+
+    this.log.info('LLM generation complete', {
+      responseLength: response.length,
+      response,
+    });
+
+    if (this.session.shouldEndCall) this.markConfirmationComplete();
+
+    tts.flush();
   }
 
   // ─── Deterministic Scheduling Responses ──────────────────────────────────
@@ -1317,6 +1551,11 @@ export class CallOrchestrator {
     this.state = 'SPEAKING';
     this.startSpeakingWatchdog();
     this.suppressBargeInArm = false;
+
+    // Update barge-in validator with TTS and agent response state
+    this.bargeInValidator.onTTSStarted();
+    this.bargeInValidator.onAgentResponseStarted(response);
+
     this.muteSTTForEchoBurst();
 
     // Stream directly to TTS — no LLM involved
@@ -1410,6 +1649,9 @@ export class CallOrchestrator {
     // flowing through the buffer when generation starts) cannot trigger
     // a false barge-in and abort the LLM before it has sent a single token.
     this.suppressBargeInArm = opts.suppressBargeIn ?? false;
+
+    // Update barge-in validator for echo detection
+    this.bargeInValidator.onTTSStarted();
 
     // Mute STT during echo burst — unmutes after barge-in grace period
     this.muteSTTForEchoBurst();
@@ -1516,8 +1758,12 @@ export class CallOrchestrator {
             firstToken = false;
             headStartedAt = Date.now();
             this.latency.mark('llm_first_token');
+            this.bargeInValidator.onAgentResponseStarted(fullText);
             this.log.info('LLM first token received — buffering leading segment for guard');
           }
+
+          // Keep barge-in validator aware of what the agent is saying (for echo detection)
+          this.bargeInValidator.updateAgentResponse(fullText);
 
           if (!headFlushed) {
             head += text;
@@ -2266,6 +2512,7 @@ export class CallOrchestrator {
 
     this.twilioService.clearAudio(this.callSid);
     this.bargeIn.disarm();
+    this.bargeInValidator.resetTurn();
 
     // Discard the partial assistant response from conversation history
     // so the model doesn't see an incomplete assistant turn
