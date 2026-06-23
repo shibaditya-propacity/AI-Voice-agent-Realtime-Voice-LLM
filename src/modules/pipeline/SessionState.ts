@@ -4,6 +4,8 @@
  */
 
 import { Logger } from '../../shared/Logger';
+import { buildEnrichmentDirective } from '../conversation/ResponseEnrichment';
+import { PROPERTY_FACTS } from '../conversation/PropertyFacts';
 
 export type BookingStatus =
   | 'NONE'
@@ -56,6 +58,8 @@ export class SessionState {
   shouldEndCall = false;
   lastAskedField: LastAskedField = 'name';
 
+  /** Last user utterance — used for intent-based response enrichment. */
+  private lastUserText = '';
   private turnCount = 0;
 
   constructor(callSid: string) {
@@ -207,10 +211,22 @@ export class SessionState {
         break;
     }
 
+    // ── Response enrichment: inject contextual insight for the current question ──
+    const isSchedulingStep = ['DATE_CAPTURED', 'TIME_CAPTURED', 'CONFIRMATION_PENDING', 'BOOKED'].includes(this.bookingStatus);
+    const enrichment = buildEnrichmentDirective(
+      this.lastUserText,
+      PROPERTY_FACTS,
+      this.turnCount,
+      isSchedulingStep,
+    );
+    if (enrichment) {
+      lines.push(enrichment);
+    }
+
     lines.push('');
     lines.push('RESPONSE STYLE REMINDER:');
-    lines.push('- Sound like a helpful consultant, not a database. State fact + natural follow-up.');
-    lines.push('- Facts: 10–20 words. Follow-ups: 15–30 words. Objections: 20–40 words.');
+    lines.push('- Sound like a helpful consultant, not a database. State fact + contextual insight.');
+    lines.push('- Facts: 10–20 words. If a [RESPONSE INSIGHT] is provided, weave it in naturally.');
     lines.push('- Max 2 sentences. No sales pitches. No auto site-visit suggestions.');
     lines.push('');
     lines.push('FORBIDDEN:');
@@ -267,6 +283,7 @@ export class SessionState {
   extractFromUserTranscript(text: string): void {
     const lower = text.toLowerCase().trim();
     const trimmed = text.trim();
+    this.lastUserText = trimmed;
 
     if (!this.info.name) this.extractName(trimmed);
     this.extractDate(lower, trimmed);

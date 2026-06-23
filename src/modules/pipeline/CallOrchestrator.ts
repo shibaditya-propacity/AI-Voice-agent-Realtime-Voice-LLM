@@ -31,6 +31,8 @@ import { TwilioService } from '../twilio/TwilioService';
 import { Env } from '../../config';
 import { Logger, closeCallLogger } from '../../shared/Logger';
 import type { StreamEvent } from './LLMTypes';
+import { classifyIntent, isLocallyRoutable, buildLocalResponse, IntentMetrics } from '../intent';
+import { PROPERTY_FACTS } from '../conversation/PropertyFacts';
 
 type CallState =
   | 'IDLE'
@@ -51,6 +53,7 @@ export class CallOrchestrator {
   private readonly session: SessionState;
   private readonly latency: LatencyTracker;
   private readonly bargeIn: BargeInDetector;
+  private readonly intentMetrics: IntentMetrics;
   private readonly log: Logger;
 
   private generationId = 0;
@@ -118,6 +121,7 @@ export class CallOrchestrator {
     this.session        = new SessionState(callSid);
     this.latency        = new LatencyTracker(callSid);
     this.bargeIn        = new BargeInDetector(callSid);
+    this.intentMetrics  = new IntentMetrics(callSid);
     this.log            = Logger.forCall(callSid, 'CallOrchestrator');
   }
 
@@ -194,6 +198,7 @@ export class CallOrchestrator {
     this.stt.close();
 
     this.latency.logCallSummary();
+    this.intentMetrics.logCallSummary();
     this.log.info('Call orchestrator ended');
 
     closeCallLogger(this.callSid);
@@ -484,6 +489,22 @@ export class CallOrchestrator {
       return;
     }
 
+    // ── Intent-based local routing (no LLM) ─────────────────────────
+    const localResponse = this.maybeLocalIntentResponse(text);
+    if (localResponse) {
+      this.log.info('Intent routed locally (no LLM)', {
+        response: localResponse, transcriptToResponseMs: Date.now() - transcriptAt,
+      });
+      const humanPrefix = Env.humanization.enabled
+        ? maybeGetOpener(text)
+        : '';
+      const fullResponse = humanPrefix ? humanPrefix + localResponse : localResponse;
+      this.conversation.addAssistantText(fullResponse);
+      this.session.extractFromAssistantResponse(fullResponse);
+      this.speakCanned(fullResponse);
+      return;
+    }
+
     this.state = 'GENERATING';
 
     this.log.info('Transcript → LLM handoff', {
@@ -524,6 +545,49 @@ export class CallOrchestrator {
       return `${preferredTime} noted. Kaunsa day aapke liye convenient rahega — weekday ya weekend?`;
     }
 
+    return null;
+  }
+
+  // ─── Intent-Based Local Routing ─────────────────────────────────────────
+
+  /**
+   * Classify the user utterance and return a deterministic response if the
+   * intent is a property-information query. Returns null to fall through to LLM.
+   *
+   * Skipped when:
+   *  - Name hasn't been collected yet (GET_NAME flow needs LLM personality)
+   *  - Booking is in progress (scheduling flow handles these)
+   */
+  private maybeLocalIntentResponse(userText: string): string | null {
+    // Don't short-circuit LLM during name collection — needs conversational handling
+    if (!this.session.info.name) {
+      return null;
+    }
+
+    // Don't route locally during active scheduling
+    const status = this.session.bookingStatus;
+    if (status === 'DATE_CAPTURED' || status === 'TIME_CAPTURED' ||
+        status === 'CONFIRMATION_PENDING' || status === 'BOOKED') {
+      return null;
+    }
+
+    const classification = classifyIntent(userText);
+
+    if (isLocallyRoutable(classification.intent)) {
+      const response = buildLocalResponse(
+        classification.intent,
+        PROPERTY_FACTS,
+        this.session.currentTurn,
+      );
+
+      if (response) {
+        this.intentMetrics.record(classification.intent, 'local', classification.classificationTimeUs);
+        return response;
+      }
+    }
+
+    // Not locally routable — record as LLM-bound
+    this.intentMetrics.record(classification.intent, 'llm', classification.classificationTimeUs);
     return null;
   }
 
