@@ -97,14 +97,14 @@ function checkInventedAmenities(text: string): ValidationIssue | null {
 
 // ─── Response Length ─────────────────────────────────────────────────────────
 
-const MAX_WORDS = 20; // soft limit, logged as issue but not blocking
+const MAX_WORDS = 40; // soft limit — fact (20w) + insight (20w) = 40w max
 
 function checkResponseLength(text: string): ValidationIssue | null {
   const words = text.trim().split(/\s+/).length;
   if (words > MAX_WORDS) {
     return {
       type: 'response_too_long',
-      detail: `${words} words (target: under 12)`,
+      detail: `${words} words (target: under ${MAX_WORDS})`,
     };
   }
   return null;

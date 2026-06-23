@@ -3,6 +3,9 @@ export { PROPERTY_FACTS } from './PropertyFacts';
 export { buildContextBlock } from './PromptBuilder';
 export { validateResponse } from './ResponseValidator';
 export { extractEntities, extractWithGroq } from './EntityExtractor';
+export { detectIntent, buildEnrichmentDirective } from './ResponseEnrichment';
+export { getInsight, getAvailableIntents } from './InsightLibrary';
+export type { QuestionIntent } from './InsightLibrary';
 export type {
   SessionState,
   ConversationStep,
