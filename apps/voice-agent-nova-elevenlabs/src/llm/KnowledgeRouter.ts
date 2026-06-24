@@ -86,7 +86,7 @@ const INTENT_RULES: IntentRule[] = [
   {
     intent: 'LANDMARKS',
     patterns: [
-      /\b(nearby|near|around|paas|पास|aas\s*paas|आसपास|landmark|school|hospital|metro|station|highway|expressway|mall|market|college|connectivity|connect|transport|commute|IT\s*park|hinjewadi)\b/i,
+      /\b(nearby|near\b(?!\s*\d)|around\s+(?:here|property|area|project|society|building|locality|the\s+(?:property|area|project))|paas|पास|aas\s*paas|आसपास|landmark|school|hospital|metro|station|highway|expressway|mall|market|college|connectivity|connect|transport|commute|IT\s*park|hinjewadi)\b/i,
       /\b(kya\s*hai\s*nearby|आसपास\s*क्या\s*है|paas\s*mein\s*kya)\b/i,
     ],
   },
