@@ -50,6 +50,7 @@ import { Humanizer as SalesHumanizer } from '../sales/Humanizer';
 import { handleObjection } from '../sales/CommonObjections';
 import { getVisitPitch } from '../sales/VisitPitches';
 import { IntentMetrics } from '../metrics/IntentMetrics';
+import { detectRecallQuery, buildRecallResponse } from './PreferenceRecall';
 import type { StreamEvent } from '../llm/types';
 
 type CallState =
@@ -1217,6 +1218,13 @@ export class CallOrchestrator {
       transcriptToLlmMs: Date.now() - transcriptAt,
     });
 
+    // Preference recall FIRST — "what was my budget / which BHK did I say" must
+    // be answered from SessionState, not routed to the price/BHK fact (which
+    // shares the "budget"/"bhk" keywords). Zero LLM, deterministic.
+    if (this.tryPreferenceRecall(text)) {
+      return;
+    }
+
     // Try zero-token fact response FIRST — this handles factual questions
     // even during scheduling steps (appending the scheduling re-prompt).
     if (this.tryDirectFactResponse(text)) {
@@ -1273,6 +1281,7 @@ export class CallOrchestrator {
     // ── Sales context: interest scoring + routing analytics ──────────────
     if (result.intent) {
       this.memory.recordQuestion(result.intent);
+      this.session.recordQuestion(result.intent); // SessionState = source of truth
       this.intentMetrics.record(result.intent, 'local', 0);
     }
 
@@ -1353,6 +1362,28 @@ export class CallOrchestrator {
     return true;
   }
 
+  // ─── Preference Recall (zero-LLM, from SessionState) ──────────────────────
+
+  /**
+   * If the caller asks us to repeat something they told us earlier ("what was
+   * my budget", "which BHK did I say", "my requirement again"), answer straight
+   * from SessionState. Never invents — empty fields get an honest "not captured
+   * yet" line. Returns true if handled (response streaming to TTS).
+   */
+  private tryPreferenceRecall(text: string): boolean {
+    const target = detectRecallQuery(text);
+    if (!target) return false;
+
+    const { response, used } = buildRecallResponse(target, this.session.preferences);
+    this.log.info('SESSION_RECALL_TRIGGERED', {
+      target,
+      used,
+      preferences: this.session.preferences,
+    });
+    this.streamDeterministicResponse(response);
+    return true;
+  }
+
   // ─── Interest-Gated Visit Invite (Phase 5) ───────────────────────────────
 
   /**
@@ -1425,6 +1456,7 @@ export class CallOrchestrator {
     }
 
     this.memory.recordObjection(objection.type);
+    this.session.recordObjection(objection.type); // SessionState = source of truth
     this.intentMetrics.record('OBJECTION', 'local', 0);
 
     // ~50% of the time, prepend a single light filler for warmth (Phase 6:
@@ -1822,10 +1854,18 @@ export class CallOrchestrator {
 
     if (myGenId !== this.generationId || signal.aborted) {
       // Interrupted — don't add partial response to history.
-      // handleInterruption() already closed the TTS context; this is a no-op
-      // unless the abort came from somewhere else (e.g. call end).
-      this.log.info('Generation interrupted, discarding partial response', { partialLength: fullText.length });
-      tts.abort();
+      // Only abort TTS if the current context still belongs to THIS generation.
+      // If a newer generation (e.g. scheduling confirmation) has already started
+      // a fresh TTS context, calling tts.abort() here would kill the NEW context
+      // and cause silence — the booking confirmation would never be heard.
+      this.log.info('Generation interrupted, discarding partial response', {
+        partialLength: fullText.length,
+        myGenId,
+        currentGenId: this.generationId,
+      });
+      if (myGenId === this.generationId) {
+        tts.abort();
+      }
       return;
     }
 
