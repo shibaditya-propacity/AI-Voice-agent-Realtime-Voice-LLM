@@ -16,6 +16,7 @@
 import { PROPERTY_FACTS } from './PropertyFacts';
 import { Logger } from '../shared/logger';
 import type { SessionState } from '../orchestration/SessionState';
+import { factFollowUp } from '../orchestration/PreferenceRecall';
 
 // ─── Fact Intent Classification ──────────────────────────────────────────────
 
@@ -219,7 +220,9 @@ const INTENT_RULES: IntentRule[] = [
 function buildResponse(intent: FactIntent): string {
   switch (intent) {
     case 'PRICE':
-      return `${PROPERTY_FACTS.project} में price roughly ${PROPERTY_FACTS.pricePerSqft} है, overall range ${PROPERTY_FACTS.priceRange} तक है। आप किस budget range में देख रहे हैं?`;
+      // Slot-filling follow-up ("किस budget range?") is appended conditionally
+      // in routeQuery via factFollowUp() — only when budget isn't captured yet.
+      return `${PROPERTY_FACTS.project} में price roughly ${PROPERTY_FACTS.pricePerSqft} है, overall range ${PROPERTY_FACTS.priceRange} तक है।`;
     case 'PRICE_BHK': {
       const lines = Object.entries(PROPERTY_FACTS.configs)
         .map(([bhk, c]) => `${bhk} starting ${c.startingPrice} से`)
@@ -243,7 +246,9 @@ function buildResponse(intent: FactIntent): string {
     case 'SECURITY':
       return `${PROPERTY_FACTS.amenitiesDetailed.security} — plus intercom facility हर flat में।`;
     case 'BHK':
-      return `${PROPERTY_FACTS.project} में ${PROPERTY_FACTS.bhk.join(', ')} BHK options available हैं। आप किस configuration में interested हैं?`;
+      // Slot-filling follow-up ("किस configuration?") is appended conditionally
+      // in routeQuery via factFollowUp() — only when bhkPreference isn't captured.
+      return `${PROPERTY_FACTS.project} में ${PROPERTY_FACTS.bhk.join(', ')} BHK options available हैं।`;
     case 'FLOOR_TOWER':
       return `Total ${PROPERTY_FACTS.towers} towers हैं, हर tower ${PROPERTY_FACTS.totalFloors} floors का। हर tower में 2 high-speed lifts हैं।`;
     case 'CONSTRUCTION_STATUS':
@@ -382,6 +387,22 @@ export function routeQuery(
 
   // ── Build response ──────────────────────────────────────────────────────
   let response = buildResponse(matchedIntent);
+
+  // Missing-field logic: append the slot-filling follow-up ONLY when the field
+  // isn't captured yet — never re-ask a preference the caller already gave.
+  const follow = factFollowUp(matchedIntent, {
+    budget: session.budget,
+    bhk: session.bhkPreference,
+  });
+  if (follow.clause) {
+    response += ` ${follow.clause}`;
+  } else if (follow.reused && follow.field) {
+    log.info('SESSION_FIELD_REUSED', {
+      field: follow.field,
+      value: follow.field === 'budget' ? session.budget : session.bhkPreference,
+      reason: 'fact follow-up suppressed — already captured',
+    });
+  }
 
   // During VISIT_OFFER, append the visit offer — but only once.
   if (step === 'VISIT_OFFER' && session.shouldSuggestVisit()) {

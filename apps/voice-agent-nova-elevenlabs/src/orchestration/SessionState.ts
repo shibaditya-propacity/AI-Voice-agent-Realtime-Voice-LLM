@@ -16,6 +16,7 @@
 import { Logger } from '../shared/logger';
 import { Env } from '../config/env';
 import { classifyIntent } from './IntentClassifier';
+import { buildSchedulingRecap, parseBudget } from './PreferenceRecall';
 
 // ─── Booking Status State Machine ──────────────────────────────────────────
 //
@@ -135,6 +136,27 @@ const SCHEDULING_OFFER = /\b(kal|aaj|parson|कल|आज|परसों|monday
 // when the application hasn't reached CONFIRMATION_PENDING. Catches phrases like
 // "kal 10 baje ka book kar raha hun", "book ho gaya", "noted for tomorrow".
 const HALLUCINATED_BOOKING = /\b(book\s*(kar|ho|kart[aei]|kiy[aei]|kr)\w*|booked|confirmed|scheduled|noted|पक्का|बुक\s*(कर|हो)|book\s+हो\s+गय[ाी]|done\s+है|fix\s+(kar|ho)\w*)\b/i;
+
+// ─── Redundant Re-ask Patterns (strip when field already captured) ───────────
+// These match TRAILING question clauses that re-ask a field the user already
+// provided. Each is gated on the corresponding SessionState field — only
+// stripped when the field is ✓. Anchored to sentence boundary / end of string
+// so the factual answer preceding the question is preserved.
+
+/** Budget re-ask: "आप किस budget range में देख रहे हैं?", "aapka budget kya hai?" etc. */
+const REASK_BUDGET = /[\s,।.!-]*[^।.!?]*?\b(budget\s*(range|kya|kitna|kitne|क्या|कितना|कितने|में|mein|me|batao|बताइए|bataiye)|किस\s*budget|kis\s*budget|aapka\s*budget|आपका\s*budget|budget\s*(dekh|देख)\w*|budget\s*(hai|है|ho|हो))\b[^।.!?]*[?।.!]*\s*$/i;
+
+/** BHK re-ask: "कौन सा BHK देख रहे हैं?", "kitne bhk chahiye?" etc. */
+const REASK_BHK = /[\s,।.!-]*[^।.!?]*?\b(kaun\s*sa\s*bhk|कौन\s*सा\s*bhk|kitne\s*bhk|कितने\s*bhk|bhk\s*(dekh|देख|chahiye|चाहिए|prefer|interested|pasand|पसंद)|kis\s*configuration|किस\s*configuration|bhk\s*(kya|क्या|batao|बताइए)|konsa\s*bhk|कौनसा\s*bhk)\b[^।.!?]*[?।.!]*\s*$/i;
+
+/** Name re-ask: "आपका नाम क्या है?", "aapka naam bata dijiye" etc. */
+const REASK_NAME = /[\s,।.!-]*[^।.!?]*?\b(aapka\s*naam|आपका\s*नाम|your\s*name|naam\s*(kya|बताइए|batao|bata|क्या)|name\s*(please|kya|बताइए))\b[^।.!?]*[?।.!]*\s*$/i;
+
+/** Visit day re-ask: "कौन सा दिन?", "which day prefer karenge?" etc. */
+const REASK_VISIT_DAY = /[\s,।.!-]*[^।.!?]*?\b(kaun\s*sa\s*din|कौन\s*सा\s*दिन|which\s*day|kis\s*din|किस\s*दिन|kab\s*aa|कब\s*आ|day\s*prefer|date\s*prefer|कौनसा\s*din|कौनसा\s*दिन)\b[^।.!?]*[?।.!]*\s*$/i;
+
+/** Visit time re-ask: "कितने बजे?", "kis time aana chahenge?" etc. */
+const REASK_VISIT_TIME = /[\s,।.!-]*[^।.!?]*?\b(kis\s*time|किस\s*time|kitne\s*baje|कितने\s*बजे|what\s*time|time\s*prefer|samay|समय|morning\s*(ya|या)\s*(afternoon|evening|दोपहर|शाम)|सुबह\s*(ya|या)\s*(दोपहर|शाम))\b[^।.!?]*[?।.!]*\s*$/i;
 
 
 export class SessionState {
@@ -276,6 +298,77 @@ export class SessionState {
   get bhkPreference(): string | null { return this.info.bhkPreference; }
   get siteVisitDay(): string | null { return this.info.preferredDate; }
   get siteVisitTime(): string | null { return this.info.preferredTime; }
+
+  // ─── Engagement tracking (source of truth for objections + questions) ─────
+
+  private readonly _objectionsRaised: Set<string> = new Set();
+  private readonly _questionsAsked: Set<string> = new Set();
+  /** Ensures the captured-preference recap is woven into scheduling only ONCE. */
+  private _prefsRecappedInScheduling = false;
+
+  get objectionsRaised(): string[] { return [...this._objectionsRaised]; }
+  get questionsAsked(): string[] { return [...this._questionsAsked]; }
+
+  /** Record a sales objection the caller raised (deduped). */
+  recordObjection(type: string): void {
+    if (this._objectionsRaised.has(type)) return;
+    this._objectionsRaised.add(type);
+    this.log.info('SESSION_FIELD_CAPTURED', { field: 'objectionsRaised', value: type, turn: this.turnCount });
+  }
+
+  /** Record a fact intent the caller asked about (deduped). */
+  recordQuestion(intent: string): void {
+    if (this._questionsAsked.has(intent)) return;
+    this._questionsAsked.add(intent);
+    this.log.info('SESSION_FIELD_CAPTURED', { field: 'questionsAsked', value: intent, turn: this.turnCount });
+  }
+
+  /**
+   * Snapshot of all captured preferences — the single recall source.
+   * Used by the PreferenceRecall layer; never reads from the LLM.
+   */
+  get preferences(): {
+    name: string | null; budget: string | null; bhk: string | null;
+    day: string | null; time: string | null;
+  } {
+    return {
+      name: this.info.callerName,
+      budget: this.info.budgetMentioned,
+      bhk: this.info.bhkPreference,
+      day: this.info.preferredDate,
+      time: this.info.preferredTime,
+    };
+  }
+
+  /**
+   * One-time natural recap of captured preferences for the scheduling flow,
+   * e.g. "आप 3 BHK, budget around 80 lakh dekh rahe the — ". Returns '' after
+   * the first use (never repeated every turn) or when nothing is captured.
+   */
+  private schedulingPrefRecap(): string {
+    if (this._prefsRecappedInScheduling) return '';
+    const recap = buildSchedulingRecap({
+      bhk: this.info.bhkPreference,
+      budget: this.info.budgetMentioned,
+    });
+    if (!recap) return '';
+    this._prefsRecappedInScheduling = true;
+    this.log.info('SESSION_FIELD_REUSED', {
+      context: 'scheduling_recap',
+      bhk: this.info.bhkPreference,
+      budget: this.info.budgetMentioned,
+    });
+    return recap;
+  }
+
+  /** Log SESSION_FIELD_CAPTURED (first capture) or SESSION_FIELD_UPDATED (change). */
+  private logFieldChange(field: string, prev: string | null, next: string): void {
+    if (prev === null || prev === '') {
+      this.log.info('SESSION_FIELD_CAPTURED', { field, value: next, turn: this.turnCount });
+    } else {
+      this.log.info('SESSION_FIELD_UPDATED', { field, from: prev, to: next, turn: this.turnCount });
+    }
+  }
   get visitBooked(): boolean { return this.bookingSuccess; }
 
   /**
@@ -318,12 +411,9 @@ export class SessionState {
     if (!date.trim()) return;
     const cleaned = date.trim();
     if (this.info.preferredDate !== cleaned) {
+      const prev = this.info.preferredDate;
       this.info.preferredDate = cleaned;
-      this.log.info('slot_update', {
-        field: 'preferredDate',
-        value: cleaned,
-        turn: this.turnCount,
-      });
+      this.logFieldChange('siteVisitDay', prev, cleaned);
       this.advanceBookingState();
     }
   }
@@ -332,12 +422,9 @@ export class SessionState {
     if (!time.trim()) return;
     const cleaned = time.trim();
     if (this.info.preferredTime !== cleaned) {
+      const prev = this.info.preferredTime;
       this.info.preferredTime = cleaned;
-      this.log.info('slot_update', {
-        field: 'preferredTime',
-        value: cleaned,
-        turn: this.turnCount,
-      });
+      this.logFieldChange('siteVisitTime', prev, cleaned);
       this.advanceBookingState();
     }
   }
@@ -349,16 +436,20 @@ export class SessionState {
 
   setBudgetMentioned(budget: string): void {
     if (!budget.trim()) return;
-    if (this.info.budgetMentioned === budget.trim()) return;
-    this.info.budgetMentioned = budget.trim();
-    this.log.info('slot_update', { field: 'budget', value: this.info.budgetMentioned, turn: this.turnCount });
+    const cleaned = budget.trim();
+    if (this.info.budgetMentioned === cleaned) return;
+    const prev = this.info.budgetMentioned;
+    this.info.budgetMentioned = cleaned;
+    this.logFieldChange('budget', prev, cleaned);
   }
 
   setBhkPreference(bhk: string): void {
     if (!bhk.trim()) return;
-    if (this.info.bhkPreference === bhk.trim()) return;
-    this.info.bhkPreference = bhk.trim();
-    this.log.info('slot_update', { field: 'bhk', value: this.info.bhkPreference, turn: this.turnCount });
+    const cleaned = bhk.trim();
+    if (this.info.bhkPreference === cleaned) return;
+    const prev = this.info.bhkPreference;
+    this.info.bhkPreference = cleaned;
+    this.logFieldChange('bhkPreference', prev, cleaned);
   }
 
   setCallerName(name: string): void {
@@ -366,8 +457,9 @@ export class SessionState {
     // Capitalize first letter of each word
     const cleaned = name.trim().replace(/\b\w/g, c => c.toUpperCase());
     if (this.info.callerName === cleaned) return;
+    const prev = this.info.callerName;
     this.info.callerName = cleaned;
-    this.log.info('slot_update', { field: 'callerName', value: cleaned, turn: this.turnCount });
+    this.logFieldChange('customerName', prev, cleaned);
   }
 
   // ─── Booking Status Transitions ──────────────────────────────────────────
@@ -555,7 +647,7 @@ export class SessionState {
         // goal). Mark it so the pitch guard allows the visit mention this turn.
         this.visitOffered = true;
         this.markVisitSuggested();
-        return 'Answer their question in ONE line if they asked one, then warmly offer a site visit and ask which day suits — today, tomorrow, or this weekend. Be direct and natural. Ask only about the day, nothing else.';
+        return 'Answer their question in ONE short line if they asked one, then warmly offer a site visit as a single yes/no question (e.g. "क्या आप एक बार Akshay Vista देखने आना चाहेंगे?"). Do NOT ask about the day or time — the system asks that next turn. Maximum two sentences, exactly ONE question.';
       }
       case 'QUESTION_HANDLING':
         // Visit already offered once — just answer questions. NEVER re-pitch the
@@ -586,16 +678,18 @@ export class SessionState {
     const n = this.info.callerName ? `${this.info.callerName} ji, ` : '';
     const dayHindi = this.dayToHindi(this.info.preferredDate);
     switch (this.currentStep) {
-      case 'ASK_VISIT_DAY':
+      case 'ASK_VISIT_DAY': {
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_DAY_REQUESTED', step: this.currentStep });
-        return `${n}ज़रूर, आपको कौन सा दिन convenient रहेगा — आज, कल, या इस weekend?`;
+        const recap = this.schedulingPrefRecap();
+        return `${n}${recap}आपको कौन सा दिन convenient रहेगा — आज, कल, या इस weekend?`;
+      }
       case 'ASK_VISIT_TIME':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_TIME_REQUESTED', step: this.currentStep, day: this.info.preferredDate });
         return `${n}${dayHindi} बिल्कुल चलेगा। किस time आना comfortable रहेगा — morning, afternoon, या evening?`;
       case 'CONFIRM_VISIT':
       case 'BOOKED':
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_CONFIRMED', step: this.currentStep, day: this.info.preferredDate, time: this.info.preferredTime });
-        return `Perfect, ${n}आपकी site visit ${dayHindi} को ${this.info.preferredTime} के लिए book हो गई है। Location है Akshay Vista, Pimple Gurav, near Dmart, Pune। हमारी team आपको visit से पहले reminder call करेगी। आपका बहुत बहुत धन्यवाद, आपका दिन शुभ हो!`;
+        return `Perfect, ${n}आपकी site visit ${dayHindi} को ${this.info.preferredTime} के लिए book हो गई है। Location details हम आपको WhatsApp पर भेज देंगे। आपका बहुत बहुत धन्यवाद, आपका दिन शुभ हो!`;
       case 'NOT_INTERESTED':
         return `${n}कोई बात नहीं, आपका समय देने के लिए शुक्रिया। कभी भी interest हो तो बेझिझक call कीजिएगा। आपका दिन शुभ हो!`;
       default:
@@ -876,6 +970,9 @@ export class SessionState {
       out = out.replace(HALLUCINATED_BOOKING, '');
     }
 
+    // ── Redundant re-ask guard: strip questions about already-captured fields ──
+    out = this.stripRedundantReasks(out);
+
     // Clean up orphaned/duplicated punctuation left by the strips.
     out = out
       .replace(/\s{2,}/g, ' ')
@@ -917,6 +1014,57 @@ export class SessionState {
    *  answer and no specific question. */
   isAcknowledgementOnly(text: string): boolean {
     return ACK_ONLY_PATTERN.test(text.trim());
+  }
+
+  /**
+   * Strip trailing re-ask questions for fields that are already captured in
+   * SessionState. Each pattern is only tested when its corresponding field is
+   * present (✓). The factual answer before the question is preserved.
+   */
+  private stripRedundantReasks(text: string): string {
+    let out = text;
+
+    if (this.info.budgetMentioned && REASK_BUDGET.test(out)) {
+      out = out.replace(REASK_BUDGET, '');
+      this.log.warn('REASK_BLOCKED_BUDGET', {
+        captured: this.info.budgetMentioned,
+        text: text.substring(0, 80),
+      });
+    }
+
+    if (this.info.bhkPreference && REASK_BHK.test(out)) {
+      out = out.replace(REASK_BHK, '');
+      this.log.warn('REASK_BLOCKED_BHK', {
+        captured: this.info.bhkPreference,
+        text: text.substring(0, 80),
+      });
+    }
+
+    if (this.info.callerName && REASK_NAME.test(out)) {
+      out = out.replace(REASK_NAME, '');
+      this.log.warn('REASK_BLOCKED_NAME', {
+        captured: this.info.callerName,
+        text: text.substring(0, 80),
+      });
+    }
+
+    if (this.info.preferredDate && REASK_VISIT_DAY.test(out)) {
+      out = out.replace(REASK_VISIT_DAY, '');
+      this.log.warn('REASK_BLOCKED_VISIT_DAY', {
+        captured: this.info.preferredDate,
+        text: text.substring(0, 80),
+      });
+    }
+
+    if (this.info.preferredTime && REASK_VISIT_TIME.test(out)) {
+      out = out.replace(REASK_VISIT_TIME, '');
+      this.log.warn('REASK_BLOCKED_VISIT_TIME', {
+        captured: this.info.preferredTime,
+        text: text.substring(0, 80),
+      });
+    }
+
+    return out;
   }
 
   /** One specific clarifying question, steered by the field we last asked
@@ -1218,11 +1366,12 @@ export class SessionState {
 
   /** Extract a mentioned budget: "50 lakh", "1 crore", "80 lakhs", "1.2 cr". */
   private extractBudget(lower: string): void {
-    const m = lower.match(/\b(\d{1,3}(?:\.\d{1,2})?)\s*(lakh|lakhs|lac|crore|cr|करोड़|लाख)\b/);
-    if (m) {
+    // Handles both digit ("50 lakh") and number-word ("पचास लाख", "fifty lakh")
+    // forms — see parseBudget in PreferenceRecall.
+    const budget = parseBudget(lower);
+    if (budget) {
       this._budgetMentionedThisTurn = true;
-      const unit = /cr|crore|करोड़/.test(m[2]) ? 'crore' : 'lakh';
-      this.setBudgetMentioned(`${m[1]} ${unit}`);
+      this.setBudgetMentioned(budget);
     }
   }
 
