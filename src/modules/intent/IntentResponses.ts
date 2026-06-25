@@ -13,6 +13,7 @@
 
 import { PropertyFacts } from '../conversation/ConversationTypes';
 import { Intent } from './IntentClassifier';
+import type { IntentResult } from './IntentClassifier';
 
 // ─── Response Builder Type ──────────────────────────────────────────────────
 
@@ -142,6 +143,29 @@ const RESPONSE_BUILDERS: Partial<Record<Intent, ResponseBuilder>> = {
   [Intent.UNITS]:      buildUnitsResponse,
 };
 
+// ─── Compact Fact-Only Builders (for multi-intent responses) ────────────────
+
+type CompactBuilder = (facts: PropertyFacts) => string;
+
+const COMPACT_BUILDERS: Partial<Record<Intent, CompactBuilder>> = {
+  [Intent.PRICE]: (facts) => `${facts.price} hai.`,
+  [Intent.LOCATION]: (facts) => {
+    const primaryArea = facts.location.split(',')[0]?.trim() || facts.location;
+    return `${primaryArea} mein hai.`;
+  },
+  [Intent.AMENITIES]: (facts) => {
+    const amenityList = facts.amenities.slice(0, 3).join(', ');
+    return `${amenityList} available hain.`;
+  },
+  [Intent.BHK]: (facts) => `${facts.bhkOptions.join(', ')} options hain.`,
+  [Intent.POSSESSION]: (facts) => `${facts.possession} possession expected hai.`,
+  [Intent.DEVELOPER]: (facts) => {
+    const builderClean = facts.builder.replace(/\.\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    return `${builderClean} ka project hai.`;
+  },
+  [Intent.UNITS]: (facts) => `Total ${facts.units} units hain.`,
+};
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
@@ -156,4 +180,20 @@ export function buildLocalResponse(
   const builder = RESPONSE_BUILDERS[intent];
   if (!builder) return null;
   return builder(facts, turnIndex);
+}
+
+/**
+ * Build a single combined response for 2+ detected intents.
+ *
+ * Takes the first two locally-routable intents from the result and joins
+ * their compact fact sentences. Returns null if fewer than 2 fact intents
+ * are present. No LLM call — pure deterministic.
+ */
+export function buildMultiIntentResponse(
+  result: IntentResult,
+  facts: PropertyFacts,
+): string | null {
+  const factIntents = result.intents.filter(i => COMPACT_BUILDERS[i] !== undefined).slice(0, 2);
+  if (factIntents.length < 2) return null;
+  return factIntents.map(intent => COMPACT_BUILDERS[intent]!(facts)).join(' ');
 }

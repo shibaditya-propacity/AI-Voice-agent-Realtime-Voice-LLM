@@ -44,7 +44,7 @@ import { globalToolRegistry } from '../tools/ToolRegistry';
 import { maybeGetOpener } from '../shared/humanize';
 import { Env } from '../config/env';
 import { Logger, closeCallLogger } from '../shared/logger';
-import { routeQuery, resetLastRouterIntent, probeFactIntent } from '../llm/KnowledgeRouter';
+import { routeQuery, routeMultiQuery, resetLastRouterIntent, probeFactIntent } from '../llm/KnowledgeRouter';
 import { ConversationMemory } from '../sales/ConversationMemory';
 import { Humanizer as SalesHumanizer } from '../sales/Humanizer';
 import { handleObjection } from '../sales/CommonObjections';
@@ -946,6 +946,9 @@ export class CallOrchestrator {
     // visit requests during speculative generation.
     this.session.checkVisitMention(text.trim());
 
+    // Store for enrichment directive (insight injection into LLM prompt)
+    this.session.setLastUserText(text.trim());
+
     // Add to conversation and start generating
     this.conversation.addUserMessage(text.trim());
     this.state = 'GENERATING';
@@ -1198,6 +1201,9 @@ export class CallOrchestrator {
     // Update barge-in validator with final user transcript (for echo detection)
     this.bargeInValidator.onUserTranscript(text);
 
+    // Store for enrichment directive (insight injection into LLM prompt)
+    this.session.setLastUserText(text);
+
     this.conversation.addUserMessage(text);
 
     // ── Pin message if it contained critical info extraction ──────────
@@ -1260,6 +1266,25 @@ export class CallOrchestrator {
    * Returns false if the query needs LLM processing.
    */
   private tryDirectFactResponse(text: string): boolean {
+    // ── Multi-intent: try first — handles 2+ fact Qs in one utterance ────
+    const multiResult = routeMultiQuery(text, this.session, this.log);
+    if (multiResult?.handled) {
+      this.intentMetrics.recordMultiIntent(2);
+      if (multiResult.intent) {
+        this.memory.recordQuestion(multiResult.intent);
+        this.session.recordQuestion(multiResult.intent);
+        this.intentMetrics.record(multiResult.intent, 'local', 0);
+      }
+      this.log.info('DIRECT_FACT_RESPONSE', {
+        intent: multiResult.intent,
+        response: multiResult.response,
+        reason: multiResult.reason,
+        text: text.substring(0, 50),
+      });
+      this.streamDeterministicResponse(multiResult.response);
+      return true;
+    }
+
     const result = routeQuery(text, this.session, this.log);
 
     if (!result.handled) {
@@ -1408,6 +1433,8 @@ export class CallOrchestrator {
     // "visit? visit? visit?" behaviour Phase 5 exists to eliminate.
     if (this.memory.visitInvitesShown > 0) return null;
     if (this.session.visitRejected) return null;
+    // VISIT_OFFER step already offered a visit via LLM instruction — don't re-offer.
+    if (this.session.visitOffered) return null;
 
     // Only suggest during open Q&A — once we're offering/collecting a visit,
     // the SessionState step machine owns the flow.

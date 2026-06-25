@@ -31,7 +31,8 @@ import { TwilioService } from '../twilio/TwilioService';
 import { Env } from '../../config';
 import { Logger, closeCallLogger } from '../../shared/Logger';
 import type { StreamEvent } from './LLMTypes';
-import { classifyIntent, isLocallyRoutable, buildLocalResponse, IntentMetrics, Intent } from '../intent';
+import { classifyIntent, classifyIntents, isLocallyRoutable, buildLocalResponse, buildMultiIntentResponse, IntentMetrics, Intent } from '../intent';
+import { buildSchedulingResponse } from './SchedulingResponder';
 import { PROPERTY_FACTS } from '../conversation/PropertyFacts';
 import { handleObjection, detectObjection } from '../sales/CommonObjections';
 import { ConversationMemory } from '../sales/ConversationMemory';
@@ -527,34 +528,23 @@ export class CallOrchestrator {
   // ─── Deterministic Scheduling Templates ─────────────────────────────────
 
   /**
-   * If a scheduling slot was newly captured this turn, return the appropriate
-   * canned response. Returns null if no scheduling transition happened (fall
-   * through to LLM).
+   * Delegates to SchedulingResponder — handles first capture AND reschedule
+   * without ever restarting scheduling from the beginning.
    */
   private maybeCannedSchedulingResponse(
     prevDate: string | null,
     prevTime: string | null,
   ): string | null {
-    const { preferredDate, preferredTime, name } = this.session.info;
-    const status = this.session.bookingStatus;
-
-    // Both slots just completed → confirm visit
-    if (status === 'CONFIRMATION_PENDING' && preferredDate && preferredTime) {
-      const nameClause = name ? `${name} ji, ` : '';
-      return `${nameClause}aapki ${preferredDate} ko ${preferredTime} ki visit book ho gayi hai. Aapka din shubh rahe.`;
-    }
-
-    // Date was newly captured, time still missing → ask time
-    if (!prevDate && preferredDate && !preferredTime) {
-      return `${preferredDate} works. Kis time aana convenient rahega aapke liye — morning ya afternoon?`;
-    }
-
-    // Time was newly captured, date still missing → ask day
-    if (!prevTime && preferredTime && !preferredDate) {
-      return `${preferredTime} noted. Kaunsa day aapke liye convenient rahega — weekday ya weekend?`;
-    }
-
-    return null;
+    return buildSchedulingResponse(
+      {
+        preferredDate: this.session.info.preferredDate,
+        preferredTime: this.session.info.preferredTime,
+        bookingStatus: this.session.bookingStatus,
+        name: this.session.info.name,
+      },
+      prevDate,
+      prevTime,
+    );
   }
 
   // ─── Intent-Based Local Routing ─────────────────────────────────────────
@@ -568,6 +558,26 @@ export class CallOrchestrator {
     if (status === 'DATE_CAPTURED' || status === 'TIME_CAPTURED' ||
         status === 'CONFIRMATION_PENDING' || status === 'BOOKED') {
       return null;
+    }
+
+    // ── 0. Multi-intent: 2+ fact questions in one utterance ──────────
+    const multiResult = classifyIntents(userText);
+    if (multiResult.intents.length >= 2) {
+      const multiResponse = buildMultiIntentResponse(multiResult, PROPERTY_FACTS);
+      if (multiResponse) {
+        this.intentMetrics.recordMultiIntent(multiResult.intents.length);
+        for (const intent of multiResult.intents.slice(0, 2)) {
+          this.memory.recordQuestion(intent);
+          this.memory.recordAnswered(intent);
+          this.intentMetrics.record(intent, 'local', multiResult.classificationTimeUs);
+        }
+        this.log.info('Multi-intent routed locally', {
+          intents: multiResult.intents,
+          response: multiResponse,
+        });
+        const withVisit = this.maybeAppendVisitInvite(multiResponse);
+        return { response: withVisit, intent: `MULTI:${multiResult.intents.join('+')}` };
+      }
     }
 
     const classification = classifyIntent(userText);

@@ -97,6 +97,7 @@ export interface TwilioStreamSession {
   sampleRate: number;
   channels: number;
   callerNumber: string;
+  callDirection: 'inbound' | 'outbound';
   startedAt: number;
   sequenceNumber: number;
 }

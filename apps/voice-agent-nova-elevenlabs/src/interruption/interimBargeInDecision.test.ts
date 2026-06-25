@@ -42,9 +42,19 @@ describe('computeTranscriptDelta', () => {
 });
 
 describe('evaluateInterimBargeIn — rejects false positives', () => {
-  it('rejects an exact duplicate interim (echo)', () => {
-    const r = input({ trimmed: 'wait stop', previousText: 'wait stop' });
+  it('rejects an exact duplicate interim (echo) when anchor not yet old enough', () => {
+    const r = input({ trimmed: 'wait stop', previousText: 'wait stop', interimAnchorAge: 200 });
     expect(r).toMatchObject({ decision: 'reject', reason: 'duplicate_interim_echo' });
+  });
+
+  it('rejects exact duplicate when anchor is null (no anchor set yet)', () => {
+    const r = input({ trimmed: 'wait stop', previousText: 'wait stop', interimAnchorAge: null });
+    expect(r).toMatchObject({ decision: 'reject', reason: 'duplicate_interim_echo' });
+  });
+
+  it('accepts stable duplicate when anchor is old enough (real sustained speech)', () => {
+    const r = input({ trimmed: 'what is the price', previousText: 'what is the price', interimAnchorAge: 1200 });
+    expect(r).toMatchObject({ decision: 'accept', reason: 'sustained_stable_speech' });
   });
 
   it('rejects filler/echo-only words', () => {

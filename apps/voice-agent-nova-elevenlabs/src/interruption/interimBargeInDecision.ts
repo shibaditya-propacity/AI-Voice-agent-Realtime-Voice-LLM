@@ -72,7 +72,15 @@ export function evaluateInterimBargeIn(input: InterimBargeInInput): BargeInDecis
   const make = (decision: BargeInDecisionKind, reason: string): BargeInDecision => ({ decision, reason, delta });
 
   // 1. Duplicate echo — Deepgram repeats the same interim as PSTN echo.
-  if (trimmed === previousText) return make('reject', 'duplicate_interim_echo');
+  // EXCEPTION: if the anchor is already old enough, the transcript is just
+  // stable (Deepgram settled on the final text before speech_final arrives).
+  // Treating stable real speech as echo causes 3+ sec overlap windows.
+  if (trimmed === previousText) {
+    if (interimAnchorAge !== null && interimAnchorAge >= config.minInterimAgeMs) {
+      return make('accept', 'sustained_stable_speech');
+    }
+    return make('reject', 'duplicate_interim_echo');
+  }
 
   // 2. Filler/echo-only words.
   if (config.echoFillerPattern.test(trimmed)) return make('reject', 'echo_filler');

@@ -58,6 +58,11 @@ export class Logger {
     return new Logger({ eventType });
   }
 
+  /** Create a child logger bound to a specific call. */
+  static forCall(callId: string, eventType?: string): Logger {
+    return new Logger({ callId, eventType });
+  }
+
   /** Create a child logger bound to a specific session and call. */
   static forSession(sessionId: string, callId: string, eventType?: string): Logger {
     return new Logger({ sessionId, callId, eventType });
@@ -115,3 +120,6 @@ export class Logger {
 
 /** Singleton root logger for module-level use. */
 export const rootLogger = Logger.root('APP');
+
+/** No-op — closes any per-call log resources (reserved for future use). */
+export function closeCallLogger(_callId: string): void {}

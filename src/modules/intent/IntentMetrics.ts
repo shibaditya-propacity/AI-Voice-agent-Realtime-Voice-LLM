@@ -32,6 +32,8 @@ export class IntentMetrics {
   private routedLLM = 0;
   private objectionPlaybooksUsed = 0;
   private visitInvitesTriggered = 0;
+  private multiIntentDetected = 0;
+  private multiIntentTotalCount = 0;
   private classificationTimesUs: number[] = [];
   private readonly distribution: Map<Intent, number> = new Map();
 
@@ -79,6 +81,13 @@ export class IntentMetrics {
     this.visitInvitesTriggered++;
   }
 
+  /** Record a multi-intent turn (count = number of intents detected). */
+  recordMultiIntent(count: number): void {
+    this.multiIntentDetected++;
+    this.multiIntentTotalCount += count;
+    this.log.info('MultiIntentDetected', { intentCount: count });
+  }
+
   /** Log call-level summary. */
   logCallSummary(): void {
     const total = this.routedLocal + this.routedLLM;
@@ -103,6 +112,8 @@ export class IntentMetrics {
       INTENT_DISTRIBUTION: dist,
       OBJECTION_PLAYBOOK_USED: this.objectionPlaybooksUsed,
       VISIT_INVITE_TRIGGERED: this.visitInvitesTriggered,
+      MULTI_INTENT_DETECTED: this.multiIntentDetected,
+      MULTI_INTENT_COUNT: this.multiIntentTotalCount,
       latencySavedEstimateMs: this.routedLocal * 150,
     });
   }
@@ -113,6 +124,8 @@ export class IntentMetrics {
     routedLLM: number;
     objectionPlaybooksUsed: number;
     visitInvitesTriggered: number;
+    multiIntentDetected: number;
+    multiIntentTotalCount: number;
     distribution: Record<string, number>;
   } {
     const dist: Record<string, number> = {};
@@ -124,6 +137,8 @@ export class IntentMetrics {
       routedLLM: this.routedLLM,
       objectionPlaybooksUsed: this.objectionPlaybooksUsed,
       visitInvitesTriggered: this.visitInvitesTriggered,
+      multiIntentDetected: this.multiIntentDetected,
+      multiIntentTotalCount: this.multiIntentTotalCount,
       distribution: dist,
     };
   }

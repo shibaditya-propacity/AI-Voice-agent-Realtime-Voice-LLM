@@ -149,6 +149,7 @@ export class TwilioStreamHandler {
       sampleRate: mediaFormat.sampleRate,
       channels: mediaFormat.channels,
       callerNumber: customParameters['callerNumber'] ?? '',
+      callDirection: customParameters['callDirection'] === 'outbound' ? 'outbound' : 'inbound',
       startedAt: Date.now(),
       sequenceNumber: 0,
     };

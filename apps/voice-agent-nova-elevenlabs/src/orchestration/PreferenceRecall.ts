@@ -209,12 +209,18 @@ const UNIT_CRORE = /cr|crore|करोड़/;
  * Pure — no env, no SessionState.
  */
 export function parseBudget(lower: string): string | null {
-  // 1. Digit form.
-  const m = lower.match(/\b(\d{1,3}(?:\.\d{1,2})?)\s*(lakh|lakhs|lac|crore|cr|करोड़|लाख)\b/);
+  // Unit boundary: \b doesn't work after Hindi chars (they're \W in JS).
+  // Use a lookahead that accepts space, end-of-string, or any non-alpha/non-Devanagari char.
+  const UNIT_END = '(?=[\\s,।$]|$)';
+  const UNITS = `(lakh|lakhs|lac|crore|cr|करोड़|लाख)${UNIT_END}`;
+
+  // 1. Digit form ("50 lakh", "1.5 crore").
+  const m = lower.match(new RegExp(`\\b(\\d{1,3}(?:\\.\\d{1,2})?)\\s*${UNITS}`));
   if (m) return `${m[1]} ${UNIT_CRORE.test(m[2]) ? 'crore' : 'lakh'}`;
 
-  // 2. Number-word form.
-  const wm = lower.match(/([ऀ-ॿ]+|[a-z]+(?:-[a-z]+)*)\s*(lakh|lakhs|lac|crore|cr|करोड़|लाख)\b/);
+  // 2. Number-word form ("पचास लाख", "fifty lakh", "डेढ़ करोड़").
+  // Note: \b is intentionally omitted before the unit — Hindi unit words are \W so \b never fires.
+  const wm = lower.match(new RegExp(`([ऀ-ॿ]+|[a-z]+(?:-[a-z]+)*)\\s*${UNITS}`));
   if (wm) {
     const digits = NUM_WORDS[wm[1]];
     if (digits) return `${digits} ${UNIT_CRORE.test(wm[2]) ? 'crore' : 'lakh'}`;

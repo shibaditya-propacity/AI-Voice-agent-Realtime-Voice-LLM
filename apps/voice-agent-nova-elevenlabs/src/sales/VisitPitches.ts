@@ -13,27 +13,27 @@ type PitchTemplate = (callerName?: string) => string;
 const PITCH_TEMPLATES: PitchTemplate[] = [
   (name) => {
     const greeting = name ? `${name} ji, ` : '';
-    return `${greeting}एक बार ${PROPERTY_FACTS.project} देखने आओ ना — seeing is believing! Sample flat ready है, construction progress भी दिखाएंगे।`;
+    return `${greeting}अगर convenient हो तो एक बार ${PROPERTY_FACTS.project} visit कर सकते हैं — site पर देखने से काफी कुछ clear हो जाता है।`;
   },
   (name) => {
     const greeting = name ? `${name} ji, ` : '';
-    return `${greeting}${PROPERTY_FACTS.project} site visit करो तो सब clear हो जाएगा — flat layout, view, construction quality — सब अपनी आँखों से देखना best है।`;
+    return `${greeting}जब भी time हो, site visit कर सकते हैं — flat layout और location खुद देख लेंगे, बहुत कुछ clear हो जाएगा।`;
   },
   (name) => {
     const greeting = name ? `${name} ji, ` : '';
-    return `${greeting}मैं suggest करूँगा कि एक बार site visit कर लो — ${PROPERTY_FACTS.project} का location और quality phone पर describe करने में limits हैं, देखोगे तो impressed होगे।`;
+    return `${greeting}अगर आप चाहें तो एक बार आकर देख सकते हैं — हमारी team सब कुछ detail में समझाएगी, कोई pressure नहीं।`;
   },
   (name) => {
     const greeting = name ? `${name} ji, ` : '';
-    return `${greeting}${PROPERTY_FACTS.project} का sample flat बहुत अच्छा बना है — एक बार देखो, no commitment, बस 30 minute का time दो।`;
+    return `${greeting}एक बार site आकर देखें तो बेहतर idea मिलेगा — sample flat भी ready है, और सारे questions site पर ही clear हो जाते हैं।`;
   },
   (name) => {
     const greeting = name ? `${name} ji, ` : '';
-    return `${greeting}अगर seriously consider कर रहे हो तो site visit ज़रूर करो — हमारी team सब details explain करेगी, cost sheet भी मिलेगी, और construction progress भी दिखाएंगे।`;
+    return `${greeting}जब सुविधा हो तो visit plan कर सकते हैं — हमारी team available रहेगी, कोई commitment नहीं।`;
   },
   (name) => {
     const greeting = name ? `${name} ji, ` : '';
-    return `${greeting}weekend पर free हो तो ${PROPERTY_FACTS.project} देखने आ जाओ — Sunday भी open है। Cab arrange कर देंगे अगर चाहो तो।`;
+    return `${greeting}अगर इस project में interest हो तो एक बार आकर देखना helpful रहेगा — site पर सब कुछ personally समझ आ जाता है।`;
   },
 ];
 
