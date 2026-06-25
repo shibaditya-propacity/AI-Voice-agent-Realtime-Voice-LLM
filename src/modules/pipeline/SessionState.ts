@@ -6,6 +6,7 @@
 import { Logger } from '../../shared/Logger';
 import { buildEnrichmentDirective } from '../conversation/ResponseEnrichment';
 import { PROPERTY_FACTS } from '../conversation/PropertyFacts';
+import { detectPreferenceChanges } from '../conversation/PreferenceChangeDetector';
 
 export type BookingStatus =
   | 'NONE'
@@ -23,6 +24,7 @@ export interface CollectedInfo {
   preferredTime: string | null;
   projectInterest: string | null;
   budgetMentioned: string | null;
+  bhkPreference: string | null;
 }
 
 const NAME_TRIGGER_PHRASES = new Set([
@@ -51,6 +53,7 @@ export class SessionState {
     preferredTime: null,
     projectInterest: null,
     budgetMentioned: null,
+    bhkPreference: null,
   };
 
   bookingStatus: BookingStatus = 'NONE';
@@ -109,9 +112,38 @@ export class SessionState {
     this.info.projectInterest = interest.trim();
   }
 
-  setBudgetMentioned(budget: string): void {
+  setBudgetMentioned(budget: string, isCorrection = false): void {
     if (!budget.trim()) return;
-    this.info.budgetMentioned = budget.trim();
+    const cleaned = budget.trim();
+    if (this.info.budgetMentioned === cleaned) return;
+    if (this.info.budgetMentioned && isCorrection) {
+      this.log.info('SESSION_FIELD_UPDATED', {
+        field: 'budget',
+        oldValue: this.info.budgetMentioned,
+        newValue: cleaned,
+        turn: this.turnCount,
+      });
+    } else if (!this.info.budgetMentioned) {
+      this.log.info('slot_update', { field: 'budgetMentioned', value: cleaned, turn: this.turnCount });
+    }
+    this.info.budgetMentioned = cleaned;
+  }
+
+  setBhkPreference(bhk: string, isCorrection = false): void {
+    if (!bhk.trim()) return;
+    const cleaned = bhk.trim();
+    if (this.info.bhkPreference === cleaned) return;
+    if (this.info.bhkPreference && isCorrection) {
+      this.log.info('SESSION_FIELD_UPDATED', {
+        field: 'bhk',
+        oldValue: this.info.bhkPreference,
+        newValue: cleaned,
+        turn: this.turnCount,
+      });
+    } else if (!this.info.bhkPreference) {
+      this.log.info('slot_update', { field: 'bhkPreference', value: cleaned, turn: this.turnCount });
+    }
+    this.info.bhkPreference = cleaned;
   }
 
   private advanceBookingState(): void {
@@ -178,6 +210,8 @@ export class SessionState {
     lines.push(this.info.name ? `  Caller name: ${this.info.name} ✓` : '  Caller name: ❌ NOT COLLECTED');
     lines.push(this.info.preferredDate ? `  Preferred date: ${this.info.preferredDate} ✓` : '  Preferred date: ❌ NOT COLLECTED');
     lines.push(this.info.preferredTime ? `  Preferred time: ${this.info.preferredTime} ✓` : '  Preferred time: ❌ NOT COLLECTED');
+    lines.push(this.info.bhkPreference ? `  BHK preference: ${this.info.bhkPreference} ✓` : '  BHK preference: not specified');
+    lines.push(this.info.budgetMentioned ? `  Budget: ${this.info.budgetMentioned} ✓` : '  Budget: not specified');
     lines.push(`  Booking status: ${this.bookingStatus}`);
     lines.push('');
     lines.push('PRIORITY: Always answer the user\'s question FIRST. Slot collection is secondary.');
@@ -288,6 +322,7 @@ export class SessionState {
     if (!this.info.name) this.extractName(trimmed);
     this.extractDate(lower, trimmed);
     this.extractTime(text, trimmed);
+    this.extractPreferences(trimmed);
 
     if (this.bookingStatus === 'NONE') {
       const visitContext = /\b(visit|schedule|book|देखना|देखेंगे|site|हाँ|sure|ok)\b/i;
@@ -396,6 +431,32 @@ export class SessionState {
     }
   }
 
+  private extractPreferences(text: string): void {
+    const detection = detectPreferenceChanges(
+      text,
+      this.info.bhkPreference,
+      this.info.budgetMentioned,
+    );
+
+    // BHK: set on first mention; update only on explicit correction
+    if (detection.newBhk) {
+      if (!this.info.bhkPreference) {
+        this.setBhkPreference(detection.newBhk, false);
+      } else if (detection.changes.some(c => c.field === 'bhk')) {
+        this.setBhkPreference(detection.newBhk, true);
+      }
+    }
+
+    // Budget: set on first mention; update only on explicit correction
+    if (detection.newBudget) {
+      if (!this.info.budgetMentioned) {
+        this.setBudgetMentioned(detection.newBudget, false);
+      } else if (detection.changes.some(c => c.field === 'budget')) {
+        this.setBudgetMentioned(detection.newBudget, true);
+      }
+    }
+  }
+
   extractFromAssistantResponse(text: string): void {
     this.updateLastAskedField(text);
     if (this.bookingStatus !== 'CONFIRMATION_PENDING') return;
@@ -409,6 +470,7 @@ export class SessionState {
       name: this.info.name, preferredDate: this.info.preferredDate,
       preferredTime: this.info.preferredTime, bookingStatus: this.bookingStatus,
       bookingSuccess: this.bookingSuccess, lastAskedField: this.lastAskedField,
+      bhkPreference: this.info.bhkPreference, budgetMentioned: this.info.budgetMentioned,
       turn: this.turnCount, shouldEndCall: this.shouldEndCall,
     };
   }

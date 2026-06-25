@@ -17,6 +17,8 @@ import { Logger } from '../shared/logger';
 import { Env } from '../config/env';
 import { classifyIntent } from './IntentClassifier';
 import { buildSchedulingRecap, parseBudget } from './PreferenceRecall';
+import { detectPreferenceChanges } from './PreferenceChangeDetector';
+import { buildEnrichmentDirective } from '../llm/ResponseEnrichment';
 
 // ─── Booking Status State Machine ──────────────────────────────────────────
 //
@@ -230,7 +232,7 @@ export class SessionState {
 
   /** Whether the deliberate one-time site-visit OFFER (right after interest is
    *  detected) has been made. Latch: prevents re-offering on every later turn. */
-  private visitOffered = false;
+  visitOffered = false;
 
   // ─── Adaptive Token Budget ──────────────────────────────────────────────
   // Pick the smallest token ceiling that fits the answer (latency-first), and
@@ -258,6 +260,9 @@ export class SessionState {
   /** Turn counter for fact provenance tracking. */
   private turnCount = 0;
 
+  /** Last user utterance — used for intent-based response enrichment. */
+  private _lastUserText = '';
+
   /** How many times the pre-TTS guard replaced an acknowledgement-only reply
    *  with a clarifying question this call. Surfaced per-turn (in the warn log)
    *  and per-call (RESPONSE_QUALITY_SUMMARY) to track how often the model
@@ -278,6 +283,11 @@ export class SessionState {
   }
 
   // ─── Turn Tracking ──────────────────────────────────────────────────────
+
+  /** Store the user's latest utterance for enrichment directive generation. */
+  setLastUserText(text: string): void {
+    this._lastUserText = text;
+  }
 
   advanceTurn(): void {
     this.turnCount++;
@@ -620,13 +630,26 @@ export class SessionState {
     const nameLine = this.info.callerName
       ? `Caller: ${this.info.callerName} ✓ (use their name naturally, e.g. "${this.info.callerName} ji")`
       : 'Caller: — (name not yet known)';
-    return [
+
+    const lines = [
       '[SESSION_STATE] (ground truth — use ✓ values, never re-ask them)',
       nameLine,
       `BHK: ${f(this.info.bhkPreference)} | Budget: ${f(this.info.budgetMentioned)}`,
       `Visit day: ${f(this.info.preferredDate)} | Visit time: ${f(this.info.preferredTime)} | Booked: ${this.visitBooked ? 'yes' : 'no'}`,
       `[NEXT_ACTION] ${this.nextAction()}`,
-    ].join('\n');
+    ];
+
+    // Inject insight directive when user asked a recognizable property question.
+    // Skipped during scheduling steps — keep model focused on date/time extraction.
+    const isSchedulingStep = ['ASK_VISIT_DAY', 'ASK_VISIT_TIME', 'CONFIRM_VISIT', 'BOOKED'].includes(this.currentStep);
+    const enrichment = buildEnrichmentDirective(this._lastUserText, this.turnCount, isSchedulingStep);
+    if (enrichment) {
+      lines.push(enrichment);
+    }
+
+    lines.push('[RESPONSE STYLE] Sound like a helpful consultant — state the fact then weave in the insight naturally. Max 2 sentences, under 35 words total.');
+
+    return lines.join('\n');
   }
 
   /**
@@ -647,12 +670,12 @@ export class SessionState {
         // goal). Mark it so the pitch guard allows the visit mention this turn.
         this.visitOffered = true;
         this.markVisitSuggested();
-        return 'Answer their question in ONE short line if they asked one, then warmly offer a site visit as a single yes/no question (e.g. "क्या आप एक बार Akshay Vista देखने आना चाहेंगे?"). Do NOT ask about the day or time — the system asks that next turn. Maximum two sentences, exactly ONE question.';
+        return 'If they asked a clear property question, answer it in ONE short line. Then in a natural, low-pressure way, mention that seeing the project in person gives the full picture — e.g. "अगर आप एक बार site visit करें तो सब कुछ अच्छे से देख सकते हैं।" Do NOT use a hard yes/no close. Do NOT say "क्या आप आना चाहेंगे" as a direct question — make it a soft suggestion. Do NOT ask about the day or time. Maximum two sentences.';
       }
       case 'QUESTION_HANDLING':
         // Visit already offered once — just answer questions. NEVER re-pitch the
         // visit or append a "site visit" line; only answer what they asked.
-        return 'Answer their question briefly and completely from PROPERTY_FACTS. Give ONLY the answer to what they asked (budget→price, location→location, etc.). Do NOT mention a site visit, do NOT say "aur kuch"/"anything else", and do NOT add any extra line.';
+        return 'Answer their question briefly and completely from PROPERTY_FACTS. Give ONLY the answer to what they asked (budget→price, location→location, etc.). If their message is not a clear question, acknowledge in ≤5 words and gently ask what they would like to know. Do NOT mention a site visit, do NOT say "aur kuch"/"anything else", and do NOT add any extra line.';
       case 'ASK_VISIT_DAY':
         return '[DETERMINISTIC] Application handles this step directly.';
       case 'ASK_VISIT_TIME':
@@ -681,6 +704,10 @@ export class SessionState {
       case 'ASK_VISIT_DAY': {
         this.log.info('VISIT_FLOW_DIRECT_RESPONSE', { action: 'VISIT_DAY_REQUESTED', step: this.currentStep });
         const recap = this.schedulingPrefRecap();
+        if (this.info.preferredTime) {
+          // Time was provided first — acknowledge it, then ask for day
+          return `${n}${this.info.preferredTime} noted। ${recap}आपको कौन सा दिन convenient रहेगा — आज, कल, या इस weekend?`;
+        }
         return `${n}${recap}आपको कौन सा दिन convenient रहेगा — आज, कल, या इस weekend?`;
       }
       case 'ASK_VISIT_TIME':
@@ -1357,21 +1384,51 @@ export class SessionState {
 
   /** Extract BHK preference: "2 bhk", "2.5 BHK", "3bhk", "two bhk". */
   private extractBhk(lower: string): void {
-    const m = lower.match(/\b(2\.5|2|3)\s*bhk\b/);
-    if (m) { this._bhkMentionedThisTurn = true; this.setBhkPreference(`${m[1]} BHK`); return; }
-    const words: Record<string, string> = { two: '2', 'two and half': '2.5', three: '3' };
-    const w = lower.match(/\b(two and half|two|three)\s*bhk\b/);
-    if (w && words[w[1]]) { this._bhkMentionedThisTurn = true; this.setBhkPreference(`${words[w[1]]} BHK`); }
+    const { hasCorrection, newBhk } = detectPreferenceChanges(lower, this.info.bhkPreference, null);
+    if (newBhk) {
+      const current = this.info.bhkPreference;
+      // First mention always captures; conflicting value only updates with correction signal
+      if (!current || current === newBhk || hasCorrection) {
+        this._bhkMentionedThisTurn = true;
+        this.setBhkPreference(newBhk);
+      }
+      return;
+    }
+    // Fallback: English + Hindi number words ("two BHK", "दो BHK", "तीन BHK")
+    const words: Record<string, string> = {
+      two: '2', 'two and half': '2.5', three: '3',
+      'दो': '2', 'ढाई': '2.5', 'तीन': '3',
+    };
+    const w = lower.match(/(two and half|two|three|दो|ढाई|तीन)\s*bhk/i);
+    if (w && words[w[1].toLowerCase()]) {
+      this._bhkMentionedThisTurn = true;
+      this.setBhkPreference(`${words[w[1].toLowerCase()]} BHK`);
+    }
   }
 
   /** Extract a mentioned budget: "50 lakh", "1 crore", "80 lakhs", "1.2 cr". */
   private extractBudget(lower: string): void {
-    // Handles both digit ("50 lakh") and number-word ("पचास लाख", "fifty lakh")
-    // forms — see parseBudget in PreferenceRecall.
-    const budget = parseBudget(lower);
-    if (budget) {
-      this._budgetMentionedThisTurn = true;
-      this.setBudgetMentioned(budget);
+    const current = this.info.budgetMentioned;
+
+    // Use correction-aware detector first (last-value-wins on correction signal)
+    const { hasCorrection, newBudget } = detectPreferenceChanges(lower, null, current);
+    if (newBudget) {
+      if (!current || current === newBudget || hasCorrection) {
+        this._budgetMentionedThisTurn = true;
+        this.setBudgetMentioned(newBudget);
+      }
+      return;
+    }
+
+    // Fallback: parseBudget handles Hindi number words ("पचास लाख", "fifty lakh")
+    // that BUDGET_PATTERNS in PreferenceChangeDetector may not cover. Only apply
+    // on first mention — corrections need the detector's last-value-wins logic.
+    if (!current) {
+      const budget = parseBudget(lower);
+      if (budget) {
+        this._budgetMentionedThisTurn = true;
+        this.setBudgetMentioned(budget);
+      }
     }
   }
 

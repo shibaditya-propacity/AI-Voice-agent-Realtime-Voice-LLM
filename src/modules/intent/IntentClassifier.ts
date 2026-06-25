@@ -69,7 +69,7 @@ const INTENT_RULES: IntentRule[] = [
   // ── Price ──────────────────────────────────────────────────────────────
   {
     intent: Intent.PRICE,
-    pattern: /\b(price|pricing|rate|cost|kitna\s*(?:hai|hoga|padega|lagega)?|kharcha|per\s*sq|psf|sqft|sq\s*ft|rupee|paisa|keemat|कीमत|दाम|रेट|कितना|खर्चा|महंगा|सस्ता|affordable|cheap|value|worth)\b/i,
+    pattern: /\b(price|pricing|rate|cost|kitna\s*(?:hai|hoga|padega|lagega)?|kharcha|per\s*sq|psf|sqft|sq\s*ft|rupee|paisa|keemat|budget|कीमत|दाम|रेट|कितना|खर्चा|बजट|महंगा|सस्ता|affordable|cheap|value|worth)\b/i,
   },
 
   // ── Possession ────────────────────────────────────────────────────────
@@ -108,6 +108,17 @@ const INTENT_RULES: IntentRule[] = [
     pattern: /\b(units|flats|apartments|kitne\s*flat|total\s*(?:flats|units)|how\s*many\s*(?:flats|units|apartments)|towers|floors|buildings|कितने\s*फ्लैट|यूनिट|टावर|मंज़िल|total\s*kitne)\b/i,
   },
 ];
+
+// ─── Multi-Intent Result ────────────────────────────────────────────────────
+
+/**
+ * Result of multi-intent classification — all locally-routable intents
+ * detected in a single utterance, ordered by rule specificity.
+ */
+export interface IntentResult {
+  intents: Intent[];
+  classificationTimeUs: number;
+}
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -159,6 +170,46 @@ export function classifyIntent(userText: string): ClassificationResult {
     matchedTrigger: '',
     classificationTimeUs: Math.round(elapsed * 1000),
   };
+}
+
+/**
+ * Classify a user utterance into ALL matching locally-routable intents.
+ *
+ * Scans every rule (not just the first match) and collects all fact-based
+ * intents. Used to detect multi-intent queries like "price aur possession?".
+ * Non-fact intents (VISIT_*, OBJECTION, UNKNOWN) are excluded.
+ */
+export function classifyIntents(userText: string): IntentResult {
+  const start = performance.now();
+  const lower = userText.trim().toLowerCase();
+
+  const matched: Intent[] = [];
+  const seen = new Set<Intent>();
+
+  for (const { intent, pattern } of INTENT_RULES) {
+    if (!isLocallyRoutablePure(intent)) continue;
+    if (seen.has(intent)) continue;
+    if (pattern.test(lower)) {
+      matched.push(intent);
+      seen.add(intent);
+    }
+  }
+
+  const elapsed = performance.now() - start;
+  return { intents: matched, classificationTimeUs: Math.round(elapsed * 1000) };
+}
+
+/** Internal pure check used by classifyIntents (avoids circular dep with isLocallyRoutable). */
+function isLocallyRoutablePure(intent: Intent): boolean {
+  return (
+    intent === Intent.PRICE ||
+    intent === Intent.LOCATION ||
+    intent === Intent.AMENITIES ||
+    intent === Intent.BHK ||
+    intent === Intent.POSSESSION ||
+    intent === Intent.DEVELOPER ||
+    intent === Intent.UNITS
+  );
 }
 
 /**

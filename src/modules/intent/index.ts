@@ -1,6 +1,6 @@
-export { Intent, classifyIntent, isLocallyRoutable } from './IntentClassifier';
-export type { ClassificationResult } from './IntentClassifier';
-export { buildLocalResponse } from './IntentResponses';
+export { Intent, classifyIntent, classifyIntents, isLocallyRoutable } from './IntentClassifier';
+export type { ClassificationResult, IntentResult } from './IntentClassifier';
+export { buildLocalResponse, buildMultiIntentResponse } from './IntentResponses';
 export { IntentMetrics } from './IntentMetrics';
 export { handleObjection, detectObjection } from '../sales/CommonObjections';
 export { ConversationMemory } from '../sales/ConversationMemory';

@@ -10,6 +10,7 @@
 
 import express from 'express';
 import http from 'http';
+import path from 'path';
 import { WebSocketServer } from 'ws';
 import { Env } from './config/env';
 import { Logger } from './shared/logger';
@@ -58,6 +59,11 @@ export function createApp(): AppInstance {
     });
     next();
   });
+
+  // ─── Static Assets ────────────────────────────────────────────────────────
+  // Serve greeting WAV for Twilio <Play> in outbound TwiML — lets Twilio play
+  // the greeting immediately when the callee answers (before stream connects).
+  app.use('/assets', express.static(path.join(__dirname, '..', 'assets')));
 
   // ─── Routes ──────────────────────────────────────────────────────────────
 

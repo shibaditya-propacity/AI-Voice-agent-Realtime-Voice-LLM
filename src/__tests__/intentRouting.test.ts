@@ -14,10 +14,11 @@
 import {
   Intent,
   classifyIntent,
+  classifyIntents,
   isLocallyRoutable,
   ClassificationResult,
 } from '../modules/intent/IntentClassifier';
-import { buildLocalResponse } from '../modules/intent/IntentResponses';
+import { buildLocalResponse, buildMultiIntentResponse } from '../modules/intent/IntentResponses';
 import { IntentMetrics } from '../modules/intent/IntentMetrics';
 import { PropertyFacts } from '../modules/conversation/ConversationTypes';
 
@@ -373,6 +374,153 @@ describe('response safety', () => {
         expect(response).not.toMatch(/\d+\s*crore/i);
       }
     }
+  });
+});
+
+// ─── Multi-Intent Classification ────────────────────────────────────────────
+
+describe('classifyIntents (multi-intent)', () => {
+  it('detects price + possession in one utterance', () => {
+    const result = classifyIntents('Price kya hai aur possession kab hai?');
+    expect(result.intents).toContain(Intent.PRICE);
+    expect(result.intents).toContain(Intent.POSSESSION);
+    expect(result.intents.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('detects location + amenities in one utterance', () => {
+    const result = classifyIntents('Location batao aur amenities kya hain?');
+    expect(result.intents).toContain(Intent.LOCATION);
+    expect(result.intents).toContain(Intent.AMENITIES);
+  });
+
+  it('detects BHK + price in one utterance', () => {
+    const result = classifyIntents('Budget kya hai aur 3 BHK available hai?');
+    expect(result.intents).toContain(Intent.PRICE);
+    expect(result.intents).toContain(Intent.BHK);
+  });
+
+  it('returns single intent for single-intent utterances', () => {
+    const result = classifyIntents('Price kya hai?');
+    expect(result.intents).toContain(Intent.PRICE);
+    expect(result.intents.length).toBe(1);
+  });
+
+  it('returns empty intents for non-fact utterances', () => {
+    const result = classifyIntents('Tell me about the project');
+    expect(result.intents.length).toBe(0);
+  });
+
+  it('excludes non-fact intents (visit, objection) from multi-intent results', () => {
+    const result = classifyIntents('price kya hai aur visit nahi karna');
+    expect(result.intents).toContain(Intent.PRICE);
+    expect(result.intents).not.toContain(Intent.VISIT_REJECTION);
+  });
+
+  it('includes classification time', () => {
+    const result = classifyIntents('price aur possession?');
+    expect(result.classificationTimeUs).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ─── Multi-Intent Response Building ─────────────────────────────────────────
+
+describe('buildMultiIntentResponse', () => {
+  it('builds a combined response for price + possession', () => {
+    const result = classifyIntents('Price kya hai aur possession kab hai?');
+    const response = buildMultiIntentResponse(result, TEST_FACTS);
+    expect(response).toBeTruthy();
+    expect(response).toContain('8,000 to 10,000');
+    expect(response).toContain('April 2027');
+  });
+
+  it('builds a combined response for location + amenities', () => {
+    const result = classifyIntents('Location batao aur amenities kya hain?');
+    const response = buildMultiIntentResponse(result, TEST_FACTS);
+    expect(response).toBeTruthy();
+    expect(response).toContain('Pimple Gurav');
+    expect(response).toContain('gym');
+  });
+
+  it('returns null when fewer than 2 fact intents detected', () => {
+    const result = classifyIntents('price kya hai?');
+    const response = buildMultiIntentResponse(result, TEST_FACTS);
+    expect(response).toBeNull();
+  });
+
+  it('combined response is max 2 sentences', () => {
+    const pairs: [string, string][] = [
+      ['Price aur possession?', ''],
+      ['Location aur amenities?', ''],
+      ['BHK options aur price?', ''],
+    ];
+    for (const [query] of pairs) {
+      const result = classifyIntents(query);
+      const response = buildMultiIntentResponse(result, TEST_FACTS);
+      if (response) {
+        const sentences = countSentences(response);
+        expect(sentences).toBeLessThanOrEqual(2);
+      }
+    }
+  });
+
+  it('each sentence in combined response is ≤25 words', () => {
+    const queries = [
+      'Price aur possession?',
+      'Location aur amenities?',
+      'BHK options aur kitne units hain?',
+    ];
+    for (const query of queries) {
+      const result = classifyIntents(query);
+      const response = buildMultiIntentResponse(result, TEST_FACTS);
+      if (response) {
+        const sentences = response.split(/(?<=[.!?])\s+/);
+        for (const sentence of sentences) {
+          if (sentence.trim().length > 0) {
+            expect(countWords(sentence)).toBeLessThanOrEqual(25);
+          }
+        }
+      }
+    }
+  });
+
+  it('uses PropertyFacts — no hardcoding', () => {
+    const result = classifyIntents('price aur possession?');
+    const responseA = buildMultiIntentResponse(result, TEST_FACTS)!;
+    const responseB = buildMultiIntentResponse(result, ALT_FACTS)!;
+
+    expect(responseA).toContain('8,000 to 10,000');
+    expect(responseA).toContain('April 2027');
+    expect(responseB).toContain('12,000 to 15,000');
+    expect(responseB).toContain('December 2028');
+  });
+});
+
+// ─── Multi-Intent Metrics ────────────────────────────────────────────────────
+
+describe('IntentMetrics multi-intent', () => {
+  it('tracks MULTI_INTENT_DETECTED count', () => {
+    const metrics = new IntentMetrics('test-call');
+    metrics.recordMultiIntent(2);
+    metrics.recordMultiIntent(2);
+
+    const stats = metrics.getStats();
+    expect(stats.multiIntentDetected).toBe(2);
+  });
+
+  it('tracks MULTI_INTENT_COUNT (total intents across multi-intent turns)', () => {
+    const metrics = new IntentMetrics('test-call');
+    metrics.recordMultiIntent(2);
+    metrics.recordMultiIntent(3);
+
+    const stats = metrics.getStats();
+    expect(stats.multiIntentTotalCount).toBe(5);
+  });
+
+  it('multi-intent stats start at zero', () => {
+    const metrics = new IntentMetrics('test-call');
+    const stats = metrics.getStats();
+    expect(stats.multiIntentDetected).toBe(0);
+    expect(stats.multiIntentTotalCount).toBe(0);
   });
 });
 

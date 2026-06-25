@@ -16,6 +16,8 @@ export interface IntentStats {
   routedLLM: number;
   objectionPlaybooksUsed: number;
   visitInvitesTriggered: number;
+  multiIntentDetected: number;
+  multiIntentTotalCount: number;
   totalClassificationTimeUs: number;
   avgClassificationTimeUs: number;
   distribution: Record<string, number>;
@@ -28,6 +30,8 @@ export class IntentMetrics {
   private routedLLM = 0;
   private objectionPlaybooksUsed = 0;
   private visitInvitesTriggered = 0;
+  private multiIntentDetected = 0;
+  private multiIntentTotalCount = 0;
   private totalClassificationTimeUs = 0;
   private totalClassifications = 0;
   private readonly distribution = new Map<IntentLabel, number>();
@@ -71,6 +75,13 @@ export class IntentMetrics {
     });
   }
 
+  /** Record that a multi-intent query was handled. */
+  recordMultiIntent(count: number): void {
+    this.multiIntentDetected++;
+    this.multiIntentTotalCount += count;
+    this.log.info('MultiIntentDetected', { count, totalEvents: this.multiIntentDetected });
+  }
+
   /** Record that a visit invite was triggered during this call. */
   recordVisitInvite(): void {
     this.visitInvitesTriggered++;
@@ -87,6 +98,8 @@ export class IntentMetrics {
       routedLLM: stats.routedLLM,
       objectionPlaybooksUsed: stats.objectionPlaybooksUsed,
       visitInvitesTriggered: stats.visitInvitesTriggered,
+      MULTI_INTENT_DETECTED: stats.multiIntentDetected,
+      MULTI_INTENT_COUNT: stats.multiIntentTotalCount,
       avgClassificationTimeUs: stats.avgClassificationTimeUs,
       totalClassifications: this.totalClassifications,
       distribution: stats.distribution,
@@ -105,6 +118,8 @@ export class IntentMetrics {
       routedLLM: this.routedLLM,
       objectionPlaybooksUsed: this.objectionPlaybooksUsed,
       visitInvitesTriggered: this.visitInvitesTriggered,
+      multiIntentDetected: this.multiIntentDetected,
+      multiIntentTotalCount: this.multiIntentTotalCount,
       totalClassificationTimeUs: this.totalClassificationTimeUs,
       avgClassificationTimeUs:
         this.totalClassifications > 0

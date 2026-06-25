@@ -87,6 +87,7 @@ export class TwilioService {
   <Connect>
     <Stream url="${streamUrl}">
       <Parameter name="callerNumber" value="${to}"/>
+      <Parameter name="callDirection" value="outbound"/>
     </Stream>
   </Connect>
 </Response>`;
